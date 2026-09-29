@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "kind": "callback_factory",
+      "id": "prop-chain-callback",
+      "match": {
+        "project": "prop-chain",
+        "module": "src/capability.ts",
+        "export": "useCapability"
+      },
+      "returned_property": ["run"],
+      "retains_returned_callback": false,
+      "invokes_returned_callback_during_call": false,
+      "captures": {
+        "notice_key": { "kind": "argument", "index": 0 }
+      },
+      "on_invoke": [
+        {
+          "kind": "effect",
+          "name": "run_capability",
+          "arguments": [{ "kind": "capture", "name": "notice_key" }]
+        }
+      ],
+      "evidence": {
+        "kind": "repository_assumption",
+        "reason": "Prop-chain fixture callback factory contract"
+      }
+    }
+  ]
+}
+

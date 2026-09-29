@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "kind": "callback_factory",
+      "id": "coverage-callback",
+      "match": {
+        "project": "coverage",
+        "module": "src/factory.ts",
+        "export": "makeCapability"
+      },
+      "returned_property": ["callback"],
+      "retains_returned_callback": false,
+      "invokes_returned_callback_during_call": false,
+      "captures": {
+        "notice_key": { "kind": "argument", "index": 0 }
+      },
+      "on_invoke": [],
+      "evidence": {
+        "kind": "repository_assumption",
+        "reason": "Coverage fixture callback factory contract"
+      }
+    }
+  ]
+}
+

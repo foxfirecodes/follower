@@ -1,0 +1,12 @@
+schema_version = 1
+name = "prop-chain"
+source_roots = ["src"]
+model_files = ["models.json"]
+
+[[entries]]
+module = "src/Host.tsx"
+export = "Host"
+
+[inputs]
+"Host.variant" = ["alpha", "beta"]
+

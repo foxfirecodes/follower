@@ -1,0 +1,13 @@
+schema_version = 1
+name = "reference"
+source_roots = ["src"]
+model_files = ["models.json"]
+resolution_conditions = ["import", "default"]
+
+[[entries]]
+module = "src/Host.tsx"
+export = "Host"
+
+[inputs]
+"Host.variant" = ["welcome", "upgrade"]
+

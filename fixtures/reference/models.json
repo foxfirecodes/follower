@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "kind": "callback_factory",
+      "id": "notice-dismiss-v1",
+      "match": {
+        "project": "reference",
+        "module": "src/notice.ts",
+        "export": "useNotice"
+      },
+      "returned_property": ["dismiss"],
+      "retains_returned_callback": false,
+      "invokes_returned_callback_during_call": false,
+      "captures": {
+        "notice_key": { "kind": "argument", "index": 0 }
+      },
+      "on_invoke": [
+        {
+          "kind": "effect",
+          "name": "hide_notice_attempt",
+          "arguments": [{ "kind": "capture", "name": "notice_key" }]
+        }
+      ],
+      "evidence": {
+        "kind": "repository_assumption",
+        "reason": "Contract of the reference notice hook"
+      }
+    }
+  ]
+}
+
