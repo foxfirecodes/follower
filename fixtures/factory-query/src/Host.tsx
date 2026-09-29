@@ -1,4 +1,6 @@
-import { useHideableThing } from "./hideable";
+import { useThing as makeHideable } from "./public";
+import * as Hideable from "./public";
+import { useHideableThing as decoy } from "./decoy";
 
 enum ThingType {
   Banner = "banner",
@@ -24,7 +26,7 @@ const registry = {
 
 export function Host({ variant }: { variant: "welcome" | "upgrade" }) {
   const item = registry[variant];
-  const { markHandled } = useHideableThing(item.types);
+  const { markHandled } = makeHideable(item.types);
   const View = item.View;
   return <View dismiss={markHandled} />;
 }
@@ -46,8 +48,15 @@ function UpgradeCard({ dismiss }: { dismiss: (kind: string) => void }) {
 // Deliberately absent from the configured render roots. An all_creations query
 // still reports this callsite and labels its reachability as unknown.
 function DormantCard() {
-  const { markHandled } = useHideableThing([ThingType.Modal]);
+  const { markHandled } = Hideable.useThing([ThingType.Modal]);
   return (
     <button onClick={() => markHandled(HideKind.Timeout)}>Hide</button>
   );
+}
+
+// Same exported spelling, different canonical declaration: this must not match
+// the query's factory identity.
+function DecoyCard() {
+  const { markHandled } = decoy([ThingType.Banner]);
+  return <button onClick={() => markHandled(HideKind.Timeout)}>No-op</button>;
 }

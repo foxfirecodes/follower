@@ -1,0 +1,7 @@
+schema_version = 1
+name = "query-mutation"
+source_roots = ["src"]
+
+[[entries]]
+module = "src/Host.tsx"
+export = "Host"

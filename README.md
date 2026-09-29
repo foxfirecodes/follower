@@ -26,6 +26,24 @@ cargo run -- query \
 Use `--format json` for the stable machine-readable report. The query declaration and current
 semantics are documented in [`docs/QUERY.md`](docs/QUERY.md).
 
+The control-flow fixture exercises finite strict-equality branches and row-preserving literal-array
+`.map`, canonical ordinary-call linkage, and local callback reassignment:
+
+```sh
+cargo run -- query \
+  --project fixtures/query-control-flow/flow.toml \
+  --query fixtures/query-control-flow/query.toml
+```
+
+The mutation fixture demonstrates the current conservative boundary for an aliased record whose
+callback property is overwritten:
+
+```sh
+cargo run -- query \
+  --project fixtures/query-mutation/flow.toml \
+  --query fixtures/query-mutation/query.toml
+```
+
 To exercise a callback forwarded through three components with prop renaming and two independent
 creation contexts:
 

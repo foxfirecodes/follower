@@ -3,17 +3,19 @@ use oxc::{
         Argument, ArrowFunctionBody, BindingPattern, Declaration, Expression, FormalParameters,
         Function, ImportDeclaration, ImportDeclarationSpecifier, ImportOrExportKind,
         JSXAttributeItem, JSXAttributeValue, JSXElement, JSXElementName, JSXExpression,
-        ObjectPropertyKind, Statement, VariableDeclaration,
+        ObjectPropertyKind, SimpleAssignmentTarget, Statement, VariableDeclaration,
     },
     span::{GetSpan, Span},
+    syntax::operator::{AssignmentOperator, BinaryOperator},
 };
 
 use crate::{
     ids::FileId,
     ir::{
-        FlowArrowBody, FlowBinding, FlowExpression, FlowExpressionKind, FlowFileIr, FlowFunction,
-        FlowImport, FlowJsxProp, FlowJsxTag, FlowPattern, FlowPatternField, FlowPatternKind,
-        FlowRecordField, FlowStatement, SourceSpan, UnsupportedIr,
+        FlowArrowBody, FlowAssignmentTarget, FlowBinding, FlowExport, FlowExpression,
+        FlowExpressionKind, FlowFileIr, FlowFunction, FlowImport, FlowJsxProp, FlowJsxTag,
+        FlowPattern, FlowPatternField, FlowPatternKind, FlowRecordField, FlowStatement, SourceSpan,
+        UnsupportedIr,
     },
 };
 
@@ -58,7 +60,49 @@ impl Lowerer {
             }
             Statement::FunctionDeclaration(function) => self.lower_function(function),
             Statement::ExportDeclaration(export) => {
+                self.record_direct_exports(&export.declaration);
                 self.lower_declaration(&export.declaration);
+            }
+            Statement::ExportNamedDeclaration(export) => {
+                for specifier in &export.specifiers {
+                    self.output.exports.push(FlowExport::Local {
+                        local: specifier.local.name().to_string(),
+                        exported: specifier.exported.name().to_string(),
+                        type_only: export.export_kind == ImportOrExportKind::Type
+                            || specifier.export_kind == ImportOrExportKind::Type,
+                        span: self.span(specifier.span),
+                    });
+                }
+            }
+            Statement::ExportFromDeclaration(export) => {
+                for specifier in &export.specifiers {
+                    self.output.exports.push(FlowExport::ReExport {
+                        imported: specifier.local.name().to_string(),
+                        exported: specifier.exported.name().to_string(),
+                        module: export.source.value.to_string(),
+                        type_only: export.export_kind == ImportOrExportKind::Type
+                            || specifier.export_kind == ImportOrExportKind::Type,
+                        span: self.span(specifier.span),
+                    });
+                }
+            }
+            Statement::ExportAllDeclaration(export) => {
+                let type_only = export.export_kind == ImportOrExportKind::Type;
+                self.output
+                    .exports
+                    .push(export.exported.as_ref().map_or_else(
+                        || FlowExport::Star {
+                            module: export.source.value.to_string(),
+                            type_only,
+                            span: self.span(export.span),
+                        },
+                        |exported| FlowExport::Namespace {
+                            exported: exported.name().to_string(),
+                            module: export.source.value.to_string(),
+                            type_only,
+                            span: self.span(export.span),
+                        },
+                    ));
             }
             Statement::TSEnumDeclaration(_) => {}
             _ => self
@@ -81,6 +125,45 @@ impl Lowerer {
                 .unsupported
                 .push(self.unsupported("unsupported_exported_declaration", declaration.span())),
         }
+    }
+
+    fn record_direct_exports(&mut self, declaration: &Declaration<'_>) {
+        let (names, span) = match declaration {
+            Declaration::FunctionDeclaration(function) => (
+                function
+                    .id
+                    .iter()
+                    .map(|identifier| identifier.name.to_string())
+                    .collect::<Vec<_>>(),
+                function.span,
+            ),
+            Declaration::VariableDeclaration(declaration) => (
+                declaration
+                    .declarations
+                    .iter()
+                    .filter_map(|declarator| match &declarator.id {
+                        BindingPattern::BindingIdentifier(identifier) => {
+                            Some(identifier.name.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                declaration.span,
+            ),
+            Declaration::TSEnumDeclaration(declaration) => {
+                (vec![declaration.id.name.to_string()], declaration.span)
+            }
+            _ => return,
+        };
+        let span = self.span(span);
+        self.output
+            .exports
+            .extend(names.into_iter().map(|name| FlowExport::Local {
+                local: name.clone(),
+                exported: name,
+                type_only: false,
+                span: span.clone(),
+            }));
     }
 
     fn lower_import(&mut self, declaration: &ImportDeclaration<'_>) {
@@ -207,11 +290,30 @@ impl Lowerer {
                     span: self.span(statement.span),
                 }),
                 Statement::ExpressionStatement(statement) => {
-                    lowered.push(FlowStatement::Expression {
-                        value: self.lower_expression(&statement.expression),
-                        span: self.span(statement.span),
-                    });
+                    if let Expression::AssignmentExpression(assignment) = &statement.expression
+                        && assignment.operator == AssignmentOperator::Assign
+                    {
+                        lowered.push(FlowStatement::Assign {
+                            target: self.lower_assignment_target(&assignment.left),
+                            value: self.lower_expression(&assignment.right),
+                            span: self.span(statement.span),
+                        });
+                    } else {
+                        lowered.push(FlowStatement::Expression {
+                            value: self.lower_expression(&statement.expression),
+                            span: self.span(statement.span),
+                        });
+                    }
                 }
+                Statement::IfStatement(statement) => lowered.push(FlowStatement::If {
+                    test: self.lower_expression(&statement.test),
+                    consequent: self.lower_branch(&statement.consequent),
+                    alternate: statement
+                        .alternate
+                        .as_ref()
+                        .map_or_else(Vec::new, |alternate| self.lower_branch(alternate)),
+                    span: self.span(statement.span),
+                }),
                 _ => lowered.push(FlowStatement::Unsupported(
                     self.unsupported("unsupported_function_statement", statement.span()),
                 )),
@@ -220,11 +322,57 @@ impl Lowerer {
         lowered
     }
 
+    fn lower_branch(&self, statement: &Statement<'_>) -> Vec<FlowStatement> {
+        match statement {
+            Statement::BlockStatement(block) => self.lower_statements(&block.body),
+            _ => self.lower_statements(std::slice::from_ref(statement)),
+        }
+    }
+
+    fn lower_assignment_target(
+        &self,
+        target: &oxc::ast::ast::AssignmentTarget<'_>,
+    ) -> FlowAssignmentTarget {
+        let Some(target) = target.as_simple_assignment_target() else {
+            return FlowAssignmentTarget::Unsupported {
+                syntax: "destructuring_assignment".to_owned(),
+                span: self.span(target.span()),
+            };
+        };
+        match target {
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                FlowAssignmentTarget::Identifier {
+                    name: identifier.name.to_string(),
+                }
+            }
+            SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                FlowAssignmentTarget::StaticMember {
+                    object: self.lower_expression(&member.object),
+                    property: member.property.name.to_string(),
+                }
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                FlowAssignmentTarget::ComputedMember {
+                    object: self.lower_expression(&member.object),
+                    property: self.lower_expression(&member.expression),
+                }
+            }
+            _ => FlowAssignmentTarget::Unsupported {
+                syntax: "unsupported_assignment_target".to_owned(),
+                span: self.span(target.span()),
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn lower_expression(&self, expression: &Expression<'_>) -> FlowExpression {
         let span = self.span(expression.span());
         let kind = match expression {
             Expression::StringLiteral(literal) => FlowExpressionKind::String {
                 value: literal.value.to_string(),
+            },
+            Expression::BooleanLiteral(literal) => FlowExpressionKind::Boolean {
+                value: literal.value,
             },
             Expression::Identifier(identifier) => FlowExpressionKind::Identifier {
                 name: identifier.name.to_string(),
@@ -282,6 +430,23 @@ impl Lowerer {
                     arguments,
                 }
             }
+            Expression::BinaryExpression(binary)
+                if matches!(
+                    binary.operator,
+                    BinaryOperator::StrictEquality | BinaryOperator::StrictInequality
+                ) =>
+            {
+                FlowExpressionKind::StrictEquality {
+                    left: Box::new(self.lower_expression(&binary.left)),
+                    right: Box::new(self.lower_expression(&binary.right)),
+                    negated: binary.operator == BinaryOperator::StrictInequality,
+                }
+            }
+            Expression::ConditionalExpression(conditional) => FlowExpressionKind::Conditional {
+                test: Box::new(self.lower_expression(&conditional.test)),
+                consequent: Box::new(self.lower_expression(&conditional.consequent)),
+                alternate: Box::new(self.lower_expression(&conditional.alternate)),
+            },
             Expression::ArrowFunctionExpression(function) => FlowExpressionKind::Arrow {
                 params: self.lower_params(&function.params),
                 body: match &function.body {

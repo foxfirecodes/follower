@@ -142,15 +142,26 @@ pub enum Reachability {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QueryValue {
     String { value: String },
+    Boolean { value: bool },
     Array { elements: Vec<QueryValue> },
     Undefined,
     Unknown { reason: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryLocation {
+    pub path: String,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryInvocation {
     pub evidence_id: String,
     pub callsite: SourceSpan,
+    pub location: Option<QueryLocation>,
     pub arguments: BTreeMap<String, QueryValue>,
 }
 
@@ -158,6 +169,7 @@ pub struct QueryInvocation {
 pub struct QueryCreation {
     pub creation_id: String,
     pub factory_callsite: SourceSpan,
+    pub factory_location: Option<QueryLocation>,
     pub reachability: Reachability,
     pub choice: String,
     pub factory_arguments: BTreeMap<String, QueryValue>,

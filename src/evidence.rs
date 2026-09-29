@@ -7,8 +7,10 @@ use crate::{ids::EvidenceId, ir::SourceSpan};
 pub enum RelationKind {
     ImportReference,
     ValueTransfer,
+    Mutation,
     Derivation,
     KeySelection,
+    BranchDependency,
     Capture,
     Call,
     Return,

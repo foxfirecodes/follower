@@ -54,6 +54,10 @@ fn lowering_is_owned_and_contains_reference_operations() {
             .iter()
             .any(|function| function.name == "Host")
     );
+    assert!(host.flow.exports.iter().any(|export| matches!(
+        export,
+        code_flow::ir::FlowExport::Local { exported, .. } if exported == "Host"
+    )));
     assert!(
         host.flow
             .functions

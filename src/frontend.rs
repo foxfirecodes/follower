@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use oxc::{
     allocator::Allocator,
     ast::ast::{
-        ArrowFunctionExpression, Expression, Function, ImportDeclaration, ImportOrExportKind,
-        TSEnumDeclaration,
+        ArrowFunctionExpression, ExportAllDeclaration, ExportFromDeclaration, Expression, Function,
+        ImportDeclaration, ImportOrExportKind, TSEnumDeclaration,
     },
     ast_visit::{Visit, walk},
     parser::{Parser, ParserReturn},
@@ -192,6 +192,24 @@ impl<'a> Visit<'a> for SyntaxCollector {
             type_only: declaration.import_kind == ImportOrExportKind::Type,
         });
         walk::walk_import_declaration(self, declaration);
+    }
+
+    fn visit_export_from_declaration(&mut self, declaration: &ExportFromDeclaration<'a>) {
+        self.imports.push(ImportIr {
+            specifier: declaration.source.value.to_string(),
+            span: owned_span(self.file_id, declaration.span),
+            type_only: declaration.export_kind == ImportOrExportKind::Type,
+        });
+        walk::walk_export_from_declaration(self, declaration);
+    }
+
+    fn visit_export_all_declaration(&mut self, declaration: &ExportAllDeclaration<'a>) {
+        self.imports.push(ImportIr {
+            specifier: declaration.source.value.to_string(),
+            span: owned_span(self.file_id, declaration.span),
+            type_only: declaration.export_kind == ImportOrExportKind::Type,
+        });
+        walk::walk_export_all_declaration(self, declaration);
     }
 
     fn visit_ts_enum_declaration(&mut self, declaration: &TSEnumDeclaration<'a>) {

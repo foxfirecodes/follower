@@ -1,6 +1,6 @@
 #![allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::{Context, Result, bail};
 
@@ -9,15 +9,17 @@ use crate::{
     evidence::{Evidence, RelationKind},
     ids::{EvidenceId, FileId},
     ir::{
-        FlowArrowBody, FlowBinding, FlowExpression, FlowExpressionKind, FlowFunction, FlowJsxProp,
-        FlowJsxTag, FlowPattern, FlowPatternKind, FlowStatement, SourceSpan,
+        FlowArrowBody, FlowAssignmentTarget, FlowBinding, FlowExpression, FlowExpressionKind,
+        FlowFunction, FlowJsxProp, FlowJsxTag, FlowPattern, FlowPatternKind, FlowStatement,
+        SourceSpan,
     },
+    link::SymbolLinker,
     models::{CallbackFactoryModel, CaptureSource, ModelEvidence, ModelValue, ModeledOperation},
     project::Project,
     queries::{AuditFinding, AuditReport, Conclusion, Coverage, FindingRef},
     query::{
-        QueryCreation, QueryInvocation, QueryReport, QueryScope, QuerySpec, QueryValue,
-        Reachability,
+        QueryCreation, QueryInvocation, QueryLocation, QueryReport, QueryScope, QuerySpec,
+        QueryValue, Reachability,
     },
 };
 
@@ -33,14 +35,6 @@ struct FunctionKey {
 struct FunctionDef {
     key: FunctionKey,
     function: FlowFunction,
-}
-
-#[derive(Clone)]
-struct ImportTarget {
-    imported: String,
-    module: String,
-    resolved: Option<std::path::PathBuf>,
-    type_only: bool,
 }
 
 #[derive(Clone)]
@@ -69,8 +63,10 @@ type Environment = BTreeMap<String, TrackedValue>;
 #[derive(Clone)]
 enum AbstractValue {
     String(String),
+    Boolean(bool),
     Record(BTreeMap<String, TrackedValue>),
     Array(Vec<TrackedValue>),
+    Union(Vec<TrackedValue>),
     Function(FunctionKey),
     ModelFunction,
     Closure(ClosureValue),
@@ -117,7 +113,7 @@ struct InvocationState {
 #[derive(Clone)]
 struct FactoryCallCandidate {
     file_id: FileId,
-    callee: String,
+    callee: FlowExpression,
     span: SourceSpan,
     arguments: Vec<FlowExpression>,
     enclosing_function: Option<FunctionKey>,
@@ -188,8 +184,7 @@ struct Solver<'a> {
     snapshot: &'a Snapshot,
     model: CallbackFactoryModel,
     functions: BTreeMap<FunctionKey, FunctionDef>,
-    functions_by_name: BTreeMap<String, Vec<FunctionKey>>,
-    imports: BTreeMap<(FileId, String), ImportTarget>,
+    symbol_linker: SymbolLinker<'a>,
     globals_ir: Vec<(FileId, FlowBinding)>,
     enum_globals: Environment,
     globals: Environment,
@@ -209,8 +204,6 @@ impl<'a> Solver<'a> {
         model: CallbackFactoryModel,
     ) -> Result<Self> {
         let mut functions = BTreeMap::new();
-        let mut functions_by_name: BTreeMap<String, Vec<FunctionKey>> = BTreeMap::new();
-        let mut imports = BTreeMap::new();
         let mut globals_ir = Vec::new();
         let mut enum_globals = Environment::new();
         let mut diagnostics = Vec::new();
@@ -224,10 +217,6 @@ impl<'a> Solver<'a> {
                     file_id: file.file_id,
                     name: function.name.clone(),
                 };
-                functions_by_name
-                    .entry(function.name.clone())
-                    .or_default()
-                    .push(key.clone());
                 functions.insert(
                     key.clone(),
                     FunctionDef {
@@ -244,22 +233,6 @@ impl<'a> Solver<'a> {
                     .map(|binding| (file.file_id, binding)),
             );
 
-            for import in &file.flow.imports {
-                let resolution = snapshot.resolutions.iter().find(|resolution| {
-                    resolution.importer == file.path && resolution.specifier == import.module
-                });
-                imports.insert(
-                    (file.file_id, import.local.clone()),
-                    ImportTarget {
-                        imported: import.imported.clone(),
-                        module: import.module.clone(),
-                        resolved: resolution
-                            .and_then(|resolution| resolution.resolved_path.clone()),
-                        type_only: import.type_only,
-                    },
-                );
-            }
-
             let mut enums: BTreeMap<String, BTreeMap<String, TrackedValue>> = BTreeMap::new();
             for member in &file.enum_members {
                 if let Some(value) = &member.string_value {
@@ -272,10 +245,6 @@ impl<'a> Solver<'a> {
             for (name, members) in enums {
                 enum_globals.insert(name, TrackedValue::plain(AbstractValue::Record(members)));
             }
-        }
-
-        for keys in functions_by_name.values_mut() {
-            keys.sort();
         }
 
         if model.r#match.project != project.config.name {
@@ -292,8 +261,7 @@ impl<'a> Solver<'a> {
             snapshot,
             model,
             functions,
-            functions_by_name,
-            imports,
+            symbol_linker: SymbolLinker::new(project, snapshot),
             globals_ir,
             globals: enum_globals.clone(),
             enum_globals,
@@ -489,6 +457,14 @@ impl<'a> Solver<'a> {
                 FlowStatement::Expression { value, .. } => {
                     self.eval(value, environment, file_id);
                 }
+                FlowStatement::Assign {
+                    target,
+                    value,
+                    span,
+                } => {
+                    let value = self.eval(value, environment, file_id);
+                    self.assign_target(target, value, environment, file_id, span.clone());
+                }
                 FlowStatement::Return { value, span } => {
                     let mut value = value.as_ref().map_or_else(
                         || TrackedValue::plain(AbstractValue::Undefined),
@@ -505,6 +481,77 @@ impl<'a> Solver<'a> {
                     value.evidence = Some(evidence);
                     return Some(value);
                 }
+                FlowStatement::If {
+                    test,
+                    consequent,
+                    alternate,
+                    span,
+                } => {
+                    let test = self.eval(test, environment, file_id);
+                    self.push_evidence(
+                        RelationKind::BranchDependency,
+                        "branch_condition",
+                        span.clone(),
+                        test.evidence.into_iter().collect(),
+                        None,
+                        "control flow depends on this condition",
+                    );
+                    match test.value {
+                        AbstractValue::Boolean(true) => {
+                            if let Some(value) =
+                                self.execute_statements(consequent, environment, file_id)
+                            {
+                                return Some(value);
+                            }
+                        }
+                        AbstractValue::Boolean(false) => {
+                            if let Some(value) =
+                                self.execute_statements(alternate, environment, file_id)
+                            {
+                                return Some(value);
+                            }
+                        }
+                        _ => {
+                            let mut consequent_environment = environment.clone();
+                            let mut alternate_environment = environment.clone();
+                            let left = self.execute_statements(
+                                consequent,
+                                &mut consequent_environment,
+                                file_id,
+                            );
+                            let right = self.execute_statements(
+                                alternate,
+                                &mut alternate_environment,
+                                file_id,
+                            );
+                            match (left, right) {
+                                (Some(left), Some(right)) => {
+                                    return Some(TrackedValue::plain(AbstractValue::Union(vec![
+                                        left, right,
+                                    ])));
+                                }
+                                (Some(value), None) | (None, Some(value)) => {
+                                    if !capability_ids(&value).is_empty() {
+                                        self.mark_value_unresolved(
+                                            &value,
+                                            "unknown branch returns on only one path",
+                                            span.clone(),
+                                        );
+                                        self.coverage_gaps.push(format!(
+                                            "partially returning unknown branch at file {} bytes {}..{}",
+                                            span.file_id.0, span.start, span.end
+                                        ));
+                                    }
+                                    return Some(TrackedValue::plain(AbstractValue::Union(vec![
+                                        value,
+                                        TrackedValue::unknown("non_returning_branch_continuation"),
+                                    ])));
+                                }
+                                (None, None) => {}
+                            }
+                        }
+                    }
+                }
                 FlowStatement::Unsupported(unsupported) => {
                     self.mark_values_unresolved(
                         environment.values(),
@@ -515,6 +562,129 @@ impl<'a> Solver<'a> {
             }
         }
         None
+    }
+
+    fn assign_target(
+        &mut self,
+        target: &FlowAssignmentTarget,
+        mut value: TrackedValue,
+        environment: &mut Environment,
+        file_id: FileId,
+        span: SourceSpan,
+    ) {
+        match target {
+            FlowAssignmentTarget::Identifier { name } => {
+                let parents = environment
+                    .get(name)
+                    .and_then(|previous| previous.evidence)
+                    .into_iter()
+                    .chain(value.evidence)
+                    .collect();
+                let evidence = self.push_evidence(
+                    RelationKind::Mutation,
+                    "assign_identifier",
+                    span,
+                    parents,
+                    None,
+                    &format!("assign a new value to {name}"),
+                );
+                value.evidence = Some(evidence);
+                environment.insert(name.clone(), value);
+            }
+            FlowAssignmentTarget::StaticMember { object, property } => {
+                self.assign_property(object, property, value, environment, file_id, span);
+            }
+            FlowAssignmentTarget::ComputedMember { object, property } => {
+                let property = self.eval(property, environment, file_id);
+                if let AbstractValue::String(property) = property.value {
+                    self.assign_property(object, &property, value, environment, file_id, span);
+                } else {
+                    let object = self.eval(object, environment, file_id);
+                    self.mark_values_unresolved(
+                        [&object, &value].into_iter(),
+                        "computed mutation key is not a finite string",
+                        span,
+                    );
+                }
+            }
+            FlowAssignmentTarget::Unsupported {
+                syntax,
+                span: target_span,
+            } => self.mark_value_unresolved(
+                &value,
+                &format!("unsupported assignment target: {syntax}"),
+                target_span.clone(),
+            ),
+        }
+    }
+
+    fn assign_property(
+        &mut self,
+        object: &FlowExpression,
+        property: &str,
+        mut value: TrackedValue,
+        environment: &mut Environment,
+        file_id: FileId,
+        span: SourceSpan,
+    ) {
+        let FlowExpressionKind::Identifier { name } = &object.kind else {
+            let object = self.eval(object, environment, file_id);
+            self.mark_values_unresolved(
+                [&object, &value].into_iter(),
+                "mutation target is not a directly tracked record binding",
+                span,
+            );
+            return;
+        };
+        let Some(previous) = environment.get(name).cloned() else {
+            self.mark_value_unresolved(&value, "mutation target binding is unknown", span);
+            return;
+        };
+        let AbstractValue::Record(mut fields) = previous.value.clone() else {
+            self.mark_values_unresolved(
+                [&previous, &value].into_iter(),
+                "mutation target is not a known record",
+                span,
+            );
+            return;
+        };
+        let affected_capabilities =
+            !capability_ids(&previous).is_empty() || !capability_ids(&value).is_empty();
+        if affected_capabilities {
+            self.mark_values_unresolved(
+                [&previous, &value].into_iter(),
+                "record property mutation may be observed through an alias",
+                span.clone(),
+            );
+            self.coverage_gaps.push(format!(
+                "record aliasing around mutation at file {} bytes {}..{}",
+                span.file_id.0, span.start, span.end
+            ));
+        }
+        let parents = fields
+            .get(property)
+            .and_then(|old| old.evidence)
+            .into_iter()
+            .chain(value.evidence)
+            .collect();
+        let evidence = self.push_evidence(
+            RelationKind::Mutation,
+            "assign_record_property",
+            span,
+            parents,
+            None,
+            &format!("assign property {name}.{property}"),
+        );
+        value.evidence = Some(evidence);
+        fields.insert(property.to_owned(), value);
+        environment.insert(
+            name.clone(),
+            TrackedValue {
+                value: AbstractValue::Record(fields),
+                evidence: Some(evidence),
+                choice: previous.choice,
+            },
+        );
     }
 
     fn bind_pattern(
@@ -573,6 +743,9 @@ impl<'a> Solver<'a> {
             FlowExpressionKind::String { value } => {
                 TrackedValue::plain(AbstractValue::String(value.clone()))
             }
+            FlowExpressionKind::Boolean { value } => {
+                TrackedValue::plain(AbstractValue::Boolean(*value))
+            }
             FlowExpressionKind::Identifier { name } => {
                 if let Some(value) = environment.get(name) {
                     let evidence = self.push_evidence(
@@ -591,13 +764,10 @@ impl<'a> Solver<'a> {
                 if self.identifier_matches_model(file_id, name) {
                     return TrackedValue::plain(AbstractValue::ModelFunction);
                 }
-                match self.functions_by_name.get(name) {
-                    Some(keys) if keys.len() == 1 => {
-                        TrackedValue::plain(AbstractValue::Function(keys[0].clone()))
-                    }
-                    Some(_) => TrackedValue::unknown(format!("ambiguous_function:{name}")),
-                    None => TrackedValue::unknown(format!("unresolved_identifier:{name}")),
-                }
+                self.resolve_function_identifier(file_id, name).map_or_else(
+                    || TrackedValue::unknown(format!("unresolved_identifier:{name}")),
+                    |key| TrackedValue::plain(AbstractValue::Function(key)),
+                )
             }
             FlowExpressionKind::Record { fields } => {
                 let values = fields
@@ -618,6 +788,14 @@ impl<'a> Solver<'a> {
                     .collect(),
             )),
             FlowExpressionKind::StaticMember { object, property } => {
+                if self.expression_matches_model(file_id, expression) {
+                    return TrackedValue::plain(AbstractValue::ModelFunction);
+                }
+                if let FlowExpressionKind::Identifier { name } = &object.kind
+                    && let Some(key) = self.resolve_namespace_function(file_id, name, property)
+                {
+                    return TrackedValue::plain(AbstractValue::Function(key));
+                }
                 let object = self.eval(object, environment, file_id);
                 self.read_property(
                     object,
@@ -627,6 +805,17 @@ impl<'a> Solver<'a> {
                 )
             }
             FlowExpressionKind::ComputedMember { object, property } => {
+                if self.expression_matches_model(file_id, expression) {
+                    return TrackedValue::plain(AbstractValue::ModelFunction);
+                }
+                if let (
+                    FlowExpressionKind::Identifier { name },
+                    FlowExpressionKind::String { value },
+                ) = (&object.kind, &property.kind)
+                    && let Some(key) = self.resolve_namespace_function(file_id, name, value)
+                {
+                    return TrackedValue::plain(AbstractValue::Function(key));
+                }
                 let object = self.eval(object, environment, file_id);
                 let property = self.eval(property, environment, file_id);
                 let AbstractValue::String(property_name) = &property.value else {
@@ -644,53 +833,72 @@ impl<'a> Solver<'a> {
                     RelationKind::KeySelection,
                 )
             }
+            FlowExpressionKind::StrictEquality {
+                left,
+                right,
+                negated,
+            } => {
+                let left = self.eval(left, environment, file_id);
+                let right = self.eval(right, environment, file_id);
+                let value = exact_equality(&left.value, &right.value).map_or_else(
+                    || AbstractValue::Unknown("non_finite_strict_equality".to_owned()),
+                    |equal| AbstractValue::Boolean(equal != *negated),
+                );
+                let evidence = self.push_evidence(
+                    RelationKind::Derivation,
+                    "strict_equality",
+                    expression.span.clone(),
+                    left.evidence.into_iter().chain(right.evidence).collect(),
+                    None,
+                    "derive exact strict-equality result",
+                );
+                TrackedValue {
+                    value,
+                    evidence: Some(evidence),
+                    choice: left.choice.or(right.choice),
+                }
+            }
+            FlowExpressionKind::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                let test = self.eval(test, environment, file_id);
+                self.push_evidence(
+                    RelationKind::BranchDependency,
+                    "conditional_expression",
+                    expression.span.clone(),
+                    test.evidence.into_iter().collect(),
+                    None,
+                    "conditional expression depends on this condition",
+                );
+                match test.value {
+                    AbstractValue::Boolean(true) => self.eval(consequent, environment, file_id),
+                    AbstractValue::Boolean(false) => self.eval(alternate, environment, file_id),
+                    _ => TrackedValue::plain(AbstractValue::Union(vec![
+                        self.eval(consequent, environment, file_id),
+                        self.eval(alternate, environment, file_id),
+                    ])),
+                }
+            }
             FlowExpressionKind::Call { callee, arguments } => {
+                if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
+                    && property == "map"
+                {
+                    return self.eval_array_map(
+                        object,
+                        arguments,
+                        environment,
+                        file_id,
+                        expression.span.clone(),
+                    );
+                }
                 let callee = self.eval(callee, environment, file_id);
                 let arguments = arguments
                     .iter()
                     .map(|argument| self.eval(argument, environment, file_id))
                     .collect::<Vec<_>>();
-                match callee.value {
-                    AbstractValue::ModelFunction => {
-                        self.call_model(&arguments, expression.span.clone())
-                    }
-                    AbstractValue::Capability(capability) => {
-                        let evidence = self.push_evidence(
-                            RelationKind::Invocation,
-                            "invoke_capability",
-                            expression.span.clone(),
-                            callee.evidence.into_iter().collect(),
-                            Some(self.model.id.clone()),
-                            "matching callback capability is invoked",
-                        );
-                        if let Some(state) = self.capabilities.get_mut(capability) {
-                            state.invocations.push(InvocationState {
-                                evidence,
-                                arguments: arguments.clone(),
-                            });
-                        }
-                        self.emit_modeled_effects(capability, evidence, expression.span.clone());
-                        TrackedValue::plain(AbstractValue::Undefined)
-                    }
-                    AbstractValue::Closure(closure) => self.call_closure(&closure, arguments),
-                    AbstractValue::Function(key) => self.call_function(&key, arguments),
-                    AbstractValue::Unknown(reason) => {
-                        self.mark_values_unresolved(
-                            arguments.iter(),
-                            &format!("call through unknown target: {reason}"),
-                            expression.span.clone(),
-                        );
-                        TrackedValue::unknown("unknown_call_result")
-                    }
-                    _ => {
-                        self.mark_values_unresolved(
-                            arguments.iter(),
-                            "value passed to unsupported call target",
-                            expression.span.clone(),
-                        );
-                        TrackedValue::unknown("unsupported_call_target")
-                    }
-                }
+                self.invoke_value(callee, arguments, expression.span.clone())
             }
             FlowExpressionKind::Arrow { params, body } => {
                 let mut parents = environment
@@ -731,6 +939,126 @@ impl<'a> Solver<'a> {
                     expression.span.clone(),
                 );
                 TrackedValue::unknown(syntax.clone())
+            }
+        }
+    }
+
+    fn invoke_value(
+        &mut self,
+        callee: TrackedValue,
+        arguments: Vec<TrackedValue>,
+        span: SourceSpan,
+    ) -> TrackedValue {
+        match callee.value {
+            AbstractValue::ModelFunction => self.call_model(&arguments, span),
+            AbstractValue::Capability(capability) => {
+                let evidence = self.push_evidence(
+                    RelationKind::Invocation,
+                    "invoke_capability",
+                    span.clone(),
+                    callee.evidence.into_iter().collect(),
+                    Some(self.model.id.clone()),
+                    "matching callback capability is invoked",
+                );
+                if let Some(state) = self.capabilities.get_mut(capability) {
+                    state.invocations.push(InvocationState {
+                        evidence,
+                        arguments: arguments.clone(),
+                    });
+                }
+                self.emit_modeled_effects(capability, evidence, span);
+                TrackedValue::plain(AbstractValue::Undefined)
+            }
+            AbstractValue::Closure(closure) => self.call_closure(&closure, arguments),
+            AbstractValue::Function(key) => self.call_function(&key, arguments),
+            AbstractValue::Unknown(reason) => {
+                self.mark_values_unresolved(
+                    arguments.iter(),
+                    &format!("call through unknown target: {reason}"),
+                    span,
+                );
+                TrackedValue::unknown("unknown_call_result")
+            }
+            _ => {
+                self.mark_values_unresolved(
+                    arguments.iter(),
+                    "value passed to unsupported call target",
+                    span,
+                );
+                TrackedValue::unknown("unsupported_call_target")
+            }
+        }
+    }
+
+    fn eval_array_map(
+        &mut self,
+        object: &FlowExpression,
+        arguments: &[FlowExpression],
+        environment: &Environment,
+        file_id: FileId,
+        span: SourceSpan,
+    ) -> TrackedValue {
+        let receiver = self.eval(object, environment, file_id);
+        let callback = arguments.first().map_or_else(
+            || TrackedValue::unknown("missing_map_callback"),
+            |callback| self.eval(callback, environment, file_id),
+        );
+        match receiver.value {
+            AbstractValue::Array(elements) => {
+                let original = TrackedValue::plain(AbstractValue::Array(elements.clone()));
+                let mapped = elements
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, element)| {
+                        self.invoke_value(
+                            callback.clone(),
+                            vec![
+                                element,
+                                TrackedValue::unknown(format!("array_index:{index}")),
+                                original.clone(),
+                            ],
+                            span.clone(),
+                        )
+                    })
+                    .collect();
+                TrackedValue::plain(AbstractValue::Array(mapped))
+            }
+            AbstractValue::Unknown(reason) => {
+                let before = self.capabilities.len();
+                let mut affected = capability_ids(&callback);
+                let mapped = self.invoke_value(
+                    callback,
+                    vec![TrackedValue::unknown("symbolic_array_element")],
+                    span.clone(),
+                );
+                affected.extend(capability_ids(&mapped));
+                affected.extend(before..self.capabilities.len());
+                affected.sort_unstable();
+                affected.dedup();
+                if !affected.is_empty() {
+                    self.coverage_gaps.push(format!(
+                        "array map receiver is unknown ({reason}) at file {} bytes {}..{}",
+                        span.file_id.0, span.start, span.end
+                    ));
+                    for capability in affected {
+                        let evidence = self.push_evidence(
+                            RelationKind::UnresolvedEscape,
+                            "unknown_array_map_receiver",
+                            span.clone(),
+                            Vec::new(),
+                            None,
+                            "array map receiver is unknown, so iteration coverage is incomplete",
+                        );
+                        if let Some(state) = self.capabilities.get_mut(capability) {
+                            state.unresolved.push(evidence);
+                        }
+                    }
+                }
+                TrackedValue::plain(AbstractValue::Array(vec![mapped]))
+            }
+            _ => {
+                self.mark_value_unresolved(&receiver, "map receiver is not a known array", span);
+                TrackedValue::unknown("unsupported_map_receiver")
             }
         }
     }
@@ -804,8 +1132,15 @@ impl<'a> Solver<'a> {
     }
 
     fn render(&mut self, value: TrackedValue) {
-        let AbstractValue::Element(element) = value.value else {
-            return;
+        let element = match value.value {
+            AbstractValue::Element(element) => element,
+            AbstractValue::Array(values) | AbstractValue::Union(values) => {
+                for value in values {
+                    self.render(value);
+                }
+                return;
+            }
+            _ => return,
         };
         match &element.component.value {
             AbstractValue::Function(key) => {
@@ -829,6 +1164,15 @@ impl<'a> Solver<'a> {
                 &format!("element has unknown component target: {reason}"),
                 element.span,
             ),
+            AbstractValue::Union(components) => {
+                for component in components.clone() {
+                    self.render(TrackedValue::plain(AbstractValue::Element(ElementValue {
+                        component: Box::new(component),
+                        props: element.props.clone(),
+                        span: element.span.clone(),
+                    })));
+                }
+            }
             _ => self.mark_values_unresolved(
                 element.props.values(),
                 "element target is not a component",
@@ -1097,6 +1441,14 @@ impl<'a> Solver<'a> {
         span: SourceSpan,
         relation: RelationKind,
     ) -> TrackedValue {
+        if let AbstractValue::Union(values) = object.value.clone() {
+            return TrackedValue::plain(AbstractValue::Union(
+                values
+                    .into_iter()
+                    .map(|value| self.read_property(value, property, span.clone(), relation))
+                    .collect(),
+            ));
+        }
         let AbstractValue::Record(fields) = &object.value else {
             self.mark_value_unresolved(
                 &object,
@@ -1141,49 +1493,78 @@ impl<'a> Solver<'a> {
     }
 
     fn import_matches_model(&self, file_id: FileId, local: &str) -> bool {
-        let Some(import) = self.imports.get(&(file_id, local.to_owned())) else {
-            return false;
-        };
-        if import.type_only || import.imported != self.model.r#match.export {
-            return false;
-        }
-        let expected = self
-            .project
-            .resolve_path(Path::new(&self.model.r#match.module));
-        match (&import.resolved, expected.canonicalize()) {
-            (Some(resolved), Ok(expected)) => *resolved == expected,
-            _ => {
-                import.module.trim_start_matches("./")
-                    == Path::new(&self.model.r#match.module)
-                        .file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .unwrap_or_default()
-            }
-        }
+        self.symbol_linker
+            .imported_binding_matches(file_id, local, &self.model.r#match)
+    }
+
+    fn namespace_member_matches_model(&self, file_id: FileId, local: &str, member: &str) -> bool {
+        self.symbol_linker
+            .namespace_member_matches(file_id, local, member, &self.model.r#match)
     }
 
     fn local_matches_model(&self, file_id: FileId, name: &str) -> bool {
-        if name != self.model.r#match.export {
-            return false;
-        }
-        let Some(file) = self
-            .snapshot
-            .files
-            .iter()
-            .find(|file| file.file_id == file_id)
-        else {
-            return false;
-        };
-        let expected = self
-            .project
-            .resolve_path(Path::new(&self.model.r#match.module));
-        expected
-            .canonicalize()
-            .is_ok_and(|expected| file.path == expected)
+        self.symbol_linker
+            .local_declaration_matches(file_id, name, &self.model.r#match)
     }
 
     fn identifier_matches_model(&self, file_id: FileId, name: &str) -> bool {
         self.import_matches_model(file_id, name) || self.local_matches_model(file_id, name)
+    }
+
+    fn resolve_function_identifier(&self, file_id: FileId, name: &str) -> Option<FunctionKey> {
+        let local = FunctionKey {
+            file_id,
+            name: name.to_owned(),
+        };
+        if self.functions.contains_key(&local) {
+            return Some(local);
+        }
+        self.symbol_linker
+            .resolve_imported_binding(file_id, name)
+            .and_then(|symbol| {
+                let key = FunctionKey {
+                    file_id: symbol.file_id,
+                    name: symbol.name,
+                };
+                self.functions.contains_key(&key).then_some(key)
+            })
+    }
+
+    fn resolve_namespace_function(
+        &self,
+        file_id: FileId,
+        namespace: &str,
+        member: &str,
+    ) -> Option<FunctionKey> {
+        self.symbol_linker
+            .resolve_namespace_member(file_id, namespace, member)
+            .and_then(|symbol| {
+                let key = FunctionKey {
+                    file_id: symbol.file_id,
+                    name: symbol.name,
+                };
+                self.functions.contains_key(&key).then_some(key)
+            })
+    }
+
+    fn expression_matches_model(&self, file_id: FileId, expression: &FlowExpression) -> bool {
+        match &expression.kind {
+            FlowExpressionKind::Identifier { name } => self.identifier_matches_model(file_id, name),
+            FlowExpressionKind::StaticMember { object, property } => {
+                matches!(&object.kind, FlowExpressionKind::Identifier { name }
+                    if self.namespace_member_matches_model(file_id, name, property))
+            }
+            FlowExpressionKind::ComputedMember { object, property } => {
+                matches!(
+                    (&object.kind, &property.kind),
+                    (
+                        FlowExpressionKind::Identifier { name },
+                        FlowExpressionKind::String { value }
+                    ) if self.namespace_member_matches_model(file_id, name, value)
+                )
+            }
+            _ => false,
+        }
     }
 
     fn seed_unreached_creations(&mut self) {
@@ -1217,7 +1598,7 @@ impl<'a> Solver<'a> {
         candidates.dedup_by(|left, right| left.span == right.span);
 
         for candidate in candidates {
-            if !self.identifier_matches_model(candidate.file_id, &candidate.callee) {
+            if !self.expression_matches_model(candidate.file_id, &candidate.callee) {
                 continue;
             }
             if self
@@ -1433,6 +1814,8 @@ impl<'a> Solver<'a> {
                     .map(|invocation| QueryInvocation {
                         evidence_id: format!("E{}", invocation.evidence.0),
                         callsite: self.evidence[invocation.evidence.0 as usize].span.clone(),
+                        location: self
+                            .query_location(&self.evidence[invocation.evidence.0 as usize].span),
                         arguments: query
                             .capability
                             .invocation_arguments
@@ -1454,6 +1837,7 @@ impl<'a> Solver<'a> {
                 Some(QueryCreation {
                     creation_id: format!("{snapshot_prefix}-Q{index}"),
                     factory_callsite: capability.callsite.clone(),
+                    factory_location: self.query_location(&capability.callsite),
                     reachability: capability.reachability,
                     choice: capability.choice.clone(),
                     factory_arguments,
@@ -1489,7 +1873,7 @@ impl<'a> Solver<'a> {
             .map(|entry| format!("{}#{}", entry.module.display(), entry.export))
             .collect();
         QueryReport {
-            schema_version: 1,
+            schema_version: 2,
             snapshot_id: self.snapshot.snapshot_id.clone(),
             config_hash: self.snapshot.config_hash.clone(),
             query_hash: query_hash.to_owned(),
@@ -1525,6 +1909,24 @@ impl<'a> Solver<'a> {
             span: evidence.span.clone(),
         }
     }
+
+    fn query_location(&self, span: &SourceSpan) -> Option<QueryLocation> {
+        let file = self
+            .snapshot
+            .files
+            .iter()
+            .find(|file| file.file_id == span.file_id)?;
+        let source = fs::read_to_string(&file.path).ok()?;
+        let (start_line, start_column) = line_column(&source, span.start);
+        let (end_line, end_column) = line_column(&source, span.end);
+        Some(QueryLocation {
+            path: display_path(&self.project.root, &file.path),
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        })
+    }
 }
 
 fn capability_ids(value: &TrackedValue) -> Vec<usize> {
@@ -1543,7 +1945,7 @@ fn collect_capability_ids(value: &TrackedValue, ids: &mut Vec<usize>) {
                 collect_capability_ids(field, ids);
             }
         }
-        AbstractValue::Array(elements) => {
+        AbstractValue::Array(elements) | AbstractValue::Union(elements) => {
             for element in elements {
                 collect_capability_ids(element, ids);
             }
@@ -1566,6 +1968,7 @@ fn collect_capability_ids(value: &TrackedValue, ids: &mut Vec<usize>) {
 fn render_compact_value(value: &TrackedValue) -> String {
     match &value.value {
         AbstractValue::String(value) => value.clone(),
+        AbstractValue::Boolean(value) => value.to_string(),
         AbstractValue::Array(elements) => format!(
             "[{}]",
             elements
@@ -1576,6 +1979,14 @@ fn render_compact_value(value: &TrackedValue) -> String {
         ),
         AbstractValue::Undefined => "undefined".to_owned(),
         AbstractValue::Unknown(reason) => format!("<{reason}>"),
+        AbstractValue::Union(values) => format!(
+            "({})",
+            values
+                .iter()
+                .map(render_compact_value)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ),
         _ => "<symbolic>".to_owned(),
     }
 }
@@ -1592,6 +2003,10 @@ fn query_value(value: &TrackedValue) -> QueryValue {
         AbstractValue::Unknown(reason) => QueryValue::Unknown {
             reason: reason.clone(),
         },
+        AbstractValue::Boolean(value) => QueryValue::Boolean { value: *value },
+        AbstractValue::Union(_) => QueryValue::Unknown {
+            reason: "joined_alternatives".to_owned(),
+        },
         AbstractValue::Record(_) => QueryValue::Unknown {
             reason: "record_value".to_owned(),
         },
@@ -1606,6 +2021,19 @@ fn query_value(value: &TrackedValue) -> QueryValue {
     }
 }
 
+fn exact_equality(left: &AbstractValue, right: &AbstractValue) -> Option<bool> {
+    match (left, right) {
+        (AbstractValue::String(left), AbstractValue::String(right)) => Some(left == right),
+        (AbstractValue::Boolean(left), AbstractValue::Boolean(right)) => Some(left == right),
+        (AbstractValue::Undefined, AbstractValue::Undefined) => Some(true),
+        (AbstractValue::String(_) | AbstractValue::Boolean(_) | AbstractValue::Undefined, _)
+        | (_, AbstractValue::String(_) | AbstractValue::Boolean(_) | AbstractValue::Undefined) => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
 fn collect_factory_calls(
     expression: &FlowExpression,
     file_id: FileId,
@@ -1614,15 +2042,13 @@ fn collect_factory_calls(
 ) {
     match &expression.kind {
         FlowExpressionKind::Call { callee, arguments } => {
-            if let FlowExpressionKind::Identifier { name } = &callee.kind {
-                candidates.push(FactoryCallCandidate {
-                    file_id,
-                    callee: name.clone(),
-                    span: expression.span.clone(),
-                    arguments: arguments.clone(),
-                    enclosing_function: enclosing_function.cloned(),
-                });
-            }
+            candidates.push(FactoryCallCandidate {
+                file_id,
+                callee: callee.as_ref().clone(),
+                span: expression.span.clone(),
+                arguments: arguments.clone(),
+                enclosing_function: enclosing_function.cloned(),
+            });
             collect_factory_calls(callee, file_id, enclosing_function, candidates);
             for argument in arguments {
                 collect_factory_calls(argument, file_id, enclosing_function, candidates);
@@ -1644,6 +2070,19 @@ fn collect_factory_calls(
         FlowExpressionKind::ComputedMember { object, property } => {
             collect_factory_calls(object, file_id, enclosing_function, candidates);
             collect_factory_calls(property, file_id, enclosing_function, candidates);
+        }
+        FlowExpressionKind::StrictEquality { left, right, .. } => {
+            collect_factory_calls(left, file_id, enclosing_function, candidates);
+            collect_factory_calls(right, file_id, enclosing_function, candidates);
+        }
+        FlowExpressionKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            collect_factory_calls(test, file_id, enclosing_function, candidates);
+            collect_factory_calls(consequent, file_id, enclosing_function, candidates);
+            collect_factory_calls(alternate, file_id, enclosing_function, candidates);
         }
         FlowExpressionKind::Arrow { body, .. } => match body {
             FlowArrowBody::Expression { expression } => {
@@ -1671,6 +2110,7 @@ fn collect_factory_calls(
             }
         }
         FlowExpressionKind::String { .. }
+        | FlowExpressionKind::Boolean { .. }
         | FlowExpressionKind::Identifier { .. }
         | FlowExpressionKind::Unsupported { .. } => {}
     }
@@ -1694,6 +2134,31 @@ fn collect_factory_calls_statement(
         FlowStatement::Expression { value, .. } => {
             collect_factory_calls(value, file_id, enclosing_function, candidates);
         }
+        FlowStatement::Assign { target, value, .. } => {
+            collect_factory_calls(value, file_id, enclosing_function, candidates);
+            match target {
+                FlowAssignmentTarget::StaticMember { object, .. } => {
+                    collect_factory_calls(object, file_id, enclosing_function, candidates);
+                }
+                FlowAssignmentTarget::ComputedMember { object, property } => {
+                    collect_factory_calls(object, file_id, enclosing_function, candidates);
+                    collect_factory_calls(property, file_id, enclosing_function, candidates);
+                }
+                FlowAssignmentTarget::Identifier { .. }
+                | FlowAssignmentTarget::Unsupported { .. } => {}
+            }
+        }
+        FlowStatement::If {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            collect_factory_calls(test, file_id, enclosing_function, candidates);
+            for statement in consequent.iter().chain(alternate) {
+                collect_factory_calls_statement(statement, file_id, enclosing_function, candidates);
+            }
+        }
         FlowStatement::Unsupported(_) => {}
     }
 }
@@ -1703,6 +2168,27 @@ fn display_path(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+fn line_column(source: &str, offset: u32) -> (u32, u32) {
+    let mut offset = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(source.len());
+    while !source.is_char_boundary(offset) {
+        offset = offset.saturating_sub(1);
+    }
+    let prefix = &source[..offset];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, current_line)| current_line)
+        .chars()
+        .count()
+        + 1;
+    (
+        u32::try_from(line).unwrap_or(u32::MAX),
+        u32::try_from(column).unwrap_or(u32::MAX),
+    )
 }
 
 fn fallback_span(file_id: FileId) -> SourceSpan {

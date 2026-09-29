@@ -131,24 +131,23 @@ fn print_query_report(report: &QueryReport) {
     );
     for creation in &report.creations {
         println!(
-            "{} [{}] {:?} @ file {} bytes {}..{}",
+            "{} [{}] {:?} @ {}",
             creation.creation_id,
             creation.choice,
             creation.conclusion,
-            creation.factory_callsite.file_id.0,
-            creation.factory_callsite.start,
-            creation.factory_callsite.end
+            render_location(
+                creation.factory_location.as_ref(),
+                &creation.factory_callsite
+            )
         );
         for (label, value) in &creation.factory_arguments {
             println!("  factory {label} = {}", render_query_value(value));
         }
         for invocation in &creation.invocations {
             println!(
-                "  invocation {} @ file {} bytes {}..{}",
+                "  invocation {} @ {}",
                 invocation.evidence_id,
-                invocation.callsite.file_id.0,
-                invocation.callsite.start,
-                invocation.callsite.end
+                render_location(invocation.location.as_ref(), &invocation.callsite)
             );
             for (label, value) in &invocation.arguments {
                 println!("    {label} = {}", render_query_value(value));
@@ -170,9 +169,25 @@ fn print_query_report(report: &QueryReport) {
     );
 }
 
+fn render_location(
+    location: Option<&code_flow::query::QueryLocation>,
+    span: &code_flow::ir::SourceSpan,
+) -> String {
+    location.map_or_else(
+        || format!("file {} bytes {}..{}", span.file_id.0, span.start, span.end),
+        |location| {
+            format!(
+                "{}:{}:{}",
+                location.path, location.start_line, location.start_column
+            )
+        },
+    )
+}
+
 fn render_query_value(value: &QueryValue) -> String {
     match value {
         QueryValue::String { value } => format!("{value:?}"),
+        QueryValue::Boolean { value } => value.to_string(),
         QueryValue::Array { elements } => format!(
             "[{}]",
             elements

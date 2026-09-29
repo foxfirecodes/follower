@@ -51,18 +51,33 @@ flow query --project flow.toml --query query.toml --format json
   an otherwise-unreached enclosing function once with unknown parameters. Such rows have
   `reachability = "unknown"`, an unresolved reference, and an incomplete-coverage gap; they are
   not falsely presented as reachable runtime behavior.
-- `candidate_invocation` means the selected capability reached a modeled call or React event path.
+- `candidate_invocation` means the selected capability reached at least one modeled call or React
+  event path. Its row may also contain unresolved escapes for other paths.
   `absent_within_model` means no invocation or unresolved escape was found in the explored scope.
-  `unresolved` means an unsupported or opaque operation prevents that claim.
+  An `unresolved` conclusion means no invocation was found and an unsupported or opaque operation
+  prevents an absence claim.
 - `--fail-on-unresolved` exits unsuccessfully when a creation's conclusion is `unresolved`.
 
-The report includes source byte spans and an evidence graph. Line/column rendering and snapshot
-reuse are not implemented yet.
+Query report schema version 2 includes both stable source byte spans and repository-relative,
+one-based line/column locations for factory calls and invocations. The text renderer uses
+`path:line:column`; JSON retains both forms along with the evidence graph. Snapshot reuse is not
+implemented yet.
 
 ## Current analysis fragment
 
 The engine follows destructuring, local calls and closures, records, finite computed record
-selection, arrays, JSX component props/spreads, prop renaming, wrapper callbacks, and intrinsic
-`onClick` handlers. Symbol matching resolves named imports to the configured module and also
-recognizes a call from inside the defining module. Re-exports, namespace-member calls, mutations,
-branches, loops, and array methods such as `.map` still require additional IR and solver work.
+selection, arrays, exact string/boolean strict-equality branches, conditional expressions,
+literal-array `.map`, JSX component props/spreads, prop renaming, wrapper callbacks, simple
+identifier reassignment, and intrinsic `onClick` handlers. Factory matching and ordinary
+function/component calls use canonical identities across named import aliases, explicit renamed
+re-exports, local imported-then-exported aliases, `export *` chains, and direct namespace member
+calls. Same-named declarations in unrelated modules therefore do not enter the call graph.
+
+An unknown `.map` receiver gets one symbolic element. It becomes a coverage gap only when the
+callback, mapped result, or symbolic iteration contains a capability selected by the query.
+Unknown conditions explore both branches; a branch that returns on only one side likewise records
+a gap only when that partial return contains a selected capability. Record-property assignment is
+lowered, but a mutation involving a tracked callback is conservatively unresolved because another
+record alias may observe the old or new property. Namespace re-exports (`export * as ns`), precise
+heap aliasing, general truthiness, non-strict comparisons, loops, and array methods other than
+`.map` still require additional IR and solver work.

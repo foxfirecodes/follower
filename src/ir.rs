@@ -68,6 +68,8 @@ pub struct FileIr {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FlowFileIr {
     pub imports: Vec<FlowImport>,
+    #[serde(default)]
+    pub exports: Vec<FlowExport>,
     pub globals: Vec<FlowBinding>,
     pub functions: Vec<FlowFunction>,
     pub unsupported: Vec<UnsupportedIr>,
@@ -80,6 +82,35 @@ pub struct FlowImport {
     pub module: String,
     pub type_only: bool,
     pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FlowExport {
+    Local {
+        local: String,
+        exported: String,
+        type_only: bool,
+        span: SourceSpan,
+    },
+    ReExport {
+        imported: String,
+        exported: String,
+        module: String,
+        type_only: bool,
+        span: SourceSpan,
+    },
+    Star {
+        module: String,
+        type_only: bool,
+        span: SourceSpan,
+    },
+    Namespace {
+        exported: String,
+        module: String,
+        type_only: bool,
+        span: SourceSpan,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -109,7 +140,38 @@ pub enum FlowStatement {
         value: FlowExpression,
         span: SourceSpan,
     },
+    Assign {
+        target: FlowAssignmentTarget,
+        value: FlowExpression,
+        span: SourceSpan,
+    },
+    If {
+        test: FlowExpression,
+        consequent: Vec<FlowStatement>,
+        alternate: Vec<FlowStatement>,
+        span: SourceSpan,
+    },
     Unsupported(UnsupportedIr),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FlowAssignmentTarget {
+    Identifier {
+        name: String,
+    },
+    StaticMember {
+        object: FlowExpression,
+        property: String,
+    },
+    ComputedMember {
+        object: FlowExpression,
+        property: FlowExpression,
+    },
+    Unsupported {
+        syntax: String,
+        span: SourceSpan,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,6 +206,9 @@ pub enum FlowExpressionKind {
     String {
         value: String,
     },
+    Boolean {
+        value: bool,
+    },
     Identifier {
         name: String,
     },
@@ -164,6 +229,16 @@ pub enum FlowExpressionKind {
     Call {
         callee: Box<FlowExpression>,
         arguments: Vec<FlowExpression>,
+    },
+    StrictEquality {
+        left: Box<FlowExpression>,
+        right: Box<FlowExpression>,
+        negated: bool,
+    },
+    Conditional {
+        test: Box<FlowExpression>,
+        consequent: Box<FlowExpression>,
+        alternate: Box<FlowExpression>,
     },
     Arrow {
         params: Vec<FlowPattern>,
