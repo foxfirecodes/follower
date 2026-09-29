@@ -247,6 +247,17 @@ impl Lowerer {
                 }
                 FlowExpressionKind::Record { fields }
             }
+            Expression::ArrayExpression(array) => {
+                let mut elements = Vec::with_capacity(array.elements.len());
+                for element in &array.elements {
+                    let Some(element) = element.as_expression() else {
+                        return self
+                            .unsupported_expression("array_spread_or_elision", expression.span());
+                    };
+                    elements.push(self.lower_expression(element));
+                }
+                FlowExpressionKind::Array { elements }
+            }
             Expression::StaticMemberExpression(member) => FlowExpressionKind::StaticMember {
                 object: Box::new(self.lower_expression(&member.object)),
                 property: member.property.name.to_string(),

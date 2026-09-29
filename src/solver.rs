@@ -12,9 +12,13 @@ use crate::{
         FlowArrowBody, FlowBinding, FlowExpression, FlowExpressionKind, FlowFunction, FlowJsxProp,
         FlowJsxTag, FlowPattern, FlowPatternKind, FlowStatement, SourceSpan,
     },
-    models::{CallbackFactoryModel, CaptureSource, ModelValue, ModeledOperation},
+    models::{CallbackFactoryModel, CaptureSource, ModelEvidence, ModelValue, ModeledOperation},
     project::Project,
     queries::{AuditFinding, AuditReport, Conclusion, Coverage, FindingRef},
+    query::{
+        QueryCreation, QueryInvocation, QueryReport, QueryScope, QuerySpec, QueryValue,
+        Reachability,
+    },
 };
 
 const MAX_CALL_DEPTH: usize = 128;
@@ -66,6 +70,7 @@ type Environment = BTreeMap<String, TrackedValue>;
 enum AbstractValue {
     String(String),
     Record(BTreeMap<String, TrackedValue>),
+    Array(Vec<TrackedValue>),
     Function(FunctionKey),
     ModelFunction,
     Closure(ClosureValue),
@@ -96,10 +101,26 @@ struct CapabilityState {
     choice: String,
     callsite: SourceSpan,
     origin: EvidenceId,
+    factory_arguments: Vec<TrackedValue>,
+    reachability: Reachability,
     registrations: Vec<EvidenceId>,
-    invocations: Vec<EvidenceId>,
+    invocations: Vec<InvocationState>,
     unresolved: Vec<EvidenceId>,
     assumptions: Vec<String>,
+}
+
+struct InvocationState {
+    evidence: EvidenceId,
+    arguments: Vec<TrackedValue>,
+}
+
+#[derive(Clone)]
+struct FactoryCallCandidate {
+    file_id: FileId,
+    callee: String,
+    span: SourceSpan,
+    arguments: Vec<FlowExpression>,
+    enclosing_function: Option<FunctionKey>,
 }
 
 pub fn audit(
@@ -111,6 +132,55 @@ pub fn audit(
     let mut solver = Solver::new(project, snapshot, model.clone())?;
     solver.run()?;
     Ok(solver.report(model_hash))
+}
+
+pub fn execute_query(
+    project: &Project,
+    snapshot: &Snapshot,
+    query: &QuerySpec,
+    query_hash: &str,
+) -> Result<QueryReport> {
+    let captures = query
+        .factory_arguments
+        .iter()
+        .map(|projection| {
+            (
+                projection.label.clone(),
+                CaptureSource::Argument {
+                    index: projection.index,
+                },
+            )
+        })
+        .collect();
+    let model = CallbackFactoryModel {
+        id: format!("query:{}", query.id),
+        r#match: query.factory.clone(),
+        returned_property: query.capability.returned_property.clone(),
+        retains_returned_callback: Some(false),
+        invokes_returned_callback_during_call: Some(false),
+        captures,
+        on_invoke: Vec::new(),
+        evidence: ModelEvidence {
+            kind: "query_instrumentation".to_owned(),
+            reason: format!(
+                "query {} treats the selected return as a capability",
+                query.id
+            ),
+        },
+    };
+    let mut solver = Solver::new(project, snapshot, model)?;
+    if project.config.entries.is_empty() {
+        if query.scope == QueryScope::Reachable {
+            bail!("a reachable query requires at least one configured entry point");
+        }
+        solver.prepare_globals();
+    } else {
+        solver.run()?;
+    }
+    if query.scope == QueryScope::AllCreations {
+        solver.seed_unreached_creations();
+    }
+    Ok(solver.query_report(query, query_hash))
 }
 
 struct Solver<'a> {
@@ -128,6 +198,7 @@ struct Solver<'a> {
     diagnostics: Vec<String>,
     coverage_gaps: Vec<String>,
     current_choice: Option<String>,
+    current_reachability: Reachability,
     call_depth: usize,
 }
 
@@ -231,71 +302,118 @@ impl<'a> Solver<'a> {
             diagnostics,
             coverage_gaps: Vec::new(),
             current_choice: None,
+            current_reachability: Reachability::Reachable,
             call_depth: 0,
         })
     }
 
     fn run(&mut self) -> Result<()> {
-        let entry = self
-            .project
-            .config
-            .entries
-            .first()
-            .context("audit requires a configured entry point")?;
-        let entry_path = self
-            .project
-            .resolve_path(&entry.module)
-            .canonicalize()
-            .with_context(|| format!("failed to locate entry module {}", entry.module.display()))?;
-        let entry_file = self
-            .snapshot
-            .files
-            .iter()
-            .find(|file| file.path == entry_path)
-            .with_context(|| format!("entry module was not indexed: {}", entry_path.display()))?;
-        let entry_key = FunctionKey {
-            file_id: entry_file.file_id,
-            name: entry.export.clone(),
-        };
-        if !self.functions.contains_key(&entry_key) {
-            bail!(
-                "entry export {} was not lowered from {}",
-                entry.export,
-                entry.module.display()
-            );
+        if self.project.config.entries.is_empty() {
+            bail!("analysis requires a configured entry point");
         }
-
-        let input_name = format!("{}.variant", entry.export);
-        let variants = self
-            .project
-            .config
-            .inputs
-            .get(&input_name)
-            .cloned()
-            .with_context(|| format!("audit requires a finite input domain for {input_name}"))?;
-
-        for variant in variants {
-            self.current_choice = Some(variant.clone());
-            self.prepare_globals();
-            let mut props = BTreeMap::new();
-            props.insert(
-                "variant".to_owned(),
-                TrackedValue {
-                    value: AbstractValue::String(variant.clone()),
-                    evidence: None,
-                    choice: Some(variant.clone()),
-                },
-            );
-            let argument = TrackedValue {
-                value: AbstractValue::Record(props),
-                evidence: None,
-                choice: Some(variant),
+        let entries = self.project.config.entries.clone();
+        for entry in &entries {
+            let entry_path = self
+                .project
+                .resolve_path(&entry.module)
+                .canonicalize()
+                .with_context(|| {
+                    format!("failed to locate entry module {}", entry.module.display())
+                })?;
+            let entry_file = self
+                .snapshot
+                .files
+                .iter()
+                .find(|file| file.path == entry_path)
+                .with_context(|| {
+                    format!("entry module was not indexed: {}", entry_path.display())
+                })?;
+            let entry_key = FunctionKey {
+                file_id: entry_file.file_id,
+                name: entry.export.clone(),
             };
-            let returned = self.call_function(&entry_key, vec![argument]);
-            self.render(returned);
+            let parameter_count = self
+                .functions
+                .get(&entry_key)
+                .with_context(|| {
+                    format!(
+                        "entry export {} was not lowered from {}",
+                        entry.export,
+                        entry.module.display()
+                    )
+                })?
+                .function
+                .params
+                .len();
+
+            for props in self.entry_input_combinations(&entry.export)? {
+                let choice = choice_label(&props);
+                self.current_choice = Some(choice.clone());
+                self.prepare_globals();
+                let record = props
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (
+                            name,
+                            TrackedValue {
+                                value: AbstractValue::String(value),
+                                evidence: None,
+                                choice: Some(choice.clone()),
+                            },
+                        )
+                    })
+                    .collect();
+                let mut arguments = Vec::with_capacity(parameter_count.max(1));
+                if parameter_count > 0 {
+                    arguments.push(TrackedValue {
+                        value: AbstractValue::Record(record),
+                        evidence: None,
+                        choice: Some(choice),
+                    });
+                    arguments.extend(
+                        (1..parameter_count)
+                            .map(|_| TrackedValue::unknown("unconfigured_entry_argument")),
+                    );
+                }
+                let returned = self.call_function(&entry_key, arguments);
+                self.render(returned);
+            }
         }
         self.current_choice = None;
         Ok(())
+    }
+
+    fn entry_input_combinations(&self, export: &str) -> Result<Vec<BTreeMap<String, String>>> {
+        let prefix = format!("{export}.");
+        let domains = self
+            .project
+            .config
+            .inputs
+            .iter()
+            .filter_map(|(name, values)| {
+                name.strip_prefix(&prefix)
+                    .map(|property| (property.to_owned(), values))
+            })
+            .collect::<Vec<_>>();
+        let mut combinations = vec![BTreeMap::new()];
+        for (property, values) in domains {
+            if values.is_empty() {
+                bail!("input domain {export}.{property} cannot be empty");
+            }
+            let mut expanded = Vec::new();
+            for combination in &combinations {
+                for value in values {
+                    let mut next = combination.clone();
+                    next.insert(property.clone(), value.clone());
+                    expanded.push(next);
+                    if expanded.len() > 4096 {
+                        bail!("entry input product for {export} exceeds 4096 contexts");
+                    }
+                }
+            }
+            combinations = expanded;
+        }
+        Ok(combinations)
     }
 
     fn prepare_globals(&mut self) {
@@ -470,7 +588,7 @@ impl<'a> Solver<'a> {
                         ..value.clone()
                     };
                 }
-                if self.import_matches_model(file_id, name) {
+                if self.identifier_matches_model(file_id, name) {
                     return TrackedValue::plain(AbstractValue::ModelFunction);
                 }
                 match self.functions_by_name.get(name) {
@@ -493,6 +611,12 @@ impl<'a> Solver<'a> {
                     .collect();
                 TrackedValue::plain(AbstractValue::Record(values))
             }
+            FlowExpressionKind::Array { elements } => TrackedValue::plain(AbstractValue::Array(
+                elements
+                    .iter()
+                    .map(|element| self.eval(element, environment, file_id))
+                    .collect(),
+            )),
             FlowExpressionKind::StaticMember { object, property } => {
                 let object = self.eval(object, environment, file_id);
                 self.read_property(
@@ -540,7 +664,10 @@ impl<'a> Solver<'a> {
                             "matching callback capability is invoked",
                         );
                         if let Some(state) = self.capabilities.get_mut(capability) {
-                            state.invocations.push(evidence);
+                            state.invocations.push(InvocationState {
+                                evidence,
+                                arguments: arguments.clone(),
+                            });
                         }
                         self.emit_modeled_effects(capability, evidence, expression.span.clone());
                         TrackedValue::plain(AbstractValue::Undefined)
@@ -745,7 +872,10 @@ impl<'a> Solver<'a> {
                     "registered callback may be invoked by a later click",
                 );
                 if let Some(state) = self.capabilities.get_mut(*capability) {
-                    state.invocations.push(evidence);
+                    state.invocations.push(InvocationState {
+                        evidence,
+                        arguments: Vec::new(),
+                    });
                 }
                 self.emit_modeled_effects(*capability, evidence, element_span.clone());
             }
@@ -804,10 +934,7 @@ impl<'a> Solver<'a> {
             .cloned()
             .or_else(|| captures.values().next().cloned())
             .unwrap_or_else(|| TrackedValue::unknown("missing_key_capture"));
-        let key = match &key_value.value {
-            AbstractValue::String(value) => value.clone(),
-            _ => "<symbolic>".to_owned(),
-        };
+        let key = render_compact_value(&key_value);
         let choice = key_value
             .choice
             .clone()
@@ -830,7 +957,7 @@ impl<'a> Solver<'a> {
         ];
         let mut unresolved = Vec::new();
         let mut invocations = Vec::new();
-        if missing_capture || !matches!(key_value.value, AbstractValue::String(_)) {
+        if missing_capture {
             let evidence = self.push_evidence(
                 RelationKind::UnresolvedEscape,
                 "incomplete_callback_factory_capture",
@@ -840,6 +967,16 @@ impl<'a> Solver<'a> {
                 "callback factory capture could not be resolved from call arguments",
             );
             unresolved.push(evidence);
+        }
+        if self.current_reachability == Reachability::Unknown {
+            unresolved.push(self.push_evidence(
+                RelationKind::UnresolvedEscape,
+                "factory_callsite_not_reached",
+                span.clone(),
+                vec![origin],
+                Some(self.model.id.clone()),
+                "factory callsite was not reached from configured roots; local context is unknown",
+            ));
         }
         match self.model.retains_returned_callback {
             Some(false) => {
@@ -866,14 +1003,17 @@ impl<'a> Solver<'a> {
             Some(false) => {
                 assumptions.push("model does not invoke the capability during creation".to_owned());
             }
-            Some(true) => invocations.push(self.push_evidence(
-                RelationKind::Invocation,
-                "callback_factory_invokes_during_call",
-                span.clone(),
-                vec![origin],
-                Some(self.model.id.clone()),
-                "factory model invokes the returned capability during creation",
-            )),
+            Some(true) => invocations.push(InvocationState {
+                evidence: self.push_evidence(
+                    RelationKind::Invocation,
+                    "callback_factory_invokes_during_call",
+                    span.clone(),
+                    vec![origin],
+                    Some(self.model.id.clone()),
+                    "factory model invokes the returned capability during creation",
+                ),
+                arguments: Vec::new(),
+            }),
             None => unresolved.push(self.push_evidence(
                 RelationKind::UnresolvedEscape,
                 "unknown_callback_factory_creation_invocation",
@@ -888,12 +1028,19 @@ impl<'a> Solver<'a> {
             choice: choice.clone(),
             callsite: span.clone(),
             origin,
+            factory_arguments: arguments.to_vec(),
+            reachability: self.current_reachability,
             registrations: Vec::new(),
-            invocations: invocations.clone(),
+            invocations,
             unresolved,
             assumptions,
         });
-        for invocation in invocations {
+        let creation_invocations = self.capabilities[capability_id]
+            .invocations
+            .iter()
+            .map(|invocation| invocation.evidence)
+            .collect::<Vec<_>>();
+        for invocation in creation_invocations {
             self.emit_modeled_effects(capability_id, invocation, span.clone());
         }
         let capability = TrackedValue {
@@ -1015,6 +1162,119 @@ impl<'a> Solver<'a> {
         }
     }
 
+    fn local_matches_model(&self, file_id: FileId, name: &str) -> bool {
+        if name != self.model.r#match.export {
+            return false;
+        }
+        let Some(file) = self
+            .snapshot
+            .files
+            .iter()
+            .find(|file| file.file_id == file_id)
+        else {
+            return false;
+        };
+        let expected = self
+            .project
+            .resolve_path(Path::new(&self.model.r#match.module));
+        expected
+            .canonicalize()
+            .is_ok_and(|expected| file.path == expected)
+    }
+
+    fn identifier_matches_model(&self, file_id: FileId, name: &str) -> bool {
+        self.import_matches_model(file_id, name) || self.local_matches_model(file_id, name)
+    }
+
+    fn seed_unreached_creations(&mut self) {
+        let mut candidates = Vec::new();
+        for file in &self.snapshot.files {
+            for binding in &file.flow.globals {
+                collect_factory_calls(&binding.value, file.file_id, None, &mut candidates);
+            }
+            for function in &file.flow.functions {
+                let key = FunctionKey {
+                    file_id: file.file_id,
+                    name: function.name.clone(),
+                };
+                for statement in &function.body {
+                    collect_factory_calls_statement(
+                        statement,
+                        file.file_id,
+                        Some(&key),
+                        &mut candidates,
+                    );
+                }
+            }
+        }
+        candidates.sort_by_key(|candidate| {
+            (
+                candidate.span.file_id,
+                candidate.span.start,
+                candidate.span.end,
+            )
+        });
+        candidates.dedup_by(|left, right| left.span == right.span);
+
+        for candidate in candidates {
+            if !self.identifier_matches_model(candidate.file_id, &candidate.callee) {
+                continue;
+            }
+            if self
+                .capabilities
+                .iter()
+                .any(|capability| capability.callsite == candidate.span)
+            {
+                if self.capabilities.iter().any(|capability| {
+                    capability.callsite == candidate.span
+                        && capability.reachability == Reachability::Unknown
+                }) {
+                    self.record_unreached_gap(&candidate.span);
+                }
+                continue;
+            }
+            self.current_choice = Some("<unreached>".to_owned());
+            self.current_reachability = Reachability::Unknown;
+            if let Some(key) = &candidate.enclosing_function {
+                let parameter_count = self
+                    .functions
+                    .get(key)
+                    .map_or(0, |definition| definition.function.params.len());
+                let arguments = (0..parameter_count)
+                    .map(|_| TrackedValue::unknown("unreached_function_parameter"))
+                    .collect();
+                let returned = self.call_function(key, arguments);
+                self.render(returned);
+            }
+            if !self
+                .capabilities
+                .iter()
+                .any(|capability| capability.callsite == candidate.span)
+            {
+                let environment = self.globals.clone();
+                let arguments = candidate
+                    .arguments
+                    .iter()
+                    .map(|argument| self.eval(argument, &environment, candidate.file_id))
+                    .collect::<Vec<_>>();
+                self.call_model(&arguments, candidate.span.clone());
+            }
+            self.record_unreached_gap(&candidate.span);
+        }
+        self.current_choice = None;
+        self.current_reachability = Reachability::Reachable;
+    }
+
+    fn record_unreached_gap(&mut self, span: &SourceSpan) {
+        let gap = format!(
+            "factory call at file {} bytes {}..{} was not reached from configured roots",
+            span.file_id.0, span.start, span.end
+        );
+        if !self.coverage_gaps.contains(&gap) {
+            self.coverage_gaps.push(gap);
+        }
+    }
+
     fn mark_values_unresolved<'b>(
         &mut self,
         values: impl Iterator<Item = &'b TrackedValue>,
@@ -1094,7 +1354,7 @@ impl<'a> Solver<'a> {
                     invocations: capability
                         .invocations
                         .iter()
-                        .map(|&evidence| self.finding_ref(evidence))
+                        .map(|invocation| self.finding_ref(invocation.evidence))
                         .collect(),
                     unresolved: capability
                         .unresolved
@@ -1132,6 +1392,131 @@ impl<'a> Solver<'a> {
         }
     }
 
+    fn query_report(self, query: &QuerySpec, query_hash: &str) -> QueryReport {
+        let snapshot_prefix = &self.snapshot.snapshot_id[..12.min(self.snapshot.snapshot_id.len())];
+        let creations = self
+            .capabilities
+            .iter()
+            .enumerate()
+            .filter_map(|(index, capability)| {
+                if !query.report.include_non_invoked && capability.invocations.is_empty() {
+                    return None;
+                }
+                let conclusion = if !capability.invocations.is_empty() {
+                    Conclusion::CandidateInvocation
+                } else if capability.unresolved.is_empty() {
+                    Conclusion::AbsentWithinModel
+                } else {
+                    Conclusion::Unresolved
+                };
+                let factory_arguments = query
+                    .factory_arguments
+                    .iter()
+                    .map(|projection| {
+                        (
+                            projection.label.clone(),
+                            capability
+                                .factory_arguments
+                                .get(projection.index)
+                                .map_or_else(
+                                    || QueryValue::Unknown {
+                                        reason: "missing_argument".to_owned(),
+                                    },
+                                    query_value,
+                                ),
+                        )
+                    })
+                    .collect();
+                let invocations = capability
+                    .invocations
+                    .iter()
+                    .map(|invocation| QueryInvocation {
+                        evidence_id: format!("E{}", invocation.evidence.0),
+                        callsite: self.evidence[invocation.evidence.0 as usize].span.clone(),
+                        arguments: query
+                            .capability
+                            .invocation_arguments
+                            .iter()
+                            .map(|projection| {
+                                (
+                                    projection.label.clone(),
+                                    invocation.arguments.get(projection.index).map_or_else(
+                                        || QueryValue::Unknown {
+                                            reason: "missing_argument".to_owned(),
+                                        },
+                                        query_value,
+                                    ),
+                                )
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                Some(QueryCreation {
+                    creation_id: format!("{snapshot_prefix}-Q{index}"),
+                    factory_callsite: capability.callsite.clone(),
+                    reachability: capability.reachability,
+                    choice: capability.choice.clone(),
+                    factory_arguments,
+                    capability_path: query.capability.returned_property.clone(),
+                    registrations: if query.report.include_registrations {
+                        capability
+                            .registrations
+                            .iter()
+                            .map(|&evidence| self.finding_ref(evidence))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                    invocations,
+                    unresolved: if query.report.include_unresolved_escapes {
+                        capability
+                            .unresolved
+                            .iter()
+                            .map(|&evidence| self.finding_ref(evidence))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                    conclusion,
+                })
+            })
+            .collect();
+        let roots = self
+            .project
+            .config
+            .entries
+            .iter()
+            .map(|entry| format!("{}#{}", entry.module.display(), entry.export))
+            .collect();
+        QueryReport {
+            schema_version: 1,
+            snapshot_id: self.snapshot.snapshot_id.clone(),
+            config_hash: self.snapshot.config_hash.clone(),
+            query_hash: query_hash.to_owned(),
+            query_id: query.id.clone(),
+            kind: query.kind,
+            scope: query.scope,
+            creations,
+            evidence: self.evidence,
+            coverage: Coverage {
+                scope: match query.scope {
+                    QueryScope::Reachable => {
+                        "reachable from configured roots with finite input domains".to_owned()
+                    }
+                    QueryScope::AllCreations => {
+                        "all matched creations; reachability explored from configured roots"
+                            .to_owned()
+                    }
+                },
+                roots,
+                processed_files: self.snapshot.files.len(),
+                complete: self.diagnostics.is_empty() && self.coverage_gaps.is_empty(),
+                gaps: self.coverage_gaps,
+            },
+            diagnostics: self.diagnostics,
+        }
+    }
+
     fn finding_ref(&self, evidence_id: EvidenceId) -> FindingRef {
         let evidence = &self.evidence[evidence_id.0 as usize];
         FindingRef {
@@ -1158,6 +1543,11 @@ fn collect_capability_ids(value: &TrackedValue, ids: &mut Vec<usize>) {
                 collect_capability_ids(field, ids);
             }
         }
+        AbstractValue::Array(elements) => {
+            for element in elements {
+                collect_capability_ids(element, ids);
+            }
+        }
         AbstractValue::Closure(closure) => {
             for captured in closure.environment.values() {
                 collect_capability_ids(captured, ids);
@@ -1170,6 +1560,141 @@ fn collect_capability_ids(value: &TrackedValue, ids: &mut Vec<usize>) {
             }
         }
         _ => {}
+    }
+}
+
+fn render_compact_value(value: &TrackedValue) -> String {
+    match &value.value {
+        AbstractValue::String(value) => value.clone(),
+        AbstractValue::Array(elements) => format!(
+            "[{}]",
+            elements
+                .iter()
+                .map(render_compact_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        AbstractValue::Undefined => "undefined".to_owned(),
+        AbstractValue::Unknown(reason) => format!("<{reason}>"),
+        _ => "<symbolic>".to_owned(),
+    }
+}
+
+fn query_value(value: &TrackedValue) -> QueryValue {
+    match &value.value {
+        AbstractValue::String(value) => QueryValue::String {
+            value: value.clone(),
+        },
+        AbstractValue::Array(elements) => QueryValue::Array {
+            elements: elements.iter().map(query_value).collect(),
+        },
+        AbstractValue::Undefined => QueryValue::Undefined,
+        AbstractValue::Unknown(reason) => QueryValue::Unknown {
+            reason: reason.clone(),
+        },
+        AbstractValue::Record(_) => QueryValue::Unknown {
+            reason: "record_value".to_owned(),
+        },
+        AbstractValue::Function(_)
+        | AbstractValue::ModelFunction
+        | AbstractValue::Closure(_)
+        | AbstractValue::Capability(_)
+        | AbstractValue::Element(_)
+        | AbstractValue::Intrinsic(_) => QueryValue::Unknown {
+            reason: "non_data_value".to_owned(),
+        },
+    }
+}
+
+fn collect_factory_calls(
+    expression: &FlowExpression,
+    file_id: FileId,
+    enclosing_function: Option<&FunctionKey>,
+    candidates: &mut Vec<FactoryCallCandidate>,
+) {
+    match &expression.kind {
+        FlowExpressionKind::Call { callee, arguments } => {
+            if let FlowExpressionKind::Identifier { name } = &callee.kind {
+                candidates.push(FactoryCallCandidate {
+                    file_id,
+                    callee: name.clone(),
+                    span: expression.span.clone(),
+                    arguments: arguments.clone(),
+                    enclosing_function: enclosing_function.cloned(),
+                });
+            }
+            collect_factory_calls(callee, file_id, enclosing_function, candidates);
+            for argument in arguments {
+                collect_factory_calls(argument, file_id, enclosing_function, candidates);
+            }
+        }
+        FlowExpressionKind::Record { fields } => {
+            for field in fields {
+                collect_factory_calls(&field.value, file_id, enclosing_function, candidates);
+            }
+        }
+        FlowExpressionKind::Array { elements } => {
+            for element in elements {
+                collect_factory_calls(element, file_id, enclosing_function, candidates);
+            }
+        }
+        FlowExpressionKind::StaticMember { object, .. } => {
+            collect_factory_calls(object, file_id, enclosing_function, candidates);
+        }
+        FlowExpressionKind::ComputedMember { object, property } => {
+            collect_factory_calls(object, file_id, enclosing_function, candidates);
+            collect_factory_calls(property, file_id, enclosing_function, candidates);
+        }
+        FlowExpressionKind::Arrow { body, .. } => match body {
+            FlowArrowBody::Expression { expression } => {
+                collect_factory_calls(expression, file_id, enclosing_function, candidates);
+            }
+            FlowArrowBody::Statements { statements } => {
+                for statement in statements {
+                    collect_factory_calls_statement(
+                        statement,
+                        file_id,
+                        enclosing_function,
+                        candidates,
+                    );
+                }
+            }
+        },
+        FlowExpressionKind::JsxElement { props, .. } => {
+            for prop in props {
+                match prop {
+                    FlowJsxProp::Property { value, .. } | FlowJsxProp::Spread { value, .. } => {
+                        collect_factory_calls(value, file_id, enclosing_function, candidates);
+                    }
+                    FlowJsxProp::Unsupported(_) => {}
+                }
+            }
+        }
+        FlowExpressionKind::String { .. }
+        | FlowExpressionKind::Identifier { .. }
+        | FlowExpressionKind::Unsupported { .. } => {}
+    }
+}
+
+fn collect_factory_calls_statement(
+    statement: &FlowStatement,
+    file_id: FileId,
+    enclosing_function: Option<&FunctionKey>,
+    candidates: &mut Vec<FactoryCallCandidate>,
+) {
+    match statement {
+        FlowStatement::Bind(binding) => {
+            collect_factory_calls(&binding.value, file_id, enclosing_function, candidates);
+        }
+        FlowStatement::Return { value, .. } => {
+            if let Some(value) = value {
+                collect_factory_calls(value, file_id, enclosing_function, candidates);
+            }
+        }
+        FlowStatement::Expression { value, .. } => {
+            collect_factory_calls(value, file_id, enclosing_function, candidates);
+        }
+        FlowStatement::Unsupported(_) => {}
     }
 }
 
@@ -1186,4 +1711,18 @@ fn fallback_span(file_id: FileId) -> SourceSpan {
         start: 0,
         end: 0,
     }
+}
+
+fn choice_label(props: &BTreeMap<String, String>) -> String {
+    if props.is_empty() {
+        return "<unconstrained>".to_owned();
+    }
+    if props.len() == 1 {
+        return props.values().next().cloned().unwrap_or_default();
+    }
+    props
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }

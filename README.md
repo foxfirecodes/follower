@@ -13,6 +13,19 @@ cargo run -- index --project fixtures/reference/flow.toml
 cargo run -- audit --project fixtures/reference/flow.toml --model notice-dismiss-v1
 ```
 
+The first generic query family finds factory calls, projects selected factory arguments, follows a
+selected property of the returned value, and projects arguments at every invocation. The fixture
+uses an array-valued factory argument and forwards the returned callback through React props:
+
+```sh
+cargo run -- query \
+  --project fixtures/factory-query/flow.toml \
+  --query fixtures/factory-query/query.toml
+```
+
+Use `--format json` for the stable machine-readable report. The query declaration and current
+semantics are documented in [`docs/QUERY.md`](docs/QUERY.md).
+
 To exercise a callback forwarded through three components with prop renaming and two independent
 creation contexts:
 

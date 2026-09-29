@@ -15,8 +15,11 @@ This is an implementation experiment, not the completed M4 analyzer described by
 - `flow index` writes a content-derived snapshot with parser, symbol, function, CFG, enum, import,
   and owned-flow data.
 - `flow audit` interprets a tested fragment: constants, records, finite computed selection,
-  destructuring, calls, returns, closures, function-component rendering, JSX props and spreads,
-  and intrinsic `onClick` registration.
+  arrays, destructuring, calls, returns, closures, function-component rendering, JSX props and
+  spreads, and intrinsic `onClick` registration.
+- `flow query` implements the first generic query family: match a factory symbol, project selected
+  creation arguments, follow one returned property as a capability, and project its invocation
+  arguments. Query declarations are strict, versioned TOML and reports are JSON-serializable.
 - Each configured selector alternative runs in a separate choice context. The reference audit
   preserves the registry row's key, component, callback creation, prop flow, wrapper registration,
   and invocation result.
@@ -39,6 +42,11 @@ The `prop-chain` fixture sends two independently created callbacks through the s
 walks backward from each invocation through the evidence graph and requires the intermediate
 `render_prop_binding` relations to remain attached to the matching `alpha` or `beta` choice.
 
+The `factory-query` fixture projects an array of thing types from `useHideableThing`, follows
+the destructured `markHandled` callback through renamed component props, and correlates it with
+the dismissal type passed at invocation. It also contains an unrendered component to verify that
+`all_creations` emits an explicit unknown-reachability row and coverage gap.
+
 ## Important limitations
 
 - This is a bounded interpreter for the first fixtures, not yet the monotone worklist solver from
@@ -47,14 +55,16 @@ walks backward from each invocation through the evidence graph and requires the 
 - Function and enum lookup outside the modeled import matcher is still name-based. The audit
   fixture keeps relevant declarations unambiguous and local; production claims must wait for
   resolved identities.
-- Branches, loops, mutation, arrays and `.map`, getters/proxies, exceptions/finally, recursion
-  summaries, state/refs, historical renders, and custom event contracts are not analyzed yet.
+- Branches, loops, mutation, array methods such as `.map`, getters/proxies, exceptions/finally,
+  recursion summaries, state/refs, historical renders, and custom event contracts are not analyzed
+  yet.
 - Query-specific unsupported operations become unresolved only when they can see a tracked
   capability in the current environment. This rule needs adversarial acceptance tests before it
   supports production absence claims.
 - React event semantics are currently built into the experiment. They should be compiled from a
   versioned framework model pack before the solver boundary is considered stable.
-- `trace` and `explain` commands, snapshot reuse/invalidation, line/column presentation,
+- Additional query families, `trace` and `explain` commands, snapshot reuse/invalidation,
+  line/column presentation,
   performance metrics, and worker-count determinism tests remain to be built.
 
 ## Next implementation steps

@@ -11,6 +11,7 @@ use crate::{
     models::{Model, load_model_files},
     project::Project,
     queries::AuditReport,
+    query::{QueryReport, QuerySpec},
 };
 
 pub struct Analyzer {
@@ -87,5 +88,11 @@ impl Analyzer {
                 crate::solver::audit(&self.project, &snapshot, factory, &models.content_hash)
             }
         }
+    }
+
+    pub fn query(&self, query: &QuerySpec, query_hash: &str) -> Result<QueryReport> {
+        query.validate()?;
+        let snapshot = self.index()?;
+        crate::solver::execute_query(&self.project, &snapshot, query, query_hash)
     }
 }

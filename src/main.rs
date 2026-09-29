@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use code_flow::{Analyzer, Project};
+use code_flow::{
+    Analyzer, Project,
+    query::{QueryReport, QueryValue, load_query},
+};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -33,6 +36,17 @@ enum Command {
         model: String,
         #[arg(long, value_enum, default_value_t = AuditScope::Reachable)]
         scope: AuditScope,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+        #[arg(long)]
+        fail_on_unresolved: bool,
+    },
+    /// Run a generic creation-to-invocation flow query.
+    Query {
+        #[arg(long)]
+        project: PathBuf,
+        #[arg(long)]
+        query: PathBuf,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
         #[arg(long)]
@@ -77,6 +91,98 @@ fn main() -> Result<()> {
             format,
             fail_on_unresolved,
         } => audit(&project, &model, format, fail_on_unresolved),
+        Command::Query {
+            project,
+            query,
+            format,
+            fail_on_unresolved,
+        } => run_query(&project, &query, format, fail_on_unresolved),
+    }
+}
+
+fn run_query(
+    config_path: &std::path::Path,
+    query_path: &std::path::Path,
+    format: OutputFormat,
+    fail_on_unresolved: bool,
+) -> Result<()> {
+    let analyzer = Analyzer::new(Project::load(config_path)?);
+    let (query, query_hash) = load_query(query_path)?;
+    let report = analyzer.query(&query, &query_hash)?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        OutputFormat::Text => print_query_report(&report),
+    }
+    if fail_on_unresolved
+        && report
+            .creations
+            .iter()
+            .any(|creation| creation.conclusion == code_flow::queries::Conclusion::Unresolved)
+    {
+        anyhow::bail!("query contains unresolved creations");
+    }
+    Ok(())
+}
+
+fn print_query_report(report: &QueryReport) {
+    println!(
+        "query {} in snapshot {} ({:?})",
+        report.query_id, report.snapshot_id, report.scope
+    );
+    for creation in &report.creations {
+        println!(
+            "{} [{}] {:?} @ file {} bytes {}..{}",
+            creation.creation_id,
+            creation.choice,
+            creation.conclusion,
+            creation.factory_callsite.file_id.0,
+            creation.factory_callsite.start,
+            creation.factory_callsite.end
+        );
+        for (label, value) in &creation.factory_arguments {
+            println!("  factory {label} = {}", render_query_value(value));
+        }
+        for invocation in &creation.invocations {
+            println!(
+                "  invocation {} @ file {} bytes {}..{}",
+                invocation.evidence_id,
+                invocation.callsite.file_id.0,
+                invocation.callsite.start,
+                invocation.callsite.end
+            );
+            for (label, value) in &invocation.arguments {
+                println!("    {label} = {}", render_query_value(value));
+            }
+        }
+        for unresolved in &creation.unresolved {
+            println!("  unresolved {}", unresolved.summary);
+        }
+    }
+    println!(
+        "coverage: {} ({} creations, {} processed files)",
+        if report.coverage.complete {
+            "complete for modeled scope"
+        } else {
+            "incomplete"
+        },
+        report.creations.len(),
+        report.coverage.processed_files
+    );
+}
+
+fn render_query_value(value: &QueryValue) -> String {
+    match value {
+        QueryValue::String { value } => format!("{value:?}"),
+        QueryValue::Array { elements } => format!(
+            "[{}]",
+            elements
+                .iter()
+                .map(render_query_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        QueryValue::Undefined => "undefined".to_owned(),
+        QueryValue::Unknown { reason } => format!("<unknown: {reason}>"),
     }
 }
 

@@ -11,6 +11,7 @@ pub mod link;
 pub mod models;
 pub mod project;
 pub mod queries;
+pub mod query;
 mod solver;
 
 pub use analysis::Analyzer;

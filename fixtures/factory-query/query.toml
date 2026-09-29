@@ -1,0 +1,20 @@
+schema_version = 1
+id = "hideable-things"
+kind = "factory_return_invocations"
+scope = "all_creations"
+
+[factory]
+project = "factory-query"
+module = "src/hideable.ts"
+export = "useHideableThing"
+
+[[factory_arguments]]
+index = 0
+label = "thing_types"
+
+[capability]
+returned_property = ["markHandled"]
+
+[[capability.invocation_arguments]]
+index = 0
+label = "hide_kind"

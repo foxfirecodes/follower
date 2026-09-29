@@ -150,6 +150,9 @@ pub enum FlowExpressionKind {
     Record {
         fields: Vec<FlowRecordField>,
     },
+    Array {
+        elements: Vec<FlowExpression>,
+    },
     StaticMember {
         object: Box<FlowExpression>,
         property: String,
