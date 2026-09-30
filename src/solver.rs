@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::Path,
+    rc::Rc,
     time::Instant,
 };
 
@@ -23,14 +24,15 @@ use crate::{
     project::Project,
     queries::{AuditFinding, AuditReport, Conclusion, Coverage, FindingRef},
     query::{
-        QueryCreation, QueryInvocation, QueryLocation, QueryReport, QueryScope, QuerySpec,
-        QueryValue, Reachability,
+        QueryCallsiteInventory, QueryCreation, QueryInvocation, QueryLocation, QueryReport,
+        QueryScope, QuerySpec, QueryValue, Reachability,
     },
 };
 
 const MAX_CALL_DEPTH: usize = 128;
 const MAX_REVERSE_IMPORTER_EVALUATIONS: usize = 5_000;
 const MAX_REVERSE_IMPORTER_SOURCE_BYTES: usize = 20_000;
+const MAX_HEAP_ALTERNATIVES: usize = 32;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FunctionKey {
@@ -49,6 +51,7 @@ struct TrackedValue {
     value: AbstractValue,
     evidence: Option<EvidenceId>,
     choice: Option<String>,
+    heap_id: Option<u64>,
 }
 
 impl TrackedValue {
@@ -57,6 +60,7 @@ impl TrackedValue {
             value,
             evidence: None,
             choice: None,
+            heap_id: None,
         }
     }
 
@@ -236,7 +240,7 @@ pub fn execute_query(
     }
     let producer_paths = solver
         .capability_producer_files
-        .iter()
+        .union(&solver.caller_producer_files)
         .filter_map(|file_id| snapshot.files.iter().find(|file| file.file_id == *file_id))
         .map(|file| file.path.clone())
         .collect();
@@ -267,12 +271,16 @@ struct Solver<'a> {
     module_env_cache: BTreeMap<FileId, Environment>,
     module_env_cache_hits: usize,
     module_env_cache_misses: usize,
+    heap: BTreeMap<u64, Rc<AbstractValue>>,
+    heap_versions: BTreeMap<u64, u64>,
+    next_heap_id: u64,
     evidence: Vec<Evidence>,
     capabilities: Vec<CapabilityState>,
     diagnostics: Vec<String>,
     coverage_gaps: Vec<String>,
     requested_imports: BTreeSet<std::path::PathBuf>,
     capability_producer_files: BTreeSet<FileId>,
+    caller_producer_files: BTreeSet<FileId>,
     current_choice: Option<String>,
     current_reachability: Reachability,
     call_depth: usize,
@@ -369,6 +377,9 @@ impl<'a> Solver<'a> {
             module_env_cache: BTreeMap::new(),
             module_env_cache_hits: 0,
             module_env_cache_misses: 0,
+            heap: BTreeMap::new(),
+            heap_versions: BTreeMap::new(),
+            next_heap_id: 0,
             evidence: Vec::new(),
             capabilities: Vec::new(),
             diagnostics,
@@ -379,6 +390,7 @@ impl<'a> Solver<'a> {
             },
             requested_imports: BTreeSet::new(),
             capability_producer_files: BTreeSet::new(),
+            caller_producer_files: BTreeSet::new(),
             current_choice: None,
             current_reachability: Reachability::Reachable,
             call_depth: 0,
@@ -450,6 +462,7 @@ impl<'a> Solver<'a> {
                                 value: AbstractValue::String(value),
                                 evidence: None,
                                 choice: Some(choice.clone()),
+                                heap_id: None,
                             },
                         )
                     })
@@ -460,6 +473,7 @@ impl<'a> Solver<'a> {
                         value: AbstractValue::Record(record),
                         evidence: None,
                         choice: Some(choice),
+                        heap_id: None,
                     });
                     arguments.extend(
                         (1..parameter_count)
@@ -868,6 +882,8 @@ impl<'a> Solver<'a> {
                             }
                         }
                         _ => {
+                            let initial_heap = self.heap.clone();
+                            let initial_versions = self.heap_versions.clone();
                             let mut consequent_environment = environment.clone();
                             let mut alternate_environment = environment.clone();
                             refine_environment_for_condition(
@@ -885,8 +901,19 @@ impl<'a> Solver<'a> {
                                 &mut consequent_environment,
                                 file_id,
                             );
+                            let left_heap = self.heap.clone();
+                            let left_versions = self.heap_versions.clone();
+                            self.heap = initial_heap.clone();
+                            self.heap_versions = initial_versions.clone();
                             let right =
                                 self.execute_branch(alternate, &mut alternate_environment, file_id);
+                            self.join_heap_branches(
+                                &initial_heap,
+                                &initial_versions,
+                                &left_heap,
+                                &left_versions,
+                                span,
+                            );
                             match (left, right) {
                                 (Some(left), Some(right)) => {
                                     return Some(TrackedValue::plain(AbstractValue::Union(vec![
@@ -980,7 +1007,7 @@ impl<'a> Solver<'a> {
         if property != "push" {
             return false;
         }
-        let Some(previous) = environment.get(name).cloned() else {
+        let Some(previous) = environment.get(name).map(|value| self.materialize(value)) else {
             return false;
         };
         let added = arguments
@@ -1014,11 +1041,16 @@ impl<'a> Solver<'a> {
         environment.insert(
             name.clone(),
             TrackedValue {
-                value,
+                value: value.clone(),
                 evidence: Some(evidence),
                 choice: previous.choice,
+                heap_id: previous.heap_id,
             },
         );
+        if let Some(id) = previous.heap_id {
+            self.heap.insert(id, Rc::new(value));
+            *self.heap_versions.entry(id).or_default() += 1;
+        }
         true
     }
 
@@ -1063,12 +1095,30 @@ impl<'a> Solver<'a> {
                 None,
                 &format!("retain alternatives for {name} after an unknown branch"),
             );
+            if let Some(id) = values[0].heap_id
+                && values[1].heap_id == Some(id)
+            {
+                environment.insert(
+                    name,
+                    TrackedValue {
+                        value: self
+                            .heap
+                            .get(&id)
+                            .map_or_else(|| values[0].value.clone(), |value| (**value).clone()),
+                        evidence: Some(evidence),
+                        choice: self.current_choice.clone(),
+                        heap_id: Some(id),
+                    },
+                );
+                continue;
+            }
             environment.insert(
                 name,
                 TrackedValue {
                     value: AbstractValue::Union(values.into()),
                     evidence: Some(evidence),
                     choice: self.current_choice.clone(),
+                    heap_id: None,
                 },
             );
         }
@@ -1188,7 +1238,7 @@ impl<'a> Solver<'a> {
             );
             return;
         };
-        let Some(previous) = environment.get(name).cloned() else {
+        let Some(previous) = environment.get(name).map(|value| self.materialize(value)) else {
             self.mark_value_unresolved(&value, "mutation target binding is unknown", span);
             return;
         };
@@ -1200,19 +1250,6 @@ impl<'a> Solver<'a> {
             );
             return;
         };
-        let affected_capabilities =
-            !capability_ids(&previous).is_empty() || !capability_ids(&value).is_empty();
-        if affected_capabilities {
-            self.mark_values_unresolved(
-                [&previous, &value].into_iter(),
-                "record property mutation may be observed through an alias",
-                span.clone(),
-            );
-            self.coverage_gaps.push(format!(
-                "record aliasing around mutation at file {} bytes {}..{}",
-                span.file_id.0, span.start, span.end
-            ));
-        }
         let parents = fields
             .get(property)
             .and_then(|old| old.evidence)
@@ -1229,12 +1266,18 @@ impl<'a> Solver<'a> {
         );
         value.evidence = Some(evidence);
         fields.insert(property.to_owned(), value);
+        let updated = AbstractValue::Record(fields);
+        if let Some(id) = previous.heap_id {
+            self.heap.insert(id, Rc::new(updated.clone()));
+            *self.heap_versions.entry(id).or_default() += 1;
+        }
         environment.insert(
             name.clone(),
             TrackedValue {
-                value: AbstractValue::Record(fields),
+                value: updated,
                 evidence: Some(evidence),
                 choice: previous.choice,
+                heap_id: previous.heap_id,
             },
         );
     }
@@ -1322,7 +1365,7 @@ impl<'a> Solver<'a> {
                 return TrackedValue::unknown("reverse_importer_budget_exhausted");
             }
         }
-        match &expression.kind {
+        let result = match &expression.kind {
             FlowExpressionKind::Null => TrackedValue::plain(AbstractValue::Null),
             FlowExpressionKind::String { value } => {
                 TrackedValue::plain(AbstractValue::String(value.clone()))
@@ -1451,6 +1494,7 @@ impl<'a> Solver<'a> {
                     value,
                     evidence: Some(evidence),
                     choice: left.choice.or(right.choice),
+                    heap_id: None,
                 }
             }
             FlowExpressionKind::LooseNullEquality { value, negated } => {
@@ -1462,6 +1506,7 @@ impl<'a> Solver<'a> {
                     ),
                     evidence: value.evidence,
                     choice: value.choice,
+                    heap_id: None,
                 }
             }
             FlowExpressionKind::LogicalNot { value } => {
@@ -1473,6 +1518,7 @@ impl<'a> Solver<'a> {
                     ),
                     evidence: value.evidence,
                     choice: value.choice,
+                    heap_id: None,
                 }
             }
             FlowExpressionKind::Logical {
@@ -1679,6 +1725,7 @@ impl<'a> Solver<'a> {
                     }),
                     evidence,
                     choice: self.current_choice.clone(),
+                    heap_id: None,
                 }
             }
             FlowExpressionKind::JsxElement { tag, props } => {
@@ -1698,6 +1745,81 @@ impl<'a> Solver<'a> {
                 );
                 TrackedValue::unknown(syntax.clone())
             }
+        };
+        self.track_heap(result)
+    }
+
+    fn track_heap(&mut self, mut value: TrackedValue) -> TrackedValue {
+        if value.heap_id.is_none()
+            && matches!(
+                value.value,
+                AbstractValue::Record(_) | AbstractValue::Array(_)
+            )
+        {
+            let id = self.next_heap_id;
+            self.next_heap_id += 1;
+            self.heap.insert(id, Rc::new(value.value.clone()));
+            self.heap_versions.insert(id, 0);
+            value.heap_id = Some(id);
+        }
+        value
+    }
+
+    fn materialize(&self, value: &TrackedValue) -> TrackedValue {
+        let mut result = value.clone();
+        if let Some(id) = result.heap_id {
+            if let Some(current) = self.heap.get(&id) {
+                result.value = (**current).clone();
+            }
+        }
+        result
+    }
+
+    fn join_heap_branches(
+        &mut self,
+        initial: &BTreeMap<u64, Rc<AbstractValue>>,
+        initial_versions: &BTreeMap<u64, u64>,
+        left: &BTreeMap<u64, Rc<AbstractValue>>,
+        left_versions: &BTreeMap<u64, u64>,
+        span: &SourceSpan,
+    ) {
+        let right = self.heap.clone();
+        let right_versions = self.heap_versions.clone();
+        for id in initial
+            .keys()
+            .chain(left.keys())
+            .chain(right.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            let left_value = left.get(&id).or_else(|| initial.get(&id));
+            let right_value = right.get(&id).or_else(|| initial.get(&id));
+            let baseline = initial_versions.get(&id).copied().unwrap_or(0);
+            let left_version = left_versions.get(&id).copied().unwrap_or(baseline);
+            let right_version = right_versions.get(&id).copied().unwrap_or(baseline);
+            let joined = match (left_value, right_value) {
+                (Some(left), Some(right))
+                    if left_version != baseline || right_version != baseline =>
+                {
+                    let mut alternatives = Vec::new();
+                    collect_heap_alternatives(left, &mut alternatives);
+                    collect_heap_alternatives(right, &mut alternatives);
+                    if alternatives.len() > MAX_HEAP_ALTERNATIVES {
+                        self.record_coverage_gap("heap alternative budget exhausted", span);
+                        AbstractValue::Unknown("heap_alternative_budget_exhausted".to_owned())
+                    } else {
+                        AbstractValue::Union(alternatives)
+                    }
+                }
+                (Some(value), _) | (_, Some(value)) => (**value).clone(),
+                (None, None) => continue,
+            };
+            self.heap.insert(id, Rc::new(joined));
+            self.heap_versions.insert(
+                id,
+                left_version.max(right_version)
+                    + u64::from(left_version != baseline || right_version != baseline),
+            );
         }
     }
 
@@ -2237,8 +2359,24 @@ impl<'a> Solver<'a> {
                     value: AbstractValue::Record(element.props),
                     evidence: element.component.evidence,
                     choice: element.component.choice.clone(),
+                    heap_id: None,
                 };
                 let returned = self.call_function(key, vec![argument]);
+                self.render(returned);
+                if self.model.scan_callback_bodies {
+                    for prop in props.values() {
+                        self.scan_callback_bodies(prop, &element.span, 0);
+                    }
+                }
+            }
+            AbstractValue::Closure(closure) => {
+                let props = element.props.clone();
+                let argument = TrackedValue::plain(AbstractValue::Record(element.props));
+                let returned = self.invoke_value(
+                    TrackedValue::plain(AbstractValue::Closure(closure.clone())),
+                    vec![argument],
+                    element.span.clone(),
+                );
                 self.render(returned);
                 if self.model.scan_callback_bodies {
                     for prop in props.values() {
@@ -2380,6 +2518,10 @@ impl<'a> Solver<'a> {
     }
 
     fn call_model(&mut self, arguments: &[TrackedValue], span: SourceSpan) -> TrackedValue {
+        let arguments = arguments
+            .iter()
+            .map(|value| self.materialize(value))
+            .collect::<Vec<_>>();
         let mut captures = BTreeMap::new();
         let mut missing_capture = false;
         for (name, source) in &self.model.captures {
@@ -2522,6 +2664,7 @@ impl<'a> Solver<'a> {
             value: AbstractValue::Capability(capability_id),
             evidence: Some(origin),
             choice: Some(choice),
+            heap_id: None,
         };
         if let Some(index) = self.model.returned_index {
             let mut elements = vec![TrackedValue::unknown("unselected_return_element"); index + 1];
@@ -2530,6 +2673,7 @@ impl<'a> Solver<'a> {
                 value: AbstractValue::Array(elements),
                 evidence: Some(origin),
                 choice: self.current_choice.clone(),
+                heap_id: None,
             }
         } else {
             let mut returned = capability;
@@ -2538,6 +2682,7 @@ impl<'a> Solver<'a> {
                     value: AbstractValue::Record(BTreeMap::from([(property.clone(), returned)])),
                     evidence: Some(origin),
                     choice: self.current_choice.clone(),
+                    heap_id: None,
                 };
             }
             returned
@@ -2582,6 +2727,7 @@ impl<'a> Solver<'a> {
         span: SourceSpan,
         relation: RelationKind,
     ) -> TrackedValue {
+        let object = self.materialize(&object);
         if let AbstractValue::Namespace(file_id) = object.value {
             let resolution = self.symbol_linker.resolve_exported_value(file_id, property);
             if resolution == ValueResolution::Missing {
@@ -2739,6 +2885,9 @@ impl<'a> Solver<'a> {
         candidates.dedup_by(|left, right| left.span == right.span);
 
         for candidate in candidates {
+            // Each unreached callsite is a separate hypothetical execution.
+            self.heap.clear();
+            self.heap_versions.clear();
             if !self.expression_matches_model(candidate.file_id, &candidate.callee) {
                 if self.possible_unresolved_factory_call(&candidate) {
                     self.record_coverage_gap(
@@ -2827,6 +2976,34 @@ impl<'a> Solver<'a> {
                     && capability.factory_arguments.iter().any(value_is_uncertain)
             }) {
                 self.request_factory_argument_imports(&candidate);
+                let exported_host = self.snapshot.files.iter().any(|file| {
+                    file.file_id == candidate.file_id
+                        && file.flow.exports.iter().any(|export| {
+                            let crate::ir::FlowExport::Local {
+                                local,
+                                type_only: false,
+                                ..
+                            } = export
+                            else {
+                                return false;
+                            };
+                            if candidate
+                                .enclosing_function
+                                .as_ref()
+                                .is_some_and(|key| key.name == *local)
+                            {
+                                return true;
+                            }
+                            file.flow.globals.iter().any(|binding| {
+                                pattern_names(&binding.pattern).contains(&local.as_str())
+                                    && binding.value.span.start <= candidate.span.start
+                                    && candidate.span.end <= binding.value.span.end
+                            })
+                        })
+                });
+                if exported_host {
+                    self.caller_producer_files.insert(candidate.file_id);
+                }
             }
             self.record_unreached_gap(&candidate.span);
         }
@@ -2970,6 +3147,8 @@ impl<'a> Solver<'a> {
             let functions = file.flow.functions.clone();
             let globals = file.flow.globals.clone();
             for function in functions {
+                self.heap.clear();
+                self.heap_versions.clear();
                 let mut references = ClosureReferences::default();
                 for statement in &function.body {
                     collect_statement_references(statement, &mut references);
@@ -2978,11 +3157,24 @@ impl<'a> Solver<'a> {
                     continue;
                 }
                 if file_len > MAX_REVERSE_IMPORTER_SOURCE_BYTES {
-                    self.record_coverage_gap(
-                        "reverse importer source exceeds exploration size budget",
-                        &function.span,
+                    self.seed_direct_import_uses(
+                        file_id,
+                        &function.body,
+                        &function.params,
+                        &imported_names,
                     );
                     continue;
+                }
+                let mut direct_uses = Vec::new();
+                for statement in &function.body {
+                    collect_import_uses_statement(statement, &imported_names, &mut direct_uses);
+                }
+                for expression in direct_uses {
+                    let mut argument_references = ClosureReferences::default();
+                    collect_expression_references(&expression, &mut argument_references);
+                    for name in argument_references.modules {
+                        self.request_import_for_local(file_id, &name);
+                    }
                 }
                 let key = FunctionKey {
                     file_id,
@@ -3024,6 +3216,134 @@ impl<'a> Solver<'a> {
         }
         self.current_choice = None;
         self.current_reachability = Reachability::Reachable;
+    }
+
+    fn seed_direct_import_uses(
+        &mut self,
+        file_id: FileId,
+        statements: &[FlowStatement],
+        params: &[FlowPattern],
+        imported_names: &BTreeSet<String>,
+    ) {
+        let mut uses = Vec::new();
+        for statement in statements {
+            collect_import_uses_statement(statement, imported_names, &mut uses);
+        }
+        if uses.is_empty() {
+            return;
+        }
+        if uses.len() > 64 {
+            self.record_coverage_gap("imported callsite budget exhausted", &uses[64].span);
+            uses.truncate(64);
+        }
+        for expression in uses {
+            self.heap.clear();
+            self.heap_versions.clear();
+            let mut references = ClosureReferences::default();
+            collect_expression_references(&expression, &mut references);
+            let mut needed = references.names;
+            for _ in 0..8 {
+                let previous = needed.len();
+                extend_binding_dependencies(statements, &mut needed);
+                if needed.len() == previous {
+                    break;
+                }
+            }
+            for name in &needed {
+                self.request_import_for_local(file_id, &name);
+            }
+            let mut environment = self.module_environment(file_id);
+            for pattern in params {
+                self.bind_pattern(
+                    pattern,
+                    TrackedValue::unknown("unreached_caller_parameter"),
+                    &mut environment,
+                    RelationKind::RenderPropBinding,
+                );
+            }
+            self.reverse_evaluations = 0;
+            self.reverse_budget_reported = false;
+            self.reverse_budget_active = true;
+            for statement in statements {
+                let (span, relevant) = match statement {
+                    FlowStatement::Bind(binding) => (
+                        &binding.span,
+                        pattern_names(&binding.pattern)
+                            .iter()
+                            .any(|name| needed.contains(*name)),
+                    ),
+                    FlowStatement::Assign {
+                        target: FlowAssignmentTarget::Identifier { name },
+                        span,
+                        ..
+                    } => (span, needed.contains(name)),
+                    FlowStatement::Assign {
+                        target: FlowAssignmentTarget::StaticMember { object, .. },
+                        span,
+                        ..
+                    } => {
+                        let relevant = matches!(&object.kind, FlowExpressionKind::Identifier { name, .. } if needed.contains(name));
+                        (span, relevant)
+                    }
+                    FlowStatement::Expression { value, span } => {
+                        let relevant = matches!(&value.kind, FlowExpressionKind::Call { callee, .. } if matches!(&callee.kind, FlowExpressionKind::StaticMember { object, property } if property == "push" && matches!(&object.kind, FlowExpressionKind::Identifier { name, .. } if needed.contains(name))));
+                        (span, relevant)
+                    }
+                    FlowStatement::If { span, .. } => {
+                        let mut branch_references = ClosureReferences::default();
+                        collect_statement_references(statement, &mut branch_references);
+                        (span, !branch_references.names.is_disjoint(&needed))
+                    }
+                    FlowStatement::Return { span, .. }
+                    | FlowStatement::Unsupported(crate::ir::UnsupportedIr { span, .. }) => {
+                        (span, false)
+                    }
+                    FlowStatement::Assign {
+                        target:
+                            FlowAssignmentTarget::ComputedMember { .. }
+                            | FlowAssignmentTarget::Unsupported { .. },
+                        span,
+                        ..
+                    } => (span, false),
+                };
+                if span.end > expression.span.start || !relevant {
+                    continue;
+                }
+                match statement {
+                    FlowStatement::Bind(binding) => {
+                        let value = self.eval(&binding.value, &environment, file_id);
+                        self.bind_pattern(
+                            &binding.pattern,
+                            value,
+                            &mut environment,
+                            RelationKind::ValueTransfer,
+                        );
+                    }
+                    FlowStatement::Assign {
+                        target,
+                        value,
+                        span,
+                    } => {
+                        let value = self.eval(value, &environment, file_id);
+                        self.assign_target(target, value, &mut environment, file_id, span.clone());
+                    }
+                    FlowStatement::Expression { value, .. } => {
+                        self.eval_array_push(value, &mut environment, file_id);
+                    }
+                    FlowStatement::If { .. } => {
+                        self.execute_statements(
+                            std::slice::from_ref(statement),
+                            &mut environment,
+                            file_id,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            let value = self.eval(&expression, &environment, file_id);
+            self.render(value);
+            self.reverse_budget_active = false;
+        }
     }
 
     fn possible_unresolved_factory_call(&self, candidate: &FactoryCallCandidate) -> bool {
@@ -3309,7 +3629,7 @@ impl<'a> Solver<'a> {
             .map(|entry| format!("{}#{}", entry.module.display(), entry.export))
             .collect();
         QueryReport {
-            schema_version: 3,
+            schema_version: 4,
             snapshot_id: self.snapshot.snapshot_id.clone(),
             config_hash: self.snapshot.config_hash.clone(),
             query_hash: query_hash.to_owned(),
@@ -3317,6 +3637,13 @@ impl<'a> Solver<'a> {
             kind: query.kind,
             scope: query.scope,
             creations,
+            callsite_inventory: QueryCallsiteInventory {
+                configured_files: 0,
+                candidate_files: 0,
+                skipped_candidate_files: 0,
+                round_limit_hit: false,
+                callsites: Vec::new(),
+            },
             evidence: self.evidence,
             coverage: Coverage {
                 scope: match query.scope {
@@ -3373,6 +3700,22 @@ fn capability_ids(value: &TrackedValue) -> Vec<usize> {
     ids
 }
 
+fn collect_heap_alternatives(value: &AbstractValue, alternatives: &mut Vec<TrackedValue>) {
+    if alternatives.len() > MAX_HEAP_ALTERNATIVES {
+        return;
+    }
+    if let AbstractValue::Union(values) = value {
+        for value in values {
+            collect_heap_alternatives(&value.value, alternatives);
+            if alternatives.len() > MAX_HEAP_ALTERNATIVES {
+                break;
+            }
+        }
+    } else {
+        alternatives.push(TrackedValue::plain(value.clone()));
+    }
+}
+
 fn append_array_values(receiver: &AbstractValue, added: &[TrackedValue]) -> Option<AbstractValue> {
     match receiver {
         AbstractValue::Array(elements) => {
@@ -3388,6 +3731,7 @@ fn append_array_values(receiver: &AbstractValue, added: &[TrackedValue]) -> Opti
                         value: append_array_values(&value.value, added)?,
                         evidence: value.evidence,
                         choice: value.choice.clone(),
+                        heap_id: value.heap_id,
                     })
                 })
                 .collect::<Option<Vec<_>>>()?,
@@ -4038,6 +4382,133 @@ fn collect_factory_calls(
     }
 }
 
+fn collect_import_uses_statement(
+    statement: &FlowStatement,
+    imported_names: &BTreeSet<String>,
+    uses: &mut Vec<FlowExpression>,
+) {
+    match statement {
+        FlowStatement::Bind(binding) => {
+            collect_import_uses(&binding.value, imported_names, uses);
+        }
+        FlowStatement::Return { value, .. } => {
+            if let Some(value) = value {
+                collect_import_uses(value, imported_names, uses);
+            }
+        }
+        FlowStatement::Expression { value, .. } => {
+            collect_import_uses(value, imported_names, uses);
+        }
+        FlowStatement::Assign { value, .. } => {
+            collect_import_uses(value, imported_names, uses);
+        }
+        FlowStatement::If {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            collect_import_uses(test, imported_names, uses);
+            for statement in consequent.iter().chain(alternate) {
+                collect_import_uses_statement(statement, imported_names, uses);
+            }
+        }
+        FlowStatement::Unsupported(_) => {}
+    }
+}
+
+fn collect_import_uses(
+    expression: &FlowExpression,
+    imported_names: &BTreeSet<String>,
+    uses: &mut Vec<FlowExpression>,
+) {
+    match &expression.kind {
+        FlowExpressionKind::Call { callee, arguments } => {
+            if matches!(&callee.kind, FlowExpressionKind::Identifier { name, module_binding: true } if imported_names.contains(name))
+                || matches!(&callee.kind, FlowExpressionKind::StaticMember { object, .. } if matches!(&object.kind, FlowExpressionKind::Identifier { name, module_binding: true } if imported_names.contains(name)))
+            {
+                uses.push(expression.clone());
+                return;
+            }
+            collect_import_uses(callee, imported_names, uses);
+            for argument in arguments {
+                collect_import_uses(argument, imported_names, uses);
+            }
+        }
+        FlowExpressionKind::JsxElement { tag, props } => {
+            if matches!(tag, FlowJsxTag::Identifier { name, intrinsic: false, module_binding: true } if imported_names.contains(name))
+            {
+                uses.push(expression.clone());
+                return;
+            }
+            for prop in props {
+                match prop {
+                    FlowJsxProp::Property { value, .. } | FlowJsxProp::Spread { value, .. } => {
+                        collect_import_uses(value, imported_names, uses);
+                    }
+                    FlowJsxProp::Unsupported(_) => {}
+                }
+            }
+        }
+        FlowExpressionKind::Record { fields } => {
+            for field in fields {
+                collect_import_uses(&field.value, imported_names, uses);
+            }
+        }
+        FlowExpressionKind::Array { elements } => {
+            for element in elements {
+                collect_import_uses(element, imported_names, uses);
+            }
+        }
+        FlowExpressionKind::Spread { value }
+        | FlowExpressionKind::StaticMember { object: value, .. }
+        | FlowExpressionKind::LooseNullEquality { value, .. }
+        | FlowExpressionKind::LogicalNot { value } => {
+            collect_import_uses(value, imported_names, uses);
+        }
+        FlowExpressionKind::ComputedMember { object, property }
+        | FlowExpressionKind::StrictEquality {
+            left: object,
+            right: property,
+            ..
+        }
+        | FlowExpressionKind::Logical {
+            left: object,
+            right: property,
+            ..
+        } => {
+            collect_import_uses(object, imported_names, uses);
+            collect_import_uses(property, imported_names, uses);
+        }
+        FlowExpressionKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            for value in [test, consequent, alternate] {
+                collect_import_uses(value, imported_names, uses);
+            }
+        }
+        FlowExpressionKind::Arrow { body, .. } => match body {
+            FlowArrowBody::Expression { expression } => {
+                collect_import_uses(expression, imported_names, uses)
+            }
+            FlowArrowBody::Statements { statements } => {
+                for statement in statements {
+                    collect_import_uses_statement(statement, imported_names, uses);
+                }
+            }
+        },
+        FlowExpressionKind::Null
+        | FlowExpressionKind::String { .. }
+        | FlowExpressionKind::Number { .. }
+        | FlowExpressionKind::NumericEnumMember { .. }
+        | FlowExpressionKind::Boolean { .. }
+        | FlowExpressionKind::Identifier { .. }
+        | FlowExpressionKind::Unsupported { .. } => {}
+    }
+}
+
 fn collect_factory_calls_statement(
     statement: &FlowStatement,
     file_id: FileId,
@@ -4083,6 +4554,33 @@ fn collect_factory_calls_statement(
         }
         FlowStatement::Unsupported(_) => {}
     }
+}
+
+pub(crate) fn syntactic_callsite_spans(
+    file: &crate::ir::FileIr,
+    names: &BTreeSet<String>,
+) -> Vec<SourceSpan> {
+    let mut candidates = Vec::new();
+    for binding in &file.flow.globals {
+        collect_factory_calls(&binding.value, file.file_id, None, &mut candidates);
+    }
+    for function in &file.flow.functions {
+        for statement in &function.body {
+            collect_factory_calls_statement(statement, file.file_id, None, &mut candidates);
+        }
+    }
+    let mut spans = candidates
+        .into_iter()
+        .filter(|candidate| match &candidate.callee.kind {
+            FlowExpressionKind::Identifier { name, .. } => names.contains(name),
+            FlowExpressionKind::StaticMember { property, .. } => names.contains(property),
+            _ => false,
+        })
+        .map(|candidate| candidate.span)
+        .collect::<Vec<_>>();
+    spans.sort_by_key(|span| (span.start, span.end));
+    spans.dedup();
+    spans
 }
 
 fn display_path(root: &Path, path: &Path) -> String {

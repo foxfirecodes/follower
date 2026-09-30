@@ -206,6 +206,31 @@ pub struct QueryCreation {
     pub conclusion: Conclusion,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryCallsiteStatus {
+    Analyzed,
+    Filtered,
+    Unresolved,
+    Skipped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryCallsite {
+    pub location: QueryLocation,
+    pub status: QueryCallsiteStatus,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryCallsiteInventory {
+    pub configured_files: usize,
+    pub candidate_files: usize,
+    pub skipped_candidate_files: usize,
+    pub round_limit_hit: bool,
+    pub callsites: Vec<QueryCallsite>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryReport {
     pub schema_version: u32,
@@ -216,6 +241,7 @@ pub struct QueryReport {
     pub kind: QueryKind,
     pub scope: QueryScope,
     pub creations: Vec<QueryCreation>,
+    pub callsite_inventory: QueryCallsiteInventory,
     pub evidence: Vec<Evidence>,
     pub coverage: Coverage,
     pub diagnostics: Vec<String>,

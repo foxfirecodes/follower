@@ -168,6 +168,30 @@ fn print_query_report(report: &QueryReport) {
         report.creations.len(),
         report.coverage.processed_files
     );
+    let statuses = &report.callsite_inventory.callsites;
+    println!(
+        "callsite inventory: {} analyzed, {} filtered, {} unresolved, {} skipped ({} candidate files of {} configured, {} candidates over budget, round limit hit: {})",
+        statuses
+            .iter()
+            .filter(|site| site.status == code_flow::query::QueryCallsiteStatus::Analyzed)
+            .count(),
+        statuses
+            .iter()
+            .filter(|site| site.status == code_flow::query::QueryCallsiteStatus::Filtered)
+            .count(),
+        statuses
+            .iter()
+            .filter(|site| site.status == code_flow::query::QueryCallsiteStatus::Unresolved)
+            .count(),
+        statuses
+            .iter()
+            .filter(|site| site.status == code_flow::query::QueryCallsiteStatus::Skipped)
+            .count(),
+        report.callsite_inventory.candidate_files,
+        report.callsite_inventory.configured_files,
+        report.callsite_inventory.skipped_candidate_files,
+        report.callsite_inventory.round_limit_hit,
+    );
 }
 
 fn render_location(

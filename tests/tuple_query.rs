@@ -3,7 +3,7 @@ mod support;
 use code_flow::{
     Project,
     queries::Conclusion,
-    query::{QueryValue, load_query},
+    query::{QueryCallsiteStatus, QueryValue, load_query},
 };
 use support::TestProject;
 
@@ -662,4 +662,257 @@ fn all_creations_explores_memo_function_expressions_filtered_arrays_and_switch_c
         }
     );
     assert!(!report.coverage.complete);
+}
+
+#[test]
+fn filtered_query_traces_finite_props_from_imported_component_callers() {
+    let fixture = TestProject::new(&[
+        ("src/kinds.ts", "export enum Kind { FIRST = 1, SECOND = 2 }"),
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_types: unknown[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { useItemSelection } from './hook'; export function Host({types}: {types: unknown[]}) { const [, apply] = useItemSelection(types); apply('close'); return null; }",
+        ),
+        ("src/barrel.ts", "export { Host as Panel } from './Host';"),
+        (
+            "src/Parent.tsx",
+            "import { Kind } from './kinds'; import { Panel } from './barrel'; export function Parent() { return <Panel types={[Kind.FIRST, Kind.SECOND]} />; }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n");
+    fixture.write(
+        "src/Parent.tsx",
+        &format!("{}{}", "import { Kind } from './kinds'; import { Panel } from './barrel'; export function Parent() { const types = [Kind.FIRST]; types.push(Kind.SECOND); return <Panel types={types} />; }", " ".repeat(20_100)),
+    );
+    fixture.write(
+        "src/ParentCall.ts",
+        &format!("{}{}", "import { Kind } from './kinds'; import { Host } from './Host'; export function ParentCall() { return Host({types: [Kind.SECOND]}); }", " ".repeat(20_100)),
+    );
+    fixture.write(
+        "src/ParentBranch.tsx",
+        &format!("{}{}", "import { Kind } from './kinds'; import { Panel } from './barrel'; export function ParentBranch({flag}: {flag: boolean}) { const types = [Kind.FIRST]; if (flag) types.push(Kind.SECOND); return <Panel types={types} />; }", " ".repeat(20_100)),
+    );
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'types'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(
+        report.coverage.processed_files, 7,
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert!(
+        report.creations.iter().any(|creation| {
+            let mut members = Vec::new();
+            collect_enum_members(&creation.factory_arguments["types"], &mut members);
+            members == ["FIRST", "SECOND"]
+                && creation.invocations.iter().any(|invocation| {
+                    invocation.arguments["action"]
+                        == QueryValue::String {
+                            value: "close".to_owned(),
+                        }
+                })
+        }),
+        "{:?}",
+        report
+            .creations
+            .iter()
+            .map(|creation| &creation.factory_arguments)
+            .collect::<Vec<_>>()
+    );
+    assert!(report.creations.iter().any(|creation| {
+        let mut members = Vec::new();
+        collect_enum_members(&creation.factory_arguments["types"], &mut members);
+        members == ["SECOND"]
+    }));
+    assert!(report.creations.iter().any(|creation| {
+        let QueryValue::Alternatives { values } = &creation.factory_arguments["types"] else {
+            return false;
+        };
+        let members = values
+            .iter()
+            .map(|value| {
+                let mut members = Vec::new();
+                collect_enum_members(value, &mut members);
+                members
+            })
+            .collect::<Vec<_>>();
+        members.contains(&vec!["FIRST".to_owned()])
+            && members.contains(&vec!["FIRST".to_owned(), "SECOND".to_owned()])
+    }));
+}
+
+#[test]
+fn filtered_query_binds_props_into_exported_arrow_components() {
+    let fixture = TestProject::new(&[
+        ("src/kinds.ts", "export enum Kind { FIRST = 1 }"),
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_types: unknown[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { useItemSelection } from './hook'; export const Host = ({types}: {types: unknown[]}) => { const [, apply] = useItemSelection(types); apply('close'); return null; };",
+        ),
+        (
+            "src/Parent.tsx",
+            "import { Kind } from './kinds'; import { Host } from './Host'; export function Parent() { return <Host types={[Kind.FIRST]} />; }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'types'\n[capability]\nreturned_index = 1\n");
+    let report = fixture.report();
+    assert_eq!(
+        report.coverage.processed_files, 4,
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert!(report.creations.iter().any(|creation| {
+        let mut members = Vec::new();
+        collect_enum_members(&creation.factory_arguments["types"], &mut members);
+        members == ["FIRST"]
+    }));
+}
+
+#[test]
+fn helper_built_arrays_and_record_alias_mutations_reach_factory_arguments() {
+    let fixture = TestProject::new(&[
+        ("src/kinds.ts", "export enum Kind { FIRST = 1, SECOND = 2 }"),
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_types: unknown[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/helper.ts",
+            "import { Kind } from './kinds'; export function buildTypes() { return [Kind.FIRST]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { Kind } from './kinds'; import { buildTypes } from './helper'; import { useItemSelection } from './hook'; export function Host() { const state = {types: buildTypes()}; const alias = state; const arrayAlias = alias.types; arrayAlias.push(Kind.SECOND); const [, apply] = useItemSelection(state.types); apply('close'); return null; }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/Host.tsx'\nexport = 'Host'\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'types'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1, "{:?}", report.coverage.gaps);
+    let mut members = Vec::new();
+    collect_enum_members(
+        &report.creations[0].factory_arguments["types"],
+        &mut members,
+    );
+    assert_eq!(members, ["FIRST", "SECOND"]);
+    assert_eq!(report.creations[0].invocations.len(), 1);
+}
+
+#[test]
+fn mutations_through_helper_parameters_update_shared_record_and_array_values() {
+    let fixture = TestProject::new(&[
+        ("src/kinds.ts", "export enum Kind { FIRST = 1, SECOND = 2 }"),
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_types: unknown[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { Kind } from './kinds'; import { useItemSelection } from './hook'; function replace(state: {types: unknown[]}) { const alias = state; alias.types = [Kind.SECOND]; } function append(items: unknown[]) { const alias = items; alias.push(Kind.FIRST); } export function Host() { const state = {types: []}; replace(state); append(state.types); const [, apply] = useItemSelection(state.types); apply('close'); return null; }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/Host.tsx'\nexport = 'Host'\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'types'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1, "{:?}", report.coverage.gaps);
+    let mut members = Vec::new();
+    collect_enum_members(
+        &report.creations[0].factory_arguments["types"],
+        &mut members,
+    );
+    assert_eq!(members, ["SECOND", "FIRST"]);
+}
+
+#[test]
+fn callsite_inventory_marks_analyzed_filtered_and_unresolved_candidates() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_types: unknown[]) { return [null, () => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { useItemSelection } from './hook'; // this-trace\nexport function Host() { useItemSelection(['one']); return null; }",
+        ),
+        (
+            "src/Filtered.ts",
+            "import { useItemSelection } from './hook'; export function filtered() { useItemSelection(['two']); }",
+        ),
+        (
+            "src/barrel.ts",
+            "export { useItemSelection as select } from './hook';",
+        ),
+        (
+            "src/FilteredAlias.ts",
+            "import { select } from './barrel'; export function filteredAlias() { select(['three']); }",
+        ),
+        (
+            "src/Unrelated.ts",
+            "// this-trace\nfunction useItemSelection() {} export function unrelated() { useItemSelection(); }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src', 'src/hook.ts']\nsource_contains_any = ['this-trace']\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n");
+    let report = fixture.report();
+    let inventory = &report.callsite_inventory;
+    assert_eq!(inventory.configured_files, 7);
+    assert!(
+        inventory
+            .callsites
+            .iter()
+            .any(|site| site.location.path == "src/Host.tsx"
+                && site.status == QueryCallsiteStatus::Analyzed)
+    );
+    assert!(
+        inventory
+            .callsites
+            .iter()
+            .any(|site| site.location.path == "src/Filtered.ts"
+                && site.status == QueryCallsiteStatus::Filtered)
+    );
+    assert!(
+        inventory
+            .callsites
+            .iter()
+            .any(|site| site.location.path == "src/FilteredAlias.ts"
+                && site.status == QueryCallsiteStatus::Filtered)
+    );
+    assert!(
+        inventory
+            .callsites
+            .iter()
+            .any(|site| site.location.path == "src/Unrelated.ts"
+                && site.status == QueryCallsiteStatus::Unresolved)
+    );
+}
+
+#[test]
+fn callback_property_mutation_is_visible_through_record_alias() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_types: unknown[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { useItemSelection } from './hook'; export function Host() { const [, apply] = useItemSelection(['one']); const state = {run: () => {}}; const alias = state; alias.run = apply; state.run('close'); return null; }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/Host.tsx'\nexport = 'Host'\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1);
+    assert_eq!(
+        report.creations[0].invocations[0].arguments["action"],
+        QueryValue::String {
+            value: "close".to_owned()
+        }
+    );
 }

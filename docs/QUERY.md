@@ -98,11 +98,13 @@ directory roots; explicitly listed files are always included. It lets a query se
 broad directory without parsing every source file. During a query, callback-bearing calls and JSX
 props can pull excluded directly imported files into the analysis. Unknown factory arguments can
 pull in the imported constants they depend on. A lightweight import scan also finds files that
-import exported wrappers returning the tracked callback, including paths through re-export
-barrels. This expansion is bounded at 256 additional files and eight rounds, skips `node_modules`,
-and reuses parsed files within the run. Reverse importer functions in source files larger than
-20,000 bytes are skipped, and speculative function evaluation has a 5,000-expression budget. These
-limits and the text filter leave coverage incomplete.
+import exported wrappers returning the tracked callback or exported functions/components whose
+factory arguments are still unknown. It follows re-export barrels and evaluates direct imported
+calls and JSX uses in large importer files. The analysis expansion is bounded at 256 additional
+files and eight rounds, skips `node_modules`, and reuses parsed files within the run. Importer
+functions below 20,000 bytes are evaluated with a 5,000-expression budget; larger files use direct
+callsites with unknown surrounding locals and a 64-callsite budget per function. These limits and
+the text filter leave coverage incomplete.
 Include enum and constant definitions as explicit file roots. Leave the prefilter unset when a
 complete parse of the configured roots matters more than query latency. Parsed files are not yet
 cached across separate CLI runs. During each solver pass, module environments and resolved import
@@ -137,10 +139,16 @@ This keeps library-specific selector behavior in the project definition.
   unresolved escapes. This includes `candidate_invocation` rows with gaps and ambiguous-linkage
   reports with no creation rows. The JSON report is still printed before the unsuccessful exit.
 
-Query report schema version 3 includes both stable source byte spans and repository-relative,
-one-based line/column locations for factory calls and invocations. The text renderer uses
-`path:line:column`; JSON retains both forms along with the evidence graph. Snapshot reuse is not
-implemented yet.
+Query report schema version 4 includes both stable source byte spans and repository-relative,
+one-based line/column locations for factory calls and invocations. JSON also includes
+`callsite_inventory`: syntactic calls found in parsed candidate files, labeled `analyzed`,
+`filtered`, `unresolved`, or `skipped`. Inventory discovery scans every configured source for the
+factory export name, then follows imports through re-export barrels to find renamed uses. This is
+an independent check on the solver's creation rows, but dynamic property calls and aliases created
+by assignments can still escape the syntactic inventory. The report gives configured and candidate
+file counts plus any importer candidates skipped by the inventory budget. The text renderer uses
+`path:line:column` and prints inventory counts; JSON retains locations and the evidence graph.
+Snapshot reuse is not implemented yet.
 
 ## Current analysis fragment
 
@@ -176,11 +184,12 @@ coverage gaps because repeated iterations and fallthrough are not modeled. `.fil
 known predicates; unknown predicates retain possible subsets and leave a coverage gap. Finite
 `.map` and `.filter` callbacks receive a concrete array index. `Object.values` retains values from
 known records, but record key insertion order is not stored; records with multiple keys leave a
-coverage gap when array order might matter. Array `.push` is tracked for local bindings, with
-other aliases still requiring heap modeling. Reassignment of captured bindings and opaque calls
-receiving callback-bearing namespaces are conservatively unresolved. Record-property assignment is lowered, but a mutation involving a
-tracked callback is conservatively unresolved because another
-record alias may observe the old or new property. Precise branch correlation, heap aliasing and
-live closure cells, full JavaScript coercion, non-null loose comparisons, loops, and array methods
+coverage gap when array order might matter. Arrays and records bound to locals share heap identity
+across aliases and helper calls; local `.push` and static record-property writes update that
+identity. Unknown branches retain up to 32 possible heap values; exceeding that budget produces a
+coverage gap. Reassignment of captured
+bindings and opaque calls receiving callback-bearing namespaces are conservatively unresolved.
+Dynamic mutation targets, external mutation, live closure cells, full JavaScript coercion,
+non-null loose comparisons, loops, and array methods
 other than `.map` and `.filter` still require additional IR and solver work. Unsupported syntax can still hide creations or
 dependencies; the current acceptance tests do not establish production absence guarantees.

@@ -12,26 +12,19 @@ fn fixture_path(name: &str) -> PathBuf {
 }
 
 #[test]
-fn preserves_the_candidate_but_marks_aliased_record_mutation_unresolved() {
+fn follows_callback_through_aliased_record_mutation() {
     let analyzer = Analyzer::new(Project::load(fixture_path("flow.toml")).expect("load project"));
     let (query, hash) = load_query(&fixture_path("query.toml")).expect("load query");
     let report = analyzer.query(&query, &hash).expect("run query");
 
-    assert_eq!(report.schema_version, 3);
+    assert_eq!(report.schema_version, 4);
     assert_eq!(report.creations.len(), 1);
-    assert!(!report.coverage.complete);
-    assert!(
-        report
-            .coverage
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("record aliasing around mutation"))
-    );
+    assert!(report.coverage.complete, "{:?}", report.coverage.gaps);
 
     let creation = &report.creations[0];
     assert_eq!(creation.conclusion, Conclusion::CandidateInvocation);
     assert_eq!(creation.invocations.len(), 1);
-    assert!(!creation.unresolved.is_empty());
+    assert!(creation.unresolved.is_empty());
     assert_eq!(
         creation.invocations[0].arguments["action_kind"],
         QueryValue::String {

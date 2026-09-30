@@ -38,8 +38,10 @@ dependency-management costs without isolating meaningful change.
 - Project-defined import aliases resolve package-style paths such as `@sample/*`; source roots can be
   individual files or directories and are canonicalized. An optional `source_contains_any` text
   prefilter limits directory parsing; callback-bearing directly imported functions/components,
-  factory-argument data imports, and reverse importers of exported callback-producing wrappers
-  are added on demand, with a bounded expansion. Filtered reports retain an
+  factory-argument data imports, reverse importers of exported callback-producing wrappers, and
+  callers of exported hosts with unknown factory arguments are added on demand. Large importer
+  files are scanned for direct imported calls and JSX uses. Expansion has file, round, expression,
+  and callsite budgets. Filtered reports retain an
   incomplete-coverage marker. Configured callback selector imports support state libraries whose
   imported functions return a callback's result. Numeric enum members keep their names
   and values in query output. Local `.push`, finite array spreads, known-record `Object.values`,
@@ -48,6 +50,12 @@ dependency-management costs without isolating meaningful change.
 - The query solver reuses resolved import links and module environments within each pass. Module
   environments are cleared when globals initialize, and profiling reports phase timings without
   source names. Cross-run cache and incremental solver reuse remain future work.
+- Query report schema 4 includes an independent syntactic inventory of potential factory calls.
+  It scans all configured sources for the factory export name and follows re-export importers to
+  catch renamed uses, then labels candidate callsites as analyzed, filtered, unresolved, or
+  skipped. This inventory still has syntactic and candidate-budget limits.
+- Local records and arrays carry shared heap identity across aliases and helper calls. Static
+  property writes and `.push` update that identity, and unknown branches join finite heap values.
 - Each configured selector alternative runs in a separate choice context. The reference audit
   preserves the registry row's key, component, callback creation, prop flow, wrapper registration,
   and invocation result.
@@ -94,9 +102,8 @@ names. It also reassigns a local callback wrapper and checks that unrelated unkn
 not degrade query coverage.
 
 The `query-mutation` fixture aliases a callback-bearing record and then overwrites one property.
-The engine preserves the candidate invocation visible through the alias, emits mutation evidence,
-and marks the creation and overall coverage unresolved rather than assuming JavaScript heap alias
-semantics it does not yet model precisely.
+The engine preserves the candidate invocation visible through the alias and emits mutation
+evidence without an aliasing gap for that local heap operation.
 
 The `canonical_values` and `query_uncertainty` acceptance tests generate isolated source projects
 covering colliding enums/constants, aliases, namespace barrels, export precedence and ambiguity,
@@ -110,7 +117,7 @@ branches, partial returns, reassigned captures, opaque namespace consumers, and 
 - Branch joins preserve alternatives conservatively; they are not a precise correlated join or a
   fixed-point computation. Joined callback call targets remain unresolved. Module value cycles
   become explicit coverage gaps rather than modeling JavaScript temporal-dead-zone semantics.
-- General loops, precise record/heap aliasing and live closure cells, compound and destructuring assignment,
+- General loops, dynamic/external heap mutation and live closure cells, compound and destructuring assignment,
   array methods other than `.map`, bounded `.filter`, and local `.push`, getters/proxies,
   exceptions/finally, recursion summaries, state/refs, historical renders, and custom event
   contracts are not analyzed yet.
@@ -128,8 +135,8 @@ branches, partial returns, reassigned captures, opaque namespace consumers, and 
 
 1. Turn the owned expressions into explicit blocks/instructions and move evaluation to a monotone
    worklist with query budgets and context-keyed summaries.
-2. Replace conservative record-mutation and captured-binding handling with explicit heap cells,
-   live closure cells, and points-to sets; extend tests for independent selections, reassigned
+2. Extend local heap cells to dynamic/external mutation, live closure cells, and points-to sets;
+   extend tests for independent selections, reassigned
    captures, prop overwrite order, and opaque mutation.
 3. Persist evidence indexes so `trace` and `explain` can query a chosen snapshot without reindexing.
 4. Add a versioned per-file IR cache keyed by content hash, then cache import resolution and
