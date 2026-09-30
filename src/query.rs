@@ -147,6 +147,7 @@ pub enum Reachability {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QueryValue {
+    Null,
     String {
         value: String,
     },

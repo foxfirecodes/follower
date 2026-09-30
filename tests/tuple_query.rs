@@ -24,6 +24,15 @@ fn collect_enum_members(value: &QueryValue, members: &mut Vec<String>) {
     }
 }
 
+fn contains_unknown(value: &QueryValue) -> bool {
+    match value {
+        QueryValue::Unknown { .. } => true,
+        QueryValue::Array { elements } => elements.iter().any(contains_unknown),
+        QueryValue::Alternatives { values } => values.iter().any(contains_unknown),
+        _ => false,
+    }
+}
+
 #[test]
 fn text_prefilter_keeps_matching_directory_files_and_explicit_support_files() {
     let fixture = TestProject::new(&[
@@ -92,6 +101,118 @@ fn filtered_query_follows_callback_bearing_imports_across_multiple_files() {
         QueryValue::String {
             value: "submit".to_owned()
         }
+    );
+}
+
+#[test]
+fn filtered_query_follows_reverse_importers_of_wrapper_returning_capability() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_items: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/wrapper.ts",
+            "import { useItemSelection } from './hook'; export function useWidget() { const [, apply] = useItemSelection(['alpha']); return {apply}; }",
+        ),
+        (
+            "src/Host.ts",
+            "import { useWidget } from './wrapper'; export function Host() { const {apply} = useWidget(); apply('close'); }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(
+        report.coverage.processed_files, 3,
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert!(
+        report
+            .creations
+            .iter()
+            .any(|creation| creation.invocations.iter().any(
+                |invocation| invocation.arguments["action"]
+                    == QueryValue::String {
+                        value: "close".to_owned()
+                    }
+            ))
+    );
+}
+
+#[test]
+fn filtered_query_follows_reverse_importers_of_exported_arrow_wrapper() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_items: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/wrapper.ts",
+            "import { useItemSelection } from './hook'; export const useWidget = () => { const [, apply] = useItemSelection(['alpha']); return {apply}; };",
+        ),
+        (
+            "src/Host.ts",
+            "import { useWidget } from './wrapper'; export function Host() { const {apply} = useWidget(); apply('close'); }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(
+        report.coverage.processed_files, 3,
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert!(
+        report
+            .creations
+            .iter()
+            .any(|creation| creation.invocations.iter().any(
+                |invocation| invocation.arguments["action"]
+                    == QueryValue::String {
+                        value: "close".to_owned()
+                    }
+            ))
+    );
+}
+
+#[test]
+fn filtered_query_follows_reverse_importers_through_reexport_barrels() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_items: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/wrapper.ts",
+            "import { useItemSelection } from './hook'; export function useWidget() { const [, apply] = useItemSelection(['alpha']); return {apply}; }",
+        ),
+        ("src/barrel.ts", "export { useWidget } from './wrapper';"),
+        (
+            "src/Host.ts",
+            "import { useWidget } from './barrel'; export function Host() { const {apply} = useWidget(); apply('close'); }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(
+        report.coverage.processed_files, 4,
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert!(
+        report
+            .creations
+            .iter()
+            .any(|creation| creation.invocations.iter().any(
+                |invocation| invocation.arguments["action"]
+                    == QueryValue::String {
+                        value: "close".to_owned()
+                    }
+            ))
     );
 }
 
@@ -204,6 +325,208 @@ fn configured_imported_selector_invokes_its_callback_argument() {
     );
     assert_eq!(members, ["A"]);
     assert_eq!(report.creations[0].invocations.len(), 1);
+}
+
+#[test]
+fn finite_filter_then_map_preserves_only_selected_enum_values() {
+    let fixture = TestProject::new(&[
+        ("src/values.ts", "export enum Kind { A = 1, B = 2 }"),
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_items: Kind[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { Kind } from './values'; import { useItemSelection } from './hook'; export function Host() { const rows = [{enabled: true, kind: Kind.A}, {enabled: false, kind: Kind.B}]; const items = rows.filter(row => row.enabled).map(row => row.kind); const [, apply] = useItemSelection(items); apply('close'); }",
+        ),
+    ]);
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1);
+    let mut members = Vec::new();
+    collect_enum_members(
+        &report.creations[0].factory_arguments["items"],
+        &mut members,
+    );
+    assert_eq!(members, ["A"]);
+}
+
+#[test]
+fn finite_map_receives_the_array_index() {
+    let fixture = TestProject::new(&[
+        ("src/values.ts", "export enum Kind { A = 1, B = 2 }"),
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_items: Kind[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { Kind } from './values'; import { useItemSelection } from './hook'; export function Host() { const items = [Kind.A, Kind.A].map((kind, index) => index === 0 ? kind : Kind.B); const [, apply] = useItemSelection(items); apply('close'); }",
+        ),
+    ]);
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n");
+    let report = fixture.report();
+    let mut members = Vec::new();
+    collect_enum_members(
+        &report.creations[0].factory_arguments["items"],
+        &mut members,
+    );
+    assert_eq!(members, ["A", "B"]);
+}
+
+#[test]
+fn filtered_query_resolves_imported_predicate_for_dynamic_array() {
+    let fixture = TestProject::new(&[
+        ("src/values.ts", "export enum Kind { A = 1 }"),
+        (
+            "src/predicate.ts",
+            "export function isPresent<T>(value: T | null | undefined): value is T { return value != null; }",
+        ),
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_items: Kind[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { Kind } from './values'; import { isPresent } from './predicate'; import { useItemSelection } from './hook'; export function Host(flag: boolean) { const items = [flag ? Kind.A : undefined, undefined].filter(isPresent); const [, apply] = useItemSelection(items); apply('close'); }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n");
+    let report = fixture.report();
+    assert_eq!(
+        report.coverage.processed_files, 4,
+        "{:?}",
+        report.coverage.gaps
+    );
+    let mut members = Vec::new();
+    collect_enum_members(
+        &report.creations[0].factory_arguments["items"],
+        &mut members,
+    );
+    assert_eq!(members, ["A"]);
+    assert!(
+        report
+            .creations
+            .iter()
+            .all(|creation| !contains_unknown(&creation.factory_arguments["items"]))
+    );
+}
+
+#[test]
+fn guarded_record_property_can_feed_a_dynamic_array() {
+    let fixture = TestProject::new(&[
+        ("src/values.ts", "export enum Kind { A = 1 }"),
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_items: Kind[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { Kind } from './values'; import { useItemSelection } from './hook'; function getConfig(code: number) { switch (code) { case 1: return {kind: Kind.A}; default: return null; } } export function Host(code: number, ready: boolean) { const config = getConfig(code); const items: Kind[] = []; if (config != null && ready) items.push(config.kind); const [, apply] = useItemSelection(items); apply('close'); }",
+        ),
+    ]);
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n");
+    let report = fixture.report();
+    assert!(
+        report
+            .creations
+            .iter()
+            .all(|creation| !contains_unknown(&creation.factory_arguments["items"]))
+    );
+    assert!(report.creations.iter().any(|creation| {
+        let mut members = Vec::new();
+        collect_enum_members(&creation.factory_arguments["items"], &mut members);
+        members.contains(&"A".to_owned())
+    }));
+}
+
+#[test]
+fn object_values_and_array_spreads_preserve_finite_candidates() {
+    let fixture = TestProject::new(&[
+        ("src/values.ts", "export enum Kind { A = 1, B = 2, C = 3 }"),
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_items: Kind[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { Kind } from './values'; import { useItemSelection } from './hook'; export function Host() { const rows = {first: {enabled: true, kind: Kind.A}, second: {enabled: false, kind: Kind.B}}; const selected = Object.values(rows).filter(row => row.enabled).map(row => row.kind); const items = [...selected, Kind.C]; const [, apply] = useItemSelection(items); apply('close'); }",
+        ),
+    ]);
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n");
+    let report = fixture.report();
+    let mut members = Vec::new();
+    collect_enum_members(
+        &report.creations[0].factory_arguments["items"],
+        &mut members,
+    );
+    assert_eq!(members, ["A", "C"]);
+    assert!(
+        report
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("Object.values record key order is not modeled"))
+    );
+}
+
+#[test]
+fn filtered_query_follows_imported_data_used_to_build_factory_array() {
+    let fixture = TestProject::new(&[
+        ("src/values.ts", "export enum Kind { A = 1, B = 2 }"),
+        (
+            "src/data.ts",
+            "import { Kind } from './values'; export const rows = [{enabled: true, kind: Kind.A}, {enabled: false, kind: Kind.B}];",
+        ),
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_items: Kind[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { rows } from './data'; import { useItemSelection } from './hook'; export function Host() { const items = rows.filter(row => row.enabled).map(row => row.kind); const [, apply] = useItemSelection(items); apply('close'); }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n");
+    let report = fixture.report();
+    assert_eq!(
+        report.coverage.processed_files, 4,
+        "{:?}",
+        report.coverage.gaps
+    );
+    let mut members = Vec::new();
+    collect_enum_members(
+        &report.creations[0].factory_arguments["items"],
+        &mut members,
+    );
+    assert_eq!(members, ["A"]);
+}
+
+#[test]
+fn nullish_logical_and_loose_null_guards_keep_candidate_values() {
+    let fixture = TestProject::new(&[
+        ("src/values.ts", "export enum Kind { A = 1 }"),
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_items: Kind[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { Kind } from './values'; import { useItemSelection } from './hook'; export function Host() { const missing = null; const items = missing ?? [Kind.A]; const [, apply] = useItemSelection(items); if (!false && missing == null) apply('close'); return null; }",
+        ),
+    ]);
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1);
+    assert_eq!(report.creations[0].invocations.len(), 1);
+    let mut members = Vec::new();
+    collect_enum_members(
+        &report.creations[0].factory_arguments["items"],
+        &mut members,
+    );
+    assert_eq!(members, ["A"]);
 }
 
 #[test]

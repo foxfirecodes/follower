@@ -96,10 +96,13 @@ single-`*` patterns are supported. Source roots can be directories or individual
 they are canonicalized before symbol linkage. `source_contains_any` is a fast text prefilter for
 directory roots; explicitly listed files are always included. It lets a query search a
 broad directory without parsing every source file. During a query, callback-bearing calls and JSX
-props can pull excluded directly imported files into the analysis. Re-export barrels are not
-expanded automatically. This expansion is bounded at 256 additional files and eight rounds, skips `node_modules`, and reuses
-the parsed files already in that run. It does not discover reverse importers or unrelated
-dependencies, so the report marks coverage incomplete whenever the prefilter is enabled.
+props can pull excluded directly imported files into the analysis. Unknown factory arguments can
+pull in the imported constants they depend on. A lightweight import scan also finds files that
+import exported wrappers returning the tracked callback, including paths through re-export
+barrels. This expansion is bounded at 256 additional files and eight rounds, skips `node_modules`,
+and reuses parsed files within the run. Reverse importer functions in source files larger than
+20,000 bytes are skipped, and speculative function evaluation has a 5,000-expression budget. These
+limits and the text filter leave coverage incomplete.
 Include enum and constant definitions as explicit file roots. Leave the prefilter unset when a
 complete parse of the configured roots matters more than query latency. Parsed files are not yet
 cached across separate CLI runs.
@@ -113,7 +116,7 @@ This keeps library-specific selector behavior in the project definition.
 - Each result is centered on one dynamic creation context. Multiple finite root inputs at the same
   source callsite remain separate, so values from unrelated registry rows do not cross-pair.
 - Projected values preserve strings, integral numbers, numeric enum members (name and value),
-  arrays, finite array alternatives, `undefined`, and explicit unknowns. A branch-built array
+  arrays, finite array alternatives, `null`, `undefined`, and explicit unknowns. A branch-built array
   remains a set of possible arrays instead of collapsing to one merged list. String enum members
   currently project to their string values.
 - `reachable` reports creations explored from configured entry points and finite input domains.
@@ -132,7 +135,7 @@ This keeps library-specific selector behavior in the project definition.
   unresolved escapes. This includes `candidate_invocation` rows with gaps and ambiguous-linkage
   reports with no creation rows. The JSON report is still printed before the unsuccessful exit.
 
-Query report schema version 2 includes both stable source byte spans and repository-relative,
+Query report schema version 3 includes both stable source byte spans and repository-relative,
 one-based line/column locations for factory calls and invocations. The text renderer uses
 `path:line:column`; JSON retains both forms along with the evidence graph. Snapshot reuse is not
 implemented yet.
@@ -140,8 +143,9 @@ implemented yet.
 ## Current analysis fragment
 
 The engine follows object and array destructuring, local calls and closures, records, finite computed record
-selection, arrays, exact string/boolean/numeric-enum strict-equality branches, conditional expressions,
-literal-array `.map`, bounded `.filter` subsets, local `.push`, JSX component props/children/spreads,
+selection, arrays and finite spreads, exact string/boolean/numeric-enum strict-equality branches,
+null comparisons, logical expressions, conditional expressions, finite-array `.map` and `.filter`,
+`Object.values` on known records, local `.push`, JSX component props/children/spreads,
 React `useMemo`, `useCallback`, `useState`, `memo`, and `forwardRef`, prop renaming, wrapper callbacks, simple
 identifier reassignment, and intrinsic `onClick` handlers. Factory matching and ordinary
 function/component calls, enums, and module values use canonical identities across named import
@@ -163,13 +167,18 @@ Unknown conditions explore both branches. A partially returning branch also expl
 continuing path. Modified bindings retain joined alternatives; callback-bearing joins are
 unresolved rather than disappearing after the branch. Strict equality involving an unknown value
 remains unknown, and projected factory captures containing unknown or joined values carry gaps.
+Nullish guards narrow finite local alternatives inside their guarded branch, including guards
+combined with `&&` or `||`.
 `for...of` is explored for zero or one iteration and switch cases independently; both leave
-coverage gaps because repeated iterations and fallthrough are not modeled. `.filter` retains
-possible subsets and leaves a predicate gap. Array `.push` is tracked for local bindings, with
-other aliases still requiring heap modeling. Reassignment of captured bindings and opaque calls receiving callback-bearing namespaces are
-conservatively unresolved. Record-property assignment is lowered, but a mutation involving a
+coverage gaps because repeated iterations and fallthrough are not modeled. `.filter` evaluates
+known predicates; unknown predicates retain possible subsets and leave a coverage gap. Finite
+`.map` and `.filter` callbacks receive a concrete array index. `Object.values` retains values from
+known records, but record key insertion order is not stored; records with multiple keys leave a
+coverage gap when array order might matter. Array `.push` is tracked for local bindings, with
+other aliases still requiring heap modeling. Reassignment of captured bindings and opaque calls
+receiving callback-bearing namespaces are conservatively unresolved. Record-property assignment is lowered, but a mutation involving a
 tracked callback is conservatively unresolved because another
 record alias may observe the old or new property. Precise branch correlation, heap aliasing and
-live closure cells, general truthiness, non-strict comparisons, loops, and array methods other than
-`.map` still require additional IR and solver work. Unsupported syntax can still hide creations or
+live closure cells, full JavaScript coercion, non-null loose comparisons, loops, and array methods
+other than `.map` and `.filter` still require additional IR and solver work. Unsupported syntax can still hide creations or
 dependencies; the current acceptance tests do not establish production absence guarantees.

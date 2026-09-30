@@ -17,7 +17,7 @@ fn preserves_the_candidate_but_marks_aliased_record_mutation_unresolved() {
     let (query, hash) = load_query(&fixture_path("query.toml")).expect("load query");
     let report = analyzer.query(&query, &hash).expect("run query");
 
-    assert_eq!(report.schema_version, 2);
+    assert_eq!(report.schema_version, 3);
     assert_eq!(report.creations.len(), 1);
     assert!(!report.coverage.complete);
     assert!(

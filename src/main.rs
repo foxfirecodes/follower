@@ -187,6 +187,7 @@ fn render_location(
 
 fn render_query_value(value: &QueryValue) -> String {
     match value {
+        QueryValue::Null => "null".to_owned(),
         QueryValue::String { value } => format!("{value:?}"),
         QueryValue::Number { value } => value.to_string(),
         QueryValue::EnumMember {

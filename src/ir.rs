@@ -206,6 +206,7 @@ pub struct FlowExpression {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FlowExpressionKind {
+    Null,
     String {
         value: String,
     },
@@ -232,6 +233,9 @@ pub enum FlowExpressionKind {
     Array {
         elements: Vec<FlowExpression>,
     },
+    Spread {
+        value: Box<FlowExpression>,
+    },
     StaticMember {
         object: Box<FlowExpression>,
         property: String,
@@ -249,6 +253,18 @@ pub enum FlowExpressionKind {
         right: Box<FlowExpression>,
         negated: bool,
     },
+    LooseNullEquality {
+        value: Box<FlowExpression>,
+        negated: bool,
+    },
+    Logical {
+        left: Box<FlowExpression>,
+        right: Box<FlowExpression>,
+        operator: FlowLogicalOperator,
+    },
+    LogicalNot {
+        value: Box<FlowExpression>,
+    },
     Conditional {
         test: Box<FlowExpression>,
         consequent: Box<FlowExpression>,
@@ -264,7 +280,17 @@ pub enum FlowExpressionKind {
     },
     Unsupported {
         syntax: String,
+        #[serde(default)]
+        references: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowLogicalOperator {
+    And,
+    Or,
+    Coalesce,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

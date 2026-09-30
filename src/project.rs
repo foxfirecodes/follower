@@ -130,6 +130,14 @@ impl Project {
     }
 
     pub fn discover_sources(&self) -> Result<Vec<PathBuf>> {
+        self.discover_sources_with_filter(true)
+    }
+
+    pub fn discover_all_sources(&self) -> Result<Vec<PathBuf>> {
+        self.discover_sources_with_filter(false)
+    }
+
+    fn discover_sources_with_filter(&self, use_text_filter: bool) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
         for configured_root in &self.config.source_roots {
             let root = self.resolve_path(configured_root);
@@ -153,7 +161,7 @@ impl Project {
                 let entry =
                     entry.with_context(|| format!("failed while walking {}", root.display()))?;
                 if entry.file_type().is_file() && is_source_file(entry.path()) {
-                    if !self.config.source_contains_any.is_empty() {
+                    if use_text_filter && !self.config.source_contains_any.is_empty() {
                         let source = fs::read_to_string(entry.path()).with_context(|| {
                             format!("failed to read {}", entry.path().display())
                         })?;

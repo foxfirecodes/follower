@@ -1,14 +1,17 @@
+use std::collections::BTreeSet;
+
 use oxc::{
     ast::ast::{
-        Argument, ArrowFunctionBody, BindingPattern, Declaration, ExportDefaultDeclarationKind,
-        Expression, FormalParameters, Function, IdentifierReference, ImportDeclaration,
-        ImportDeclarationSpecifier, ImportOrExportKind, JSXAttributeItem, JSXAttributeValue,
-        JSXChild, JSXElement, JSXElementName, JSXExpression, ObjectPropertyKind,
+        Argument, ArrayExpressionElement, ArrowFunctionBody, BindingPattern, Declaration,
+        ExportDefaultDeclarationKind, Expression, FormalParameters, Function, IdentifierReference,
+        ImportDeclaration, ImportDeclarationSpecifier, ImportOrExportKind, JSXAttributeItem,
+        JSXAttributeValue, JSXChild, JSXElement, JSXElementName, JSXExpression, ObjectPropertyKind,
         SimpleAssignmentTarget, Statement, TSEnumDeclaration, VariableDeclaration,
     },
+    ast_visit::Visit,
     semantic::Scoping,
     span::{GetSpan, Span},
-    syntax::operator::{AssignmentOperator, BinaryOperator},
+    syntax::operator::{AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator},
 };
 
 use crate::{
@@ -16,8 +19,8 @@ use crate::{
     ir::{
         FlowArrowBody, FlowAssignmentTarget, FlowBinding, FlowExport, FlowExpression,
         FlowExpressionKind, FlowFileIr, FlowFunction, FlowImport, FlowJsxProp, FlowJsxTag,
-        FlowPattern, FlowPatternField, FlowPatternKind, FlowRecordField, FlowStatement, SourceSpan,
-        UnsupportedIr,
+        FlowLogicalOperator, FlowPattern, FlowPatternField, FlowPatternKind, FlowRecordField,
+        FlowStatement, SourceSpan, UnsupportedIr,
     },
 };
 
@@ -35,6 +38,21 @@ pub fn lower(
         lowerer.lower_top_level(statement);
     }
     lowerer.output
+}
+
+fn referenced_names(expression: &Expression<'_>) -> Vec<String> {
+    #[derive(Default)]
+    struct References(BTreeSet<String>);
+
+    impl<'a> Visit<'a> for References {
+        fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
+            self.0.insert(identifier.name.to_string());
+        }
+    }
+
+    let mut references = References::default();
+    references.visit_expression(expression);
+    references.0.into_iter().collect()
 }
 
 struct Lowerer<'s> {
@@ -527,6 +545,7 @@ impl Lowerer<'_> {
     fn lower_expression(&self, expression: &Expression<'_>) -> FlowExpression {
         let span = self.span(expression.span());
         let kind = match expression {
+            Expression::NullLiteral(_) => FlowExpressionKind::Null,
             Expression::StringLiteral(literal) => FlowExpressionKind::String {
                 value: literal.value.to_string(),
             },
@@ -567,6 +586,15 @@ impl Lowerer<'_> {
             Expression::ArrayExpression(array) => {
                 let mut elements = Vec::with_capacity(array.elements.len());
                 for element in &array.elements {
+                    if let ArrayExpressionElement::SpreadElement(spread) = element {
+                        elements.push(FlowExpression {
+                            kind: FlowExpressionKind::Spread {
+                                value: Box::new(self.lower_expression(&spread.argument)),
+                            },
+                            span: self.span(spread.span),
+                        });
+                        continue;
+                    }
                     let Some(element) = element.as_expression() else {
                         return self
                             .unsupported_expression("array_spread_or_elision", expression.span());
@@ -609,6 +637,37 @@ impl Lowerer<'_> {
                     left: Box::new(self.lower_expression(&binary.left)),
                     right: Box::new(self.lower_expression(&binary.right)),
                     negated: binary.operator == BinaryOperator::StrictInequality,
+                }
+            }
+            Expression::BinaryExpression(binary)
+                if matches!(
+                    binary.operator,
+                    BinaryOperator::Equality | BinaryOperator::Inequality
+                ) && (matches!(&binary.left, Expression::NullLiteral(_))
+                    || matches!(&binary.right, Expression::NullLiteral(_))) =>
+            {
+                let value = if matches!(&binary.left, Expression::NullLiteral(_)) {
+                    &binary.right
+                } else {
+                    &binary.left
+                };
+                FlowExpressionKind::LooseNullEquality {
+                    value: Box::new(self.lower_expression(value)),
+                    negated: binary.operator == BinaryOperator::Inequality,
+                }
+            }
+            Expression::LogicalExpression(logical) => FlowExpressionKind::Logical {
+                left: Box::new(self.lower_expression(&logical.left)),
+                right: Box::new(self.lower_expression(&logical.right)),
+                operator: match logical.operator {
+                    LogicalOperator::And => FlowLogicalOperator::And,
+                    LogicalOperator::Or => FlowLogicalOperator::Or,
+                    LogicalOperator::Coalesce => FlowLogicalOperator::Coalesce,
+                },
+            },
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
+                FlowExpressionKind::LogicalNot {
+                    value: Box::new(self.lower_expression(&unary.argument)),
                 }
             }
             Expression::ConditionalExpression(conditional) => FlowExpressionKind::Conditional {
@@ -655,6 +714,7 @@ impl Lowerer<'_> {
             }
             _ => FlowExpressionKind::Unsupported {
                 syntax: "unsupported_expression".to_owned(),
+                references: referenced_names(expression),
             },
         };
         FlowExpression { kind, span }
@@ -771,6 +831,7 @@ impl Lowerer<'_> {
         FlowExpression {
             kind: FlowExpressionKind::Unsupported {
                 syntax: syntax.to_owned(),
+                references: Vec::new(),
             },
             span: self.span(span),
         }

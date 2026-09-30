@@ -37,11 +37,13 @@ dependency-management costs without isolating meaningful change.
   arguments. Query declarations are strict, versioned TOML and reports are JSON-serializable.
 - Project-defined import aliases resolve package-style paths such as `@sample/*`; source roots can be
   individual files or directories and are canonicalized. An optional `source_contains_any` text
-  prefilter limits directory parsing; callback-bearing directly imported functions/components
+  prefilter limits directory parsing; callback-bearing directly imported functions/components,
+  factory-argument data imports, and reverse importers of exported callback-producing wrappers
   are added on demand, with a bounded expansion. Filtered reports retain an
   incomplete-coverage marker. Configured callback selector imports support state libraries whose
   imported functions return a callback's result. Numeric enum members keep their names
-  and values in query output. Local `.push`, bounded `.filter` subsets, React memoization hooks,
+  and values in query output. Local `.push`, finite array spreads, known-record `Object.values`,
+  predicate-aware `.filter`, React memoization hooks,
   array destructuring, JSX children, and default/nested functions cover additional production forms.
 - Each configured selector alternative runs in a separate choice context. The reference audit
   preserves the registry row's key, component, callback creation, prop flow, wrapper registration,

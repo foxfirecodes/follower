@@ -1,7 +1,7 @@
 #![allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::Path,
 };
@@ -14,8 +14,8 @@ use crate::{
     ids::{EvidenceId, FileId},
     ir::{
         FlowArrowBody, FlowAssignmentTarget, FlowBinding, FlowExpression, FlowExpressionKind,
-        FlowFunction, FlowJsxProp, FlowJsxTag, FlowPattern, FlowPatternKind, FlowStatement,
-        SourceSpan,
+        FlowFunction, FlowJsxProp, FlowJsxTag, FlowLogicalOperator, FlowPattern, FlowPatternKind,
+        FlowStatement, SourceSpan,
     },
     link::{LinkedSymbol, LinkedValue, SymbolLinker, ValueResolution, pattern_names},
     models::{CallbackFactoryModel, CaptureSource, ModelEvidence, ModelValue, ModeledOperation},
@@ -28,6 +28,8 @@ use crate::{
 };
 
 const MAX_CALL_DEPTH: usize = 128;
+const MAX_REVERSE_IMPORTER_EVALUATIONS: usize = 5_000;
+const MAX_REVERSE_IMPORTER_SOURCE_BYTES: usize = 20_000;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FunctionKey {
@@ -66,6 +68,7 @@ type Environment = BTreeMap<String, TrackedValue>;
 
 #[derive(Clone)]
 enum AbstractValue {
+    Null,
     String(String),
     Number(i64),
     EnumMember {
@@ -146,7 +149,13 @@ pub fn execute_query(
     snapshot: &Snapshot,
     query: &QuerySpec,
     query_hash: &str,
-) -> Result<(QueryReport, BTreeSet<std::path::PathBuf>)> {
+    reverse_seed_paths: &BTreeSet<std::path::PathBuf>,
+    reverse_producer_paths: &BTreeSet<std::path::PathBuf>,
+) -> Result<(
+    QueryReport,
+    BTreeSet<std::path::PathBuf>,
+    BTreeSet<std::path::PathBuf>,
+)> {
     let captures = query
         .factory_arguments
         .iter()
@@ -187,10 +196,27 @@ pub fn execute_query(
         solver.run()?;
     }
     if query.scope == QueryScope::AllCreations {
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!("query solver: seeding factory creations");
+        }
         solver.seed_unreached_creations();
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!("query solver: creations seeded; seeding reverse importers");
+        }
+        solver.seed_reverse_importers(reverse_seed_paths, reverse_producer_paths);
     }
     let requested_imports = solver.requested_imports.clone();
-    Ok((solver.query_report(query, query_hash), requested_imports))
+    let producer_paths = solver
+        .capability_producer_files
+        .iter()
+        .filter_map(|file_id| snapshot.files.iter().find(|file| file.file_id == *file_id))
+        .map(|file| file.path.clone())
+        .collect();
+    Ok((
+        solver.query_report(query, query_hash),
+        requested_imports,
+        producer_paths,
+    ))
 }
 
 struct Solver<'a> {
@@ -210,10 +236,14 @@ struct Solver<'a> {
     diagnostics: Vec<String>,
     coverage_gaps: Vec<String>,
     requested_imports: BTreeSet<std::path::PathBuf>,
+    capability_producer_files: BTreeSet<FileId>,
     current_choice: Option<String>,
     current_reachability: Reachability,
     call_depth: usize,
     active_captures: Vec<BTreeSet<String>>,
+    reverse_evaluations: usize,
+    reverse_budget_active: bool,
+    reverse_budget_reported: bool,
 }
 
 impl<'a> Solver<'a> {
@@ -308,10 +338,14 @@ impl<'a> Solver<'a> {
                 vec!["directory sources were text-filtered; files without a configured term were not analyzed".to_owned()]
             },
             requested_imports: BTreeSet::new(),
+            capability_producer_files: BTreeSet::new(),
             current_choice: None,
             current_reachability: Reachability::Reachable,
             call_depth: 0,
             active_captures: Vec::new(),
+            reverse_evaluations: 0,
+            reverse_budget_active: false,
+            reverse_budget_reported: false,
         })
     }
 
@@ -681,7 +715,14 @@ impl<'a> Solver<'a> {
         );
         self.active_captures.pop();
         self.call_depth -= 1;
-        returned.unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined))
+        let returned = returned.unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined));
+        if returns_capability_data(&returned) && self.snapshot.files.iter().any(|file| {
+            file.file_id == key.file_id
+                && file.flow.exports.iter().any(|export| matches!(export, crate::ir::FlowExport::Local { local, type_only: false, .. } if local == &key.name))
+        }) {
+            self.capability_producer_files.insert(key.file_id);
+        }
+        returned
     }
 
     fn execute_statements(
@@ -736,24 +777,24 @@ impl<'a> Solver<'a> {
                     alternate,
                     span,
                 } => {
-                    let test = self.eval(test, environment, file_id);
+                    let test_value = self.eval(test, environment, file_id);
                     self.push_evidence(
                         RelationKind::BranchDependency,
                         "branch_condition",
                         span.clone(),
-                        test.evidence.into_iter().collect(),
+                        test_value.evidence.into_iter().collect(),
                         None,
                         "control flow depends on this condition",
                     );
-                    match test.value {
-                        AbstractValue::Boolean(true) => {
+                    match truthy(&test_value.value) {
+                        Some(true) => {
                             if let Some(value) =
                                 self.execute_branch(consequent, environment, file_id)
                             {
                                 return Some(value);
                             }
                         }
-                        AbstractValue::Boolean(false) => {
+                        Some(false) => {
                             if let Some(value) =
                                 self.execute_branch(alternate, environment, file_id)
                             {
@@ -763,6 +804,16 @@ impl<'a> Solver<'a> {
                         _ => {
                             let mut consequent_environment = environment.clone();
                             let mut alternate_environment = environment.clone();
+                            refine_environment_for_condition(
+                                test,
+                                true,
+                                &mut consequent_environment,
+                            );
+                            refine_environment_for_condition(
+                                test,
+                                false,
+                                &mut alternate_environment,
+                            );
                             let left = self.execute_branch(
                                 consequent,
                                 &mut consequent_environment,
@@ -1187,7 +1238,26 @@ impl<'a> Solver<'a> {
         environment: &Environment,
         file_id: FileId,
     ) -> TrackedValue {
+        if self.reverse_budget_active {
+            self.reverse_evaluations += 1;
+            if self.reverse_evaluations > MAX_REVERSE_IMPORTER_EVALUATIONS {
+                if !self.reverse_budget_reported {
+                    self.mark_values_unresolved(
+                        environment.values(),
+                        "reverse importer exploration budget exhausted",
+                        expression.span.clone(),
+                    );
+                    self.record_coverage_gap(
+                        "reverse importer exploration budget exhausted",
+                        &expression.span,
+                    );
+                    self.reverse_budget_reported = true;
+                }
+                return TrackedValue::unknown("reverse_importer_budget_exhausted");
+            }
+        }
         match &expression.kind {
+            FlowExpressionKind::Null => TrackedValue::plain(AbstractValue::Null),
             FlowExpressionKind::String { value } => {
                 TrackedValue::plain(AbstractValue::String(value.clone()))
             }
@@ -1224,6 +1294,9 @@ impl<'a> Solver<'a> {
                         ..value.clone()
                     };
                 }
+                if name == "undefined" && !module_binding {
+                    return TrackedValue::plain(AbstractValue::Undefined);
+                }
                 if !module_binding {
                     return TrackedValue::unknown(format!("unresolved_local_identifier:{name}"));
                 }
@@ -1254,12 +1327,10 @@ impl<'a> Solver<'a> {
                     .collect();
                 TrackedValue::plain(AbstractValue::Record(values))
             }
-            FlowExpressionKind::Array { elements } => TrackedValue::plain(AbstractValue::Array(
-                elements
-                    .iter()
-                    .map(|element| self.eval(element, environment, file_id))
-                    .collect(),
-            )),
+            FlowExpressionKind::Array { elements } => {
+                self.eval_array_literal(elements, environment, file_id, &expression.span)
+            }
+            FlowExpressionKind::Spread { value } => self.eval(value, environment, file_id),
             FlowExpressionKind::StaticMember { object, property } => {
                 let object = self.eval(object, environment, file_id);
                 self.read_property(
@@ -1316,6 +1387,48 @@ impl<'a> Solver<'a> {
                     choice: left.choice.or(right.choice),
                 }
             }
+            FlowExpressionKind::LooseNullEquality { value, negated } => {
+                let value = self.eval(value, environment, file_id);
+                TrackedValue {
+                    value: nullish(&value.value).map_or_else(
+                        || AbstractValue::Unknown("non_finite_null_equality".to_owned()),
+                        |is_nullish| AbstractValue::Boolean(is_nullish != *negated),
+                    ),
+                    evidence: value.evidence,
+                    choice: value.choice,
+                }
+            }
+            FlowExpressionKind::LogicalNot { value } => {
+                let value = self.eval(value, environment, file_id);
+                TrackedValue {
+                    value: truthy(&value.value).map_or_else(
+                        || AbstractValue::Unknown("unknown_logical_not".to_owned()),
+                        |truthy| AbstractValue::Boolean(!truthy),
+                    ),
+                    evidence: value.evidence,
+                    choice: value.choice,
+                }
+            }
+            FlowExpressionKind::Logical {
+                left,
+                right,
+                operator,
+            } => {
+                let left = self.eval(left, environment, file_id);
+                let short_circuits = match operator {
+                    FlowLogicalOperator::And => truthy(&left.value).map(|value| !value),
+                    FlowLogicalOperator::Or => truthy(&left.value),
+                    FlowLogicalOperator::Coalesce => nullish(&left.value).map(|value| !value),
+                };
+                match short_circuits {
+                    Some(true) => left,
+                    Some(false) => self.eval(right, environment, file_id),
+                    None => TrackedValue::plain(AbstractValue::Union(vec![
+                        left,
+                        self.eval(right, environment, file_id),
+                    ])),
+                }
+            }
             FlowExpressionKind::Conditional {
                 test,
                 consequent,
@@ -1330,9 +1443,9 @@ impl<'a> Solver<'a> {
                     None,
                     "conditional expression depends on this condition",
                 );
-                match test.value {
-                    AbstractValue::Boolean(true) => self.eval(consequent, environment, file_id),
-                    AbstractValue::Boolean(false) => self.eval(alternate, environment, file_id),
+                match truthy(&test.value) {
+                    Some(true) => self.eval(consequent, environment, file_id),
+                    Some(false) => self.eval(alternate, environment, file_id),
                     _ => TrackedValue::plain(AbstractValue::Union(vec![
                         self.eval(consequent, environment, file_id),
                         self.eval(alternate, environment, file_id),
@@ -1340,6 +1453,26 @@ impl<'a> Solver<'a> {
                 }
             }
             FlowExpressionKind::Call { callee, arguments } => {
+                if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
+                    && property == "values"
+                    && matches!(&object.kind, FlowExpressionKind::Identifier { name, .. } if name == "Object")
+                    && !environment.contains_key("Object")
+                {
+                    let source = arguments.first().map_or_else(
+                        || TrackedValue::unknown("missing_object_values_argument"),
+                        |argument| self.eval(argument, environment, file_id),
+                    );
+                    if object_values_order_is_unknown(&source.value) {
+                        self.record_coverage_gap(
+                            "Object.values record key order is not modeled",
+                            &expression.span,
+                        );
+                    }
+                    return object_values(&source.value).map_or_else(
+                        || TrackedValue::unknown("object_values_unknown_record"),
+                        TrackedValue::plain,
+                    );
+                }
                 if let Some(index) = self.configured_callback_selector(file_id, callee) {
                     let callback = arguments.get(index).map_or_else(
                         || TrackedValue::unknown("missing_configured_selector_callback"),
@@ -1406,33 +1539,11 @@ impl<'a> Solver<'a> {
                     && property == "filter"
                 {
                     let receiver = self.eval(object, environment, file_id);
-                    let callback = arguments
-                        .first()
-                        .map(|argument| self.eval(argument, environment, file_id));
-                    if let Some(callback) = &callback {
-                        self.mark_value_unresolved(
-                            callback,
-                            "filter predicate is not modeled",
-                            expression.span.clone(),
-                        );
-                    }
-                    if let Some(filtered) = filtered_array_values(&receiver.value) {
-                        self.record_coverage_gap(
-                            "filter predicate is not modeled; all subsets retained",
-                            &expression.span,
-                        );
-                        return TrackedValue {
-                            value: filtered,
-                            evidence: receiver.evidence,
-                            choice: receiver.choice,
-                        };
-                    }
-                    self.mark_value_unresolved(
-                        &receiver,
-                        "filter receiver is not a bounded array",
-                        expression.span.clone(),
+                    let callback = arguments.first().map_or_else(
+                        || TrackedValue::unknown("missing_filter_callback"),
+                        |argument| self.eval(argument, environment, file_id),
                     );
-                    return TrackedValue::unknown("unknown_filter_receiver");
+                    return self.eval_array_filter_value(receiver, &callback, &expression.span);
                 }
                 let callee_value = self.eval(callee, environment, file_id);
                 let arguments = arguments
@@ -1507,7 +1618,7 @@ impl<'a> Solver<'a> {
             FlowExpressionKind::JsxElement { tag, props } => {
                 self.create_element(tag, props, expression, environment, file_id)
             }
-            FlowExpressionKind::Unsupported { syntax } => {
+            FlowExpressionKind::Unsupported { syntax, references } => {
                 if syntax == "symbolic_for_of_iteration" {
                     self.record_coverage_gap(
                         "for-of loop explored for zero or one iteration",
@@ -1515,7 +1626,7 @@ impl<'a> Solver<'a> {
                     );
                 }
                 self.mark_values_unresolved(
-                    environment.values(),
+                    references.iter().filter_map(|name| environment.get(name)),
                     &format!("unsupported expression: {syntax}"),
                     expression.span.clone(),
                 );
@@ -1722,6 +1833,75 @@ impl<'a> Solver<'a> {
         }
     }
 
+    fn eval_array_literal(
+        &mut self,
+        elements: &[FlowExpression],
+        environment: &Environment,
+        file_id: FileId,
+        span: &SourceSpan,
+    ) -> TrackedValue {
+        let mut alternatives = vec![Vec::new()];
+        for element in elements {
+            let (parts, is_spread) = match &element.kind {
+                FlowExpressionKind::Spread { value } => {
+                    let spread = self.eval(value, environment, file_id);
+                    match finite_array_parts(&spread.value) {
+                        Some(parts) => (parts, true),
+                        None => {
+                            self.mark_value_unresolved(
+                                &spread,
+                                "array spread is not a finite array",
+                                element.span.clone(),
+                            );
+                            (
+                                vec![vec![TrackedValue::unknown("unknown_array_spread")]],
+                                true,
+                            )
+                        }
+                    }
+                }
+                _ => (vec![vec![self.eval(element, environment, file_id)]], false),
+            };
+            if alternatives.len().saturating_mul(parts.len()) > 64 {
+                self.record_coverage_gap(
+                    "array construction exceeded finite alternatives budget",
+                    span,
+                );
+                return TrackedValue::unknown("array_alternatives_budget_exhausted");
+            }
+            alternatives = alternatives
+                .into_iter()
+                .flat_map(|prefix| {
+                    parts.iter().map(move |part| {
+                        let mut merged = prefix.clone();
+                        if is_spread {
+                            merged.extend(part.clone());
+                        } else {
+                            merged.push(part[0].clone());
+                        }
+                        merged
+                    })
+                })
+                .collect();
+        }
+        let mut values = alternatives
+            .into_iter()
+            .map(|elements| TrackedValue::plain(AbstractValue::Array(elements)));
+        let first = values
+            .next()
+            .unwrap_or_else(|| TrackedValue::plain(AbstractValue::Array(Vec::new())));
+        if let Some(second) = values.next() {
+            TrackedValue::plain(AbstractValue::Union(
+                std::iter::once(first)
+                    .chain(std::iter::once(second))
+                    .chain(values)
+                    .collect(),
+            ))
+        } else {
+            first
+        }
+    }
+
     fn eval_array_map(
         &mut self,
         object: &FlowExpression,
@@ -1735,6 +1915,15 @@ impl<'a> Solver<'a> {
             || TrackedValue::unknown("missing_map_callback"),
             |callback| self.eval(callback, environment, file_id),
         );
+        self.eval_array_map_value(receiver, &callback, &span)
+    }
+
+    fn eval_array_map_value(
+        &mut self,
+        receiver: TrackedValue,
+        callback: &TrackedValue,
+        span: &SourceSpan,
+    ) -> TrackedValue {
         match receiver.value {
             AbstractValue::Array(elements) => {
                 let original = TrackedValue::plain(AbstractValue::Array(elements.clone()));
@@ -1746,7 +1935,10 @@ impl<'a> Solver<'a> {
                             callback.clone(),
                             vec![
                                 element,
-                                TrackedValue::unknown(format!("array_index:{index}")),
+                                i64::try_from(index).map_or_else(
+                                    |_| TrackedValue::unknown("array_index_out_of_range"),
+                                    |index| TrackedValue::plain(AbstractValue::Number(index)),
+                                ),
                                 original.clone(),
                             ],
                             span.clone(),
@@ -1755,11 +1947,17 @@ impl<'a> Solver<'a> {
                     .collect();
                 TrackedValue::plain(AbstractValue::Array(mapped))
             }
+            AbstractValue::Union(values) => TrackedValue::plain(AbstractValue::Union(
+                values
+                    .into_iter()
+                    .map(|value| self.eval_array_map_value(value, callback, span))
+                    .collect(),
+            )),
             AbstractValue::Unknown(reason) => {
                 let before = self.capabilities.len();
                 let mut affected = capability_ids(&callback);
                 let mapped = self.invoke_value(
-                    callback,
+                    callback.clone(),
                     vec![TrackedValue::unknown("symbolic_array_element")],
                     span.clone(),
                 );
@@ -1789,8 +1987,87 @@ impl<'a> Solver<'a> {
                 TrackedValue::plain(AbstractValue::Array(vec![mapped]))
             }
             _ => {
-                self.mark_value_unresolved(&receiver, "map receiver is not a known array", span);
+                self.mark_value_unresolved(
+                    &receiver,
+                    "map receiver is not a known array",
+                    span.clone(),
+                );
                 TrackedValue::unknown("unsupported_map_receiver")
+            }
+        }
+    }
+
+    fn eval_array_filter_value(
+        &mut self,
+        receiver: TrackedValue,
+        callback: &TrackedValue,
+        span: &SourceSpan,
+    ) -> TrackedValue {
+        match receiver.value {
+            AbstractValue::Array(elements) if elements.len() <= 8 => {
+                let original = TrackedValue::plain(AbstractValue::Array(elements.clone()));
+                let mut subsets = vec![Vec::new()];
+                for (index, element) in elements.into_iter().enumerate() {
+                    let predicate = self.invoke_value(
+                        callback.clone(),
+                        vec![
+                            element.clone(),
+                            i64::try_from(index).map_or_else(
+                                |_| TrackedValue::unknown("array_index_out_of_range"),
+                                |index| TrackedValue::plain(AbstractValue::Number(index)),
+                            ),
+                            original.clone(),
+                        ],
+                        span.clone(),
+                    );
+                    match truthy(&predicate.value) {
+                        Some(true) => subsets
+                            .iter_mut()
+                            .for_each(|subset| subset.push(element.clone())),
+                        Some(false) => {}
+                        None => {
+                            self.record_coverage_gap(
+                                "filter predicate is unknown; both outcomes retained",
+                                span,
+                            );
+                            let mut included = subsets.clone();
+                            included
+                                .iter_mut()
+                                .for_each(|subset| subset.push(element.clone()));
+                            subsets.extend(included);
+                        }
+                    }
+                }
+                let mut alternatives = subsets
+                    .into_iter()
+                    .map(|elements| TrackedValue::plain(AbstractValue::Array(elements)));
+                let first = alternatives
+                    .next()
+                    .unwrap_or_else(|| TrackedValue::plain(AbstractValue::Array(Vec::new())));
+                if let Some(second) = alternatives.next() {
+                    TrackedValue::plain(AbstractValue::Union(
+                        std::iter::once(first)
+                            .chain(std::iter::once(second))
+                            .chain(alternatives)
+                            .collect(),
+                    ))
+                } else {
+                    first
+                }
+            }
+            AbstractValue::Union(values) => TrackedValue::plain(AbstractValue::Union(
+                values
+                    .into_iter()
+                    .map(|value| self.eval_array_filter_value(value, callback, span))
+                    .collect(),
+            )),
+            _ => {
+                self.mark_value_unresolved(
+                    &receiver,
+                    "filter receiver is not a bounded array",
+                    span.clone(),
+                );
+                TrackedValue::unknown("unknown_filter_receiver")
             }
         }
     }
@@ -2446,10 +2723,23 @@ impl<'a> Solver<'a> {
                 let environment = self.module_environment(candidate.file_id);
                 let callable = self.eval(&binding.value, &environment, candidate.file_id);
                 if let AbstractValue::Closure(closure) = &callable.value {
+                    let exported = matches!(
+                        &binding.pattern.kind,
+                        FlowPatternKind::Identifier { name }
+                            if self.snapshot.files.iter().any(|file| {
+                                file.file_id == candidate.file_id
+                                    && file.flow.exports.iter().any(|export| {
+                                        matches!(export, crate::ir::FlowExport::Local { local, type_only: false, .. } if local == name)
+                                    })
+                            })
+                    );
                     let arguments = (0..closure.params.len())
                         .map(|_| TrackedValue::unknown("unreached_function_parameter"))
                         .collect();
                     let returned = self.invoke_value(callable, arguments, candidate.span.clone());
+                    if exported && returns_capability_data(&returned) {
+                        self.capability_producer_files.insert(candidate.file_id);
+                    }
                     self.render(returned);
                 }
             }
@@ -2466,7 +2756,205 @@ impl<'a> Solver<'a> {
                     .collect::<Vec<_>>();
                 self.call_model(&arguments, candidate.span.clone());
             }
+            if self.capabilities.iter().any(|capability| {
+                capability.callsite == candidate.span
+                    && capability.factory_arguments.iter().any(value_is_uncertain)
+            }) {
+                self.request_factory_argument_imports(&candidate);
+            }
             self.record_unreached_gap(&candidate.span);
+        }
+        self.current_choice = None;
+        self.current_reachability = Reachability::Reachable;
+    }
+
+    fn request_factory_argument_imports(&mut self, candidate: &FactoryCallCandidate) {
+        let mut names = BTreeSet::new();
+        for argument in &candidate.arguments {
+            let mut references = ClosureReferences::default();
+            collect_expression_references(argument, &mut references);
+            names.extend(references.names);
+        }
+        let statements = candidate
+            .enclosing_function
+            .as_ref()
+            .and_then(|key| self.functions.get(key))
+            .map(|definition| definition.function.body.clone())
+            .unwrap_or_default();
+        let globals = self
+            .snapshot
+            .files
+            .iter()
+            .find(|file| file.file_id == candidate.file_id)
+            .map(|file| file.flow.globals.clone())
+            .unwrap_or_default();
+        for _ in 0..8 {
+            let before = names.len();
+            extend_binding_dependencies(&statements, &mut names);
+            for binding in &globals {
+                if pattern_names(&binding.pattern)
+                    .iter()
+                    .any(|name| names.contains(*name))
+                {
+                    let mut references = ClosureReferences::default();
+                    collect_expression_references(&binding.value, &mut references);
+                    names.extend(references.names);
+                }
+            }
+            if names.len() == before {
+                break;
+            }
+        }
+        let mut pending = names
+            .into_iter()
+            .map(|name| (candidate.file_id, name))
+            .collect::<VecDeque<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some((file_id, name)) = pending.pop_front() {
+            if !visited.insert((file_id, name.clone())) {
+                continue;
+            }
+            if visited.len() > 64 {
+                self.record_coverage_gap(
+                    "factory argument import dependency budget exhausted",
+                    &candidate.span,
+                );
+                break;
+            }
+            self.request_import_for_local(file_id, &name);
+            let target = self
+                .snapshot
+                .files
+                .iter()
+                .find(|file| file.file_id == file_id)
+                .and_then(|file| {
+                    file.flow
+                        .imports
+                        .iter()
+                        .find(|import| import.local == name)
+                        .map(|import| (file, import))
+                })
+                .and_then(|(file, import)| {
+                    self.snapshot
+                        .resolutions
+                        .iter()
+                        .find(|resolution| {
+                            resolution.importer == file.path
+                                && resolution.specifier == import.module
+                        })
+                        .and_then(|resolution| resolution.resolved_path.as_ref())
+                        .map(|path| (path, import.imported.as_str()))
+                })
+                .and_then(|(path, imported)| {
+                    self.snapshot
+                        .files
+                        .iter()
+                        .find(|file| file.path == *path)
+                        .map(|file| (file.file_id, file.flow.globals.clone(), imported.to_owned()))
+                });
+            if let Some((target_id, globals, imported)) = target {
+                for binding in globals {
+                    if pattern_names(&binding.pattern).contains(&imported.as_str()) {
+                        let mut references = ClosureReferences::default();
+                        collect_expression_references(&binding.value, &mut references);
+                        pending.extend(references.names.into_iter().map(|name| (target_id, name)));
+                    }
+                }
+            }
+        }
+    }
+
+    fn seed_reverse_importers(
+        &mut self,
+        seed_paths: &BTreeSet<std::path::PathBuf>,
+        producer_paths: &BTreeSet<std::path::PathBuf>,
+    ) {
+        if seed_paths.is_empty() || producer_paths.is_empty() {
+            return;
+        }
+        self.current_choice = Some("<reverse-importer>".to_owned());
+        self.current_reachability = Reachability::Unknown;
+        let mut seeded = 0_usize;
+        for path in seed_paths {
+            let Some(file) = self.snapshot.files.iter().find(|file| &file.path == path) else {
+                continue;
+            };
+            let file_id = file.file_id;
+            let file_len = file.source_len;
+            let imported_names = file
+                .flow
+                .imports
+                .iter()
+                .filter(|import| !import.type_only)
+                .filter(|import| {
+                    self.snapshot.resolutions.iter().any(|resolution| {
+                        resolution.importer == file.path
+                            && resolution.specifier == import.module
+                            && resolution
+                                .resolved_path
+                                .as_ref()
+                                .is_some_and(|path| producer_paths.contains(path))
+                    })
+                })
+                .map(|import| import.local.clone())
+                .collect::<BTreeSet<_>>();
+            if imported_names.is_empty() {
+                continue;
+            }
+            let functions = file.flow.functions.clone();
+            let globals = file.flow.globals.clone();
+            for function in functions {
+                let mut references = ClosureReferences::default();
+                for statement in &function.body {
+                    collect_statement_references(statement, &mut references);
+                }
+                if references.names.is_disjoint(&imported_names) {
+                    continue;
+                }
+                if file_len > MAX_REVERSE_IMPORTER_SOURCE_BYTES {
+                    self.record_coverage_gap(
+                        "reverse importer source exceeds exploration size budget",
+                        &function.span,
+                    );
+                    continue;
+                }
+                let key = FunctionKey {
+                    file_id,
+                    name: function.name.clone(),
+                };
+                let arguments = function
+                    .params
+                    .iter()
+                    .map(|_| TrackedValue::unknown("reverse_importer_parameter"))
+                    .collect();
+                seeded += 1;
+                if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+                    eprintln!(
+                        "query seeding importer function {seeded} in file {} (file_bytes={file_len}, body_statements={})",
+                        file_id.0,
+                        function.body.len()
+                    );
+                }
+                self.reverse_evaluations = 0;
+                self.reverse_budget_reported = false;
+                self.reverse_budget_active = true;
+                let returned = self.call_function(&key, arguments);
+                self.render(returned);
+                self.reverse_budget_active = false;
+            }
+            for binding in globals {
+                let mut references = ClosureReferences::default();
+                collect_expression_references(&binding.value, &mut references);
+                if references.names.is_disjoint(&imported_names) {
+                    continue;
+                }
+                let environment = self.module_environment(file_id);
+                let returned = self.eval(&binding.value, &environment, file_id);
+                self.render(returned);
+            }
+        }
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!("query reverse importer functions seeded: {seeded}");
         }
         self.current_choice = None;
         self.current_reachability = Reachability::Reachable;
@@ -2755,7 +3243,7 @@ impl<'a> Solver<'a> {
             .map(|entry| format!("{}#{}", entry.module.display(), entry.export))
             .collect();
         QueryReport {
-            schema_version: 2,
+            schema_version: 3,
             snapshot_id: self.snapshot.snapshot_id.clone(),
             config_hash: self.snapshot.config_hash.clone(),
             query_hash: query_hash.to_owned(),
@@ -2842,37 +3330,45 @@ fn append_array_values(receiver: &AbstractValue, added: &[TrackedValue]) -> Opti
     }
 }
 
-fn filtered_array_values(receiver: &AbstractValue) -> Option<AbstractValue> {
-    match receiver {
-        AbstractValue::Array(elements) if elements.len() <= 6 => {
-            let mut subsets = vec![Vec::new()];
-            for element in elements {
-                let mut with_element = subsets.clone();
-                for subset in &mut with_element {
-                    subset.push(element.clone());
+fn finite_array_parts(value: &AbstractValue) -> Option<Vec<Vec<TrackedValue>>> {
+    match value {
+        AbstractValue::Array(elements) => Some(vec![elements.clone()]),
+        AbstractValue::Union(values) => {
+            let mut parts = Vec::new();
+            for value in values {
+                parts.extend(finite_array_parts(&value.value)?);
+                if parts.len() > 64 {
+                    return None;
                 }
-                subsets.extend(with_element);
             }
-            Some(AbstractValue::Union(
-                subsets
-                    .into_iter()
-                    .map(|elements| TrackedValue::plain(AbstractValue::Array(elements)))
-                    .collect(),
-            ))
+            Some(parts)
+        }
+        _ => None,
+    }
+}
+
+fn object_values(value: &AbstractValue) -> Option<AbstractValue> {
+    match value {
+        AbstractValue::Record(fields) => {
+            Some(AbstractValue::Array(fields.values().cloned().collect()))
         }
         AbstractValue::Union(values) => Some(AbstractValue::Union(
             values
                 .iter()
-                .map(|value| {
-                    Some(TrackedValue {
-                        value: filtered_array_values(&value.value)?,
-                        evidence: value.evidence,
-                        choice: value.choice.clone(),
-                    })
-                })
+                .map(|value| Some(TrackedValue::plain(object_values(&value.value)?)))
                 .collect::<Option<Vec<_>>>()?,
         )),
         _ => None,
+    }
+}
+
+fn object_values_order_is_unknown(value: &AbstractValue) -> bool {
+    match value {
+        AbstractValue::Record(fields) => fields.len() > 1,
+        AbstractValue::Union(values) => values
+            .iter()
+            .any(|value| object_values_order_is_unknown(&value.value)),
+        _ => false,
     }
 }
 
@@ -2974,6 +3470,7 @@ fn collect_expression_references(expression: &FlowExpression, references: &mut C
                 collect_expression_references(value, references);
             }
         }
+        FlowExpressionKind::Spread { value } => collect_expression_references(value, references),
         FlowExpressionKind::StaticMember { object, .. } => {
             collect_expression_references(object, references);
         }
@@ -2981,9 +3478,14 @@ fn collect_expression_references(expression: &FlowExpression, references: &mut C
             collect_expression_references(object, references);
             collect_expression_references(property, references);
         }
-        FlowExpressionKind::StrictEquality { left, right, .. } => {
+        FlowExpressionKind::StrictEquality { left, right, .. }
+        | FlowExpressionKind::Logical { left, right, .. } => {
             collect_expression_references(left, references);
             collect_expression_references(right, references);
+        }
+        FlowExpressionKind::LooseNullEquality { value, .. }
+        | FlowExpressionKind::LogicalNot { value } => {
+            collect_expression_references(value, references);
         }
         FlowExpressionKind::Conditional {
             test,
@@ -3025,7 +3527,12 @@ fn collect_expression_references(expression: &FlowExpression, references: &mut C
                 }
             }
         }
-        FlowExpressionKind::Unsupported { .. } => references.has_unsupported = true,
+        FlowExpressionKind::Unsupported {
+            references: names, ..
+        } => {
+            references.names.extend(names.iter().cloned());
+            references.modules.extend(names.iter().cloned());
+        }
         _ => {}
     }
 }
@@ -3071,6 +3578,40 @@ fn collect_statement_references(statement: &FlowStatement, references: &mut Clos
     }
 }
 
+fn extend_binding_dependencies(statements: &[FlowStatement], names: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement {
+            FlowStatement::Bind(binding)
+                if pattern_names(&binding.pattern)
+                    .iter()
+                    .any(|name| names.contains(*name)) =>
+            {
+                let mut references = ClosureReferences::default();
+                collect_expression_references(&binding.value, &mut references);
+                names.extend(references.names);
+            }
+            FlowStatement::Assign {
+                target: FlowAssignmentTarget::Identifier { name },
+                value,
+                ..
+            } if names.contains(name) => {
+                let mut references = ClosureReferences::default();
+                collect_expression_references(value, &mut references);
+                names.extend(references.names);
+            }
+            FlowStatement::If {
+                consequent,
+                alternate,
+                ..
+            } => {
+                extend_binding_dependencies(consequent, names);
+                extend_binding_dependencies(alternate, names);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_capability_ids(value: &TrackedValue, ids: &mut Vec<usize>) {
     match &value.value {
         AbstractValue::Capability(id) => ids.push(*id),
@@ -3099,8 +3640,22 @@ fn collect_capability_ids(value: &TrackedValue, ids: &mut Vec<usize>) {
     }
 }
 
+fn returns_capability_data(value: &TrackedValue) -> bool {
+    match &value.value {
+        AbstractValue::Capability(_) | AbstractValue::Closure(_) => {
+            !capability_ids(value).is_empty()
+        }
+        AbstractValue::Record(fields) => fields.values().any(returns_capability_data),
+        AbstractValue::Array(values) | AbstractValue::Union(values) => {
+            values.iter().any(returns_capability_data)
+        }
+        _ => false,
+    }
+}
+
 fn render_compact_value(value: &TrackedValue) -> String {
     match &value.value {
+        AbstractValue::Null => "null".to_owned(),
         AbstractValue::String(value) => value.clone(),
         AbstractValue::Number(value) => value.to_string(),
         AbstractValue::EnumMember {
@@ -3133,6 +3688,7 @@ fn render_compact_value(value: &TrackedValue) -> String {
 
 fn query_value(value: &TrackedValue) -> QueryValue {
     match &value.value {
+        AbstractValue::Null => QueryValue::Null,
         AbstractValue::String(value) => QueryValue::String {
             value: value.clone(),
         },
@@ -3179,6 +3735,7 @@ fn query_value(value: &TrackedValue) -> QueryValue {
 
 fn exact_equality(left: &AbstractValue, right: &AbstractValue) -> Option<bool> {
     match (left, right) {
+        (AbstractValue::Null, AbstractValue::Null) => Some(true),
         (AbstractValue::String(left), AbstractValue::String(right)) => Some(left == right),
         (AbstractValue::Number(left), AbstractValue::Number(right)) => Some(left == right),
         (
@@ -3191,12 +3748,97 @@ fn exact_equality(left: &AbstractValue, right: &AbstractValue) -> Option<bool> {
         }
         (AbstractValue::Boolean(left), AbstractValue::Boolean(right)) => Some(left == right),
         (AbstractValue::Undefined, AbstractValue::Undefined) => Some(true),
+        (AbstractValue::Null, AbstractValue::Undefined)
+        | (AbstractValue::Undefined, AbstractValue::Null) => Some(false),
         (
             AbstractValue::String(_) | AbstractValue::Boolean(_) | AbstractValue::Undefined,
             AbstractValue::String(_) | AbstractValue::Boolean(_) | AbstractValue::Undefined,
         ) => Some(false),
         _ => None,
     }
+}
+
+fn nullish(value: &AbstractValue) -> Option<bool> {
+    match value {
+        AbstractValue::Null | AbstractValue::Undefined => Some(true),
+        AbstractValue::Unknown(_) => None,
+        AbstractValue::Union(values) => {
+            same_known(values.iter().map(|value| nullish(&value.value)))
+        }
+        _ => Some(false),
+    }
+}
+
+fn refine_environment_for_condition(
+    condition: &FlowExpression,
+    expected: bool,
+    environment: &mut Environment,
+) {
+    match &condition.kind {
+        FlowExpressionKind::Logical {
+            left,
+            right,
+            operator: FlowLogicalOperator::And,
+        } if expected => {
+            refine_environment_for_condition(left, true, environment);
+            refine_environment_for_condition(right, true, environment);
+        }
+        FlowExpressionKind::Logical {
+            left,
+            right,
+            operator: FlowLogicalOperator::Or,
+        } if !expected => {
+            refine_environment_for_condition(left, false, environment);
+            refine_environment_for_condition(right, false, environment);
+        }
+        FlowExpressionKind::LogicalNot { value } => {
+            refine_environment_for_condition(value, !expected, environment);
+        }
+        FlowExpressionKind::LooseNullEquality { value, negated } => {
+            let FlowExpressionKind::Identifier { name, .. } = &value.kind else {
+                return;
+            };
+            let Some(binding) = environment.get_mut(name) else {
+                return;
+            };
+            let AbstractValue::Union(alternatives) = &binding.value else {
+                return;
+            };
+            let wants_nullish = expected != *negated;
+            let mut narrowed = alternatives
+                .iter()
+                .filter(|alternative| {
+                    nullish(&alternative.value).is_none_or(|is_nullish| is_nullish == wants_nullish)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if narrowed.len() == 1 {
+                binding.value = narrowed.remove(0).value;
+            } else if !narrowed.is_empty() {
+                binding.value = AbstractValue::Union(narrowed);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn truthy(value: &AbstractValue) -> Option<bool> {
+    match value {
+        AbstractValue::Null | AbstractValue::Undefined => Some(false),
+        AbstractValue::Boolean(value) => Some(*value),
+        AbstractValue::Number(value) => Some(*value != 0),
+        AbstractValue::EnumMember { value, .. } => Some(*value != 0),
+        AbstractValue::String(value) => Some(!value.is_empty()),
+        AbstractValue::Unknown(_) => None,
+        AbstractValue::Union(values) => same_known(values.iter().map(|value| truthy(&value.value))),
+        _ => Some(true),
+    }
+}
+
+fn same_known(values: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut values = values;
+    let first = values.next()??;
+    values.all(|value| value == Some(first)).then_some(first)
 }
 
 fn value_is_uncertain(value: &TrackedValue) -> bool {
@@ -3267,6 +3909,9 @@ fn collect_factory_calls(
                 collect_factory_calls(element, file_id, enclosing_function, candidates);
             }
         }
+        FlowExpressionKind::Spread { value } => {
+            collect_factory_calls(value, file_id, enclosing_function, candidates);
+        }
         FlowExpressionKind::StaticMember { object, .. } => {
             collect_factory_calls(object, file_id, enclosing_function, candidates);
         }
@@ -3274,9 +3919,14 @@ fn collect_factory_calls(
             collect_factory_calls(object, file_id, enclosing_function, candidates);
             collect_factory_calls(property, file_id, enclosing_function, candidates);
         }
-        FlowExpressionKind::StrictEquality { left, right, .. } => {
+        FlowExpressionKind::StrictEquality { left, right, .. }
+        | FlowExpressionKind::Logical { left, right, .. } => {
             collect_factory_calls(left, file_id, enclosing_function, candidates);
             collect_factory_calls(right, file_id, enclosing_function, candidates);
+        }
+        FlowExpressionKind::LooseNullEquality { value, .. }
+        | FlowExpressionKind::LogicalNot { value } => {
+            collect_factory_calls(value, file_id, enclosing_function, candidates);
         }
         FlowExpressionKind::Conditional {
             test,
@@ -3312,7 +3962,8 @@ fn collect_factory_calls(
                 }
             }
         }
-        FlowExpressionKind::String { .. }
+        FlowExpressionKind::Null
+        | FlowExpressionKind::String { .. }
         | FlowExpressionKind::Number { .. }
         | FlowExpressionKind::NumericEnumMember { .. }
         | FlowExpressionKind::Boolean { .. }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ir::FileIr, link::ImportResolution};
 
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
-pub const FRONTEND_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+oxc-0.152.0.flow-ir-6");
+pub const FRONTEND_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+oxc-0.152.0.flow-ir-7");
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
