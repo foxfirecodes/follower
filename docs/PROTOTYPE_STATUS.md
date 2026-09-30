@@ -133,6 +133,8 @@ branches, partial returns, reassigned captures, opaque namespace consumers, and 
 
 ## Next implementation steps
 
+For detection-specific priorities and acceptance checks, see [Detection coverage roadmap](COVERAGE_ROADMAP.md).
+
 1. Turn the owned expressions into explicit blocks/instructions and move evaluation to a monotone
    worklist with query budgets and context-keyed summaries.
 2. Extend local heap cells to dynamic/external mutation, live closure cells, and points-to sets;
