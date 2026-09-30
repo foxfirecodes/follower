@@ -26,6 +26,10 @@ cargo run --bin follower -- query \
 Use `--format json` for the stable machine-readable report. The query declaration and current
 semantics are documented in [`docs/QUERY.md`](docs/QUERY.md).
 
+Queries can also select tuple return elements with `returned_index`, and project numeric enum
+member names from TS source. Project configs accept `[import_aliases]` for paths such as `@sample/*`.
+See [`docs/QUERY.md`](docs/QUERY.md) for synthetic tuple and project examples.
+
 The control-flow fixture exercises finite strict-equality branches and row-preserving literal-array
 `.map`, canonical ordinary-call linkage, and local callback reassignment:
 

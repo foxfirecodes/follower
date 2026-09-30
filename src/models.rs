@@ -30,7 +30,12 @@ impl Model {
 pub struct CallbackFactoryModel {
     pub id: String,
     pub r#match: SymbolMatcher,
+    #[serde(default)]
     pub returned_property: Vec<String>,
+    #[serde(default)]
+    pub returned_index: Option<usize>,
+    #[serde(default)]
+    pub scan_callback_bodies: bool,
     pub retains_returned_callback: Option<bool>,
     pub invokes_returned_callback_during_call: Option<bool>,
     pub captures: std::collections::BTreeMap<String, CaptureSource>,
@@ -127,9 +132,9 @@ fn validate_models(models: &[Model]) -> Result<()> {
         }
         match model {
             Model::CallbackFactory(factory) => {
-                if factory.returned_property.is_empty() {
+                if factory.returned_property.is_empty() == factory.returned_index.is_none() {
                     bail!(
-                        "callback factory {} has an empty returned_property",
+                        "callback factory {} must select exactly one returned_property or returned_index",
                         factory.id
                     );
                 }

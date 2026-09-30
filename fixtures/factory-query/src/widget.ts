@@ -1,5 +1,5 @@
-export function useHideableThing(
+export function useWidgetActions(
   _types: readonly string[],
-): { markHandled: (hideKind: string) => void } {
+): { runAction: (actionKind: string) => void } {
   throw new Error("fixture implementation is selected by the query");
 }

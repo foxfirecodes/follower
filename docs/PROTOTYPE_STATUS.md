@@ -33,8 +33,16 @@ dependency-management costs without isolating meaningful change.
   spreads, finite strict-equality branches, literal-array `.map`, simple assignment, and intrinsic
   `onClick` registration.
 - `follower query` implements the first generic query family: match a factory symbol, project selected
-  creation arguments, follow one returned property as a capability, and project its invocation
+  creation arguments, follow one returned property or tuple element as a capability, and project its invocation
   arguments. Query declarations are strict, versioned TOML and reports are JSON-serializable.
+- Project-defined import aliases resolve package-style paths such as `@sample/*`; source roots can be
+  individual files or directories and are canonicalized. An optional `source_contains_any` text
+  prefilter limits directory parsing; callback-bearing directly imported functions/components
+  are added on demand, with a bounded expansion. Filtered reports retain an
+  incomplete-coverage marker. Configured callback selector imports support state libraries whose
+  imported functions return a callback's result. Numeric enum members keep their names
+  and values in query output. Local `.push`, bounded `.filter` subsets, React memoization hooks,
+  array destructuring, JSX children, and default/nested functions cover additional production forms.
 - Each configured selector alternative runs in a separate choice context. The reference audit
   preserves the registry row's key, component, callback creation, prop flow, wrapper registration,
   and invocation result.
@@ -67,15 +75,15 @@ The `prop-chain` fixture sends two independently created callbacks through the s
 walks backward from each invocation through the evidence graph and requires the intermediate
 `render_prop_binding` relations to remain attached to the matching `alpha` or `beta` choice.
 
-The `factory-query` fixture projects an array of thing types from `useHideableThing`, follows
-the destructured `markHandled` callback through renamed component props, and correlates it with
-the dismissal type passed at invocation. Its imports pass through named aliases, multiple forms of
+The `factory-query` fixture projects an array of widget types from `useWidgetActions`, follows
+the destructured `runAction` callback through renamed component props, and correlates it with
+the action kind passed at invocation. Its imports pass through named aliases, multiple forms of
 re-export, an `export *` barrel, and a namespace member. It also contains an unrendered component to
 verify that `all_creations` emits an explicit unknown-reachability row and coverage gap.
 
 The `query-control-flow` fixture selects correlated record arrays with a finite conditional, maps
 each row to a component, takes an exact `if` branch inside that component, and verifies three
-distinct type/dismissal pairs across two root choices. The component and callback helper pass
+distinct type/action pairs across two root choices. The component and callback helper pass
 through canonical import/re-export/namespace linkage despite unrelated declarations with the same
 names. It also reassigns a local callback wrapper and checks that unrelated unknown iteration does
 not degrade query coverage.
@@ -97,8 +105,8 @@ branches, partial returns, reassigned captures, opaque namespace consumers, and 
 - Branch joins preserve alternatives conservatively; they are not a precise correlated join or a
   fixed-point computation. Joined callback call targets remain unresolved. Module value cycles
   become explicit coverage gaps rather than modeling JavaScript temporal-dead-zone semantics.
-- Loops, precise record/heap aliasing and live closure cells, compound and destructuring assignment,
-  array methods other than `.map`, getters/proxies,
+- General loops, precise record/heap aliasing and live closure cells, compound and destructuring assignment,
+  array methods other than `.map`, bounded `.filter`, and local `.push`, getters/proxies,
   exceptions/finally, recursion summaries, state/refs, historical renders, and custom event
   contracts are not analyzed yet.
 - Query-specific unsupported operations become unresolved only when they can see a tracked
@@ -119,5 +127,8 @@ branches, partial returns, reassigned captures, opaque namespace consumers, and 
    live closure cells, and points-to sets; extend tests for independent selections, reassigned
    captures, prop overwrite order, and opaque mutation.
 3. Persist evidence indexes so `trace` and `explain` can query a chosen snapshot without reindexing.
-4. Extend the semantic acceptance suite alongside each change, especially for dependencies hidden
+4. Add a versioned per-file IR cache keyed by content hash, then cache import resolution and
+   reuse unchanged files in query runs. Keep filtered-source gaps visible, and benchmark cold and
+   warm runs on broad source roots before adding concurrency.
+5. Extend the semantic acceptance suite alongside each change, especially for dependencies hidden
    by unsupported syntax, before adding concurrency or incremental invalidation.

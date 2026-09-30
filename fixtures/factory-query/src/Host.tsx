@@ -1,6 +1,6 @@
-import { useThing as makeHideable } from "./public";
-import * as Hideable from "./public";
-import { useHideableThing as decoy } from "./decoy";
+import { useThing as makeWidget } from "./public";
+import * as Widget from "./public";
+import { useWidgetActions as decoy } from "./decoy";
 
 enum ThingType {
   Banner = "banner",
@@ -8,7 +8,7 @@ enum ThingType {
   Upgrade = "upgrade",
 }
 
-enum HideKind {
+enum ActionKind {
   CloseButton = "close_button",
   Timeout = "timeout",
 }
@@ -26,9 +26,9 @@ const registry = {
 
 export function Host({ variant }: { variant: "welcome" | "upgrade" }) {
   const item = registry[variant];
-  const { markHandled } = makeHideable(item.types);
+  const { runAction } = makeWidget(item.types);
   const View = item.View;
-  return <View dismiss={markHandled} />;
+  return <View dismiss={runAction} />;
 }
 
 function WelcomeCard({ dismiss }: { dismiss: (kind: string) => void }) {
@@ -37,26 +37,26 @@ function WelcomeCard({ dismiss }: { dismiss: (kind: string) => void }) {
 
 function Frame({ onDismiss }: { onDismiss: (kind: string) => void }) {
   return (
-    <button onClick={() => onDismiss(HideKind.CloseButton)}>Close</button>
+    <button onClick={() => onDismiss(ActionKind.CloseButton)}>Close</button>
   );
 }
 
 function UpgradeCard({ dismiss }: { dismiss: (kind: string) => void }) {
-  return <button onClick={() => dismiss(HideKind.Timeout)}>Later</button>;
+  return <button onClick={() => dismiss(ActionKind.Timeout)}>Later</button>;
 }
 
 // Deliberately absent from the configured render roots. An all_creations query
 // still reports this callsite and labels its reachability as unknown.
 function DormantCard() {
-  const { markHandled } = Hideable.useThing([ThingType.Modal]);
+  const { runAction } = Widget.useThing([ThingType.Modal]);
   return (
-    <button onClick={() => markHandled(HideKind.Timeout)}>Hide</button>
+    <button onClick={() => runAction(ActionKind.Timeout)}>Hide</button>
   );
 }
 
 // Same exported spelling, different canonical declaration: this must not match
 // the query's factory identity.
 function DecoyCard() {
-  const { markHandled } = decoy([ThingType.Banner]);
-  return <button onClick={() => markHandled(HideKind.Timeout)}>No-op</button>;
+  const { runAction } = decoy([ThingType.Banner]);
+  return <button onClick={() => runAction(ActionKind.Timeout)}>No-op</button>;
 }

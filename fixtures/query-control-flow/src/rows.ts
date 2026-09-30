@@ -1,1 +1,1 @@
-export { HideableRow } from "./Row";
+export { WidgetRow } from "./Row";

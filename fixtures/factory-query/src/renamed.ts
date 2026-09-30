@@ -1,1 +1,1 @@
-export { useHideableThing as internalThing } from "./hideable";
+export { useWidgetActions as internalThing } from "./widget";

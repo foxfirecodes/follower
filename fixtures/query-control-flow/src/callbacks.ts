@@ -1,6 +1,6 @@
-export function invokeHide(
-  callback: (hideKind: string) => void,
-  hideKind: string,
+export function invokeAction(
+  callback: (actionKind: string) => void,
+  actionKind: string,
 ) {
-  callback(hideKind);
+  callback(actionKind);
 }

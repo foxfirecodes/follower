@@ -34,10 +34,12 @@ pub struct ImportResolution {
 
 pub struct ModuleLinker {
     resolver: Resolver,
+    project_root: PathBuf,
+    import_aliases: std::collections::BTreeMap<String, String>,
 }
 
 impl ModuleLinker {
-    pub fn new(conditions: &[String]) -> Self {
+    pub fn new(project: &Project) -> Self {
         let options = ResolveOptions {
             extensions: vec![
                 ".ts".into(),
@@ -50,12 +52,40 @@ impl ModuleLinker {
                 ".cjs".into(),
                 ".json".into(),
             ],
-            condition_names: conditions.to_vec(),
+            condition_names: project.config.resolution_conditions.clone(),
             ..ResolveOptions::default()
         };
         Self {
             resolver: Resolver::new(options),
+            project_root: project.root.clone(),
+            import_aliases: project.config.import_aliases.clone(),
         }
+    }
+
+    fn aliased_specifier(&self, specifier: &str) -> Option<String> {
+        let mut matches = self
+            .import_aliases
+            .iter()
+            .filter_map(|(alias, target)| {
+                let captured = if let Some((prefix, suffix)) = alias.split_once('*') {
+                    specifier.strip_prefix(prefix)?.strip_suffix(suffix)?
+                } else if alias == specifier {
+                    ""
+                } else {
+                    return None;
+                };
+                let mapped = target.replace('*', captured);
+                Some((
+                    alias.len(),
+                    self.project_root
+                        .join(mapped)
+                        .to_string_lossy()
+                        .into_owned(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| right.0.cmp(&left.0));
+        matches.into_iter().next().map(|(_, path)| path)
     }
 
     pub fn resolve(
@@ -75,13 +105,18 @@ impl ModuleLinker {
                 diagnostic: None,
             };
         }
-        match self.resolver.resolve_file(importer, specifier) {
+        let aliased = self.aliased_specifier(specifier);
+        let resolved_specifier = aliased.as_deref().unwrap_or(specifier);
+        match self.resolver.resolve_file(importer, resolved_specifier) {
             Ok(resolution) => ImportResolution {
                 importer: importer.to_path_buf(),
                 specifier: specifier.to_owned(),
                 span,
                 status: ResolutionStatus::Resolved,
-                resolved_path: Some(resolution.into_path_buf()),
+                resolved_path: Some({
+                    let path = resolution.into_path_buf();
+                    path.canonicalize().unwrap_or(path)
+                }),
                 diagnostic: None,
             },
             Err(error) => ImportResolution {
@@ -438,6 +473,9 @@ pub(crate) fn pattern_names(pattern: &FlowPattern) -> Vec<&str> {
             .iter()
             .flat_map(|field| pattern_names(&field.target))
             .collect(),
+        FlowPatternKind::Array { elements } => {
+            elements.iter().flatten().flat_map(pattern_names).collect()
+        }
         FlowPatternKind::Unsupported { .. } => Vec::new(),
     }
 }

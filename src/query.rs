@@ -34,7 +34,10 @@ pub struct ArgumentProjection {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityQuery {
+    #[serde(default)]
     pub returned_property: Vec<String>,
+    #[serde(default)]
+    pub returned_index: Option<usize>,
     #[serde(default)]
     pub invocation_arguments: Vec<ArgumentProjection>,
 }
@@ -71,6 +74,8 @@ pub struct QuerySpec {
     pub id: String,
     pub kind: QueryKind,
     pub scope: QueryScope,
+    #[serde(default)]
+    pub scan_callback_bodies: bool,
     pub factory: SymbolMatcher,
     #[serde(default)]
     pub factory_arguments: Vec<ArgumentProjection>,
@@ -90,8 +95,9 @@ impl QuerySpec {
         if self.id.trim().is_empty() {
             bail!("query id cannot be empty");
         }
-        if self.capability.returned_property.is_empty() {
-            bail!("capability.returned_property cannot be empty");
+        if self.capability.returned_property.is_empty() == self.capability.returned_index.is_none()
+        {
+            bail!("capability must select exactly one of returned_property or returned_index");
         }
         validate_projections("factory_arguments", &self.factory_arguments)?;
         validate_projections(
@@ -141,11 +147,30 @@ pub enum Reachability {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QueryValue {
-    String { value: String },
-    Boolean { value: bool },
-    Array { elements: Vec<QueryValue> },
+    String {
+        value: String,
+    },
+    Number {
+        value: i64,
+    },
+    EnumMember {
+        enum_name: String,
+        member_name: String,
+        value: i64,
+    },
+    Boolean {
+        value: bool,
+    },
+    Alternatives {
+        values: Vec<QueryValue>,
+    },
+    Array {
+        elements: Vec<QueryValue>,
+    },
     Undefined,
-    Unknown { reason: String },
+    Unknown {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

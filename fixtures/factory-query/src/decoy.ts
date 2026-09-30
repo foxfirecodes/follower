@@ -1,3 +1,3 @@
-export function useHideableThing(_types: readonly string[]) {
-  return { markHandled: (_hideKind: string) => undefined };
+export function useWidgetActions(_types: readonly string[]) {
+  return { runAction: (_actionKind: string) => undefined };
 }

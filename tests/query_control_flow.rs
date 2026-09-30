@@ -48,7 +48,7 @@ fn preserves_rows_through_finite_branch_literal_map_and_if_statement() {
             (
                 creation.choice.as_str(),
                 only_array_string(&creation.factory_arguments["thing_types"]),
-                string(&creation.invocations[0].arguments["hide_kind"]),
+                string(&creation.invocations[0].arguments["action_kind"]),
             )
         })
         .collect::<BTreeSet<_>>();

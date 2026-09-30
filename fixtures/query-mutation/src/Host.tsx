@@ -1,21 +1,21 @@
-import { useHideableThing } from "./hideable";
+import { useWidgetActions } from "./widget";
 
 enum ThingType {
   Banner = "banner",
 }
 
-enum HideKind {
+enum ActionKind {
   Timeout = "timeout",
 }
 
 export function Host() {
-  const { markHandled } = useHideableThing([ThingType.Banner]);
-  const handlers = { run: markHandled };
+  const { runAction } = useWidgetActions([ThingType.Banner]);
+  const handlers = { run: runAction };
   const alias = handlers;
 
-  handlers.run = (kind) => markHandled(kind);
+  handlers.run = (kind) => runAction(kind);
 
   return (
-    <button onClick={() => alias.run(HideKind.Timeout)}>Later</button>
+    <button onClick={() => alias.run(ActionKind.Timeout)}>Later</button>
   );
 }

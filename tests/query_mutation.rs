@@ -33,7 +33,7 @@ fn preserves_the_candidate_but_marks_aliased_record_mutation_unresolved() {
     assert_eq!(creation.invocations.len(), 1);
     assert!(!creation.unresolved.is_empty());
     assert_eq!(
-        creation.invocations[0].arguments["hide_kind"],
+        creation.invocations[0].arguments["action_kind"],
         QueryValue::String {
             value: "timeout".to_owned()
         }

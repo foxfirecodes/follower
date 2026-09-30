@@ -1,4 +1,4 @@
-import { HideableRow as Row } from "./rows";
+import { WidgetRow as Row } from "./rows";
 
 enum ThingType {
   Banner = "banner",
@@ -6,7 +6,7 @@ enum ThingType {
   Upgrade = "upgrade",
 }
 
-enum HideKind {
+enum ActionKind {
   CloseButton = "close_button",
   Timeout = "timeout",
 }
@@ -21,14 +21,14 @@ export function Host({ variant, unknownRows }: {
   const rows =
     variant === "alpha"
       ? [
-          { types: [ThingType.Banner], hideKind: HideKind.CloseButton },
-          { types: [ThingType.Modal], hideKind: HideKind.Timeout },
+          { types: [ThingType.Banner], actionKind: ActionKind.CloseButton },
+          { types: [ThingType.Modal], actionKind: ActionKind.Timeout },
         ]
       : [
-          { types: [ThingType.Upgrade], hideKind: HideKind.CloseButton },
+          { types: [ThingType.Upgrade], actionKind: ActionKind.CloseButton },
         ];
 
   return rows.map((row) => (
-    <Row types={row.types} hideKind={row.hideKind} />
+    <Row types={row.types} actionKind={row.actionKind} />
   ));
 }

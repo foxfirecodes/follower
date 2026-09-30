@@ -44,7 +44,7 @@ fn correlates_array_factory_arguments_with_forwarded_invocation_arguments() {
     assert_eq!(welcome.conclusion, Conclusion::CandidateInvocation);
     assert_eq!(welcome.invocations.len(), 1);
     assert_eq!(
-        welcome.invocations[0].arguments["hide_kind"],
+        welcome.invocations[0].arguments["action_kind"],
         QueryValue::String {
             value: "close_button".to_owned()
         }
@@ -61,7 +61,7 @@ fn correlates_array_factory_arguments_with_forwarded_invocation_arguments() {
     );
     assert_eq!(upgrade.invocations.len(), 1);
     assert_eq!(
-        upgrade.invocations[0].arguments["hide_kind"],
+        upgrade.invocations[0].arguments["action_kind"],
         QueryValue::String {
             value: "timeout".to_owned()
         }

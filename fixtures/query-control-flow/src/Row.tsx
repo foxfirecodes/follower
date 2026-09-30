@@ -1,24 +1,24 @@
 import * as CallbackFns from "./callbacks";
-import { useHideableThing } from "./hideable";
+import { useWidgetActions } from "./widget";
 
-enum HideKind {
+enum ActionKind {
   CloseButton = "close_button",
   Timeout = "timeout",
 }
 
-export function HideableRow({ types, hideKind }: {
+export function WidgetRow({ types, actionKind }: {
   types: readonly string[];
-  hideKind: string;
+  actionKind: string;
 }) {
-  const { markHandled } = useHideableThing(types);
-  let dismiss = markHandled;
-  dismiss = (kind) => markHandled(kind);
-  if (hideKind === HideKind.CloseButton) {
+  const { runAction } = useWidgetActions(types);
+  let dismiss = runAction;
+  dismiss = (kind) => runAction(kind);
+  if (actionKind === ActionKind.CloseButton) {
     return (
       <button
-        onClick={() => CallbackFns.invokeHide(
+        onClick={() => CallbackFns.invokeAction(
           dismiss,
-          HideKind.CloseButton,
+          ActionKind.CloseButton,
         )}
       >
         Close
@@ -27,7 +27,7 @@ export function HideableRow({ types, hideKind }: {
   }
   return (
     <button
-      onClick={() => CallbackFns.invokeHide(dismiss, HideKind.Timeout)}
+      onClick={() => CallbackFns.invokeAction(dismiss, ActionKind.Timeout)}
     >
       Later
     </button>

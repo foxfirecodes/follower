@@ -5,16 +5,16 @@ scope = "reachable"
 
 [factory]
 project = "query-mutation"
-module = "src/hideable.ts"
-export = "useHideableThing"
+module = "src/widget.ts"
+export = "useWidgetActions"
 
 [[factory_arguments]]
 index = 0
 label = "thing_types"
 
 [capability]
-returned_property = ["markHandled"]
+returned_property = ["runAction"]
 
 [[capability.invocation_arguments]]
 index = 0
-label = "hide_kind"
+label = "action_kind"

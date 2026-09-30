@@ -188,7 +188,21 @@ fn render_location(
 fn render_query_value(value: &QueryValue) -> String {
     match value {
         QueryValue::String { value } => format!("{value:?}"),
+        QueryValue::Number { value } => value.to_string(),
+        QueryValue::EnumMember {
+            enum_name,
+            member_name,
+            value,
+        } => format!("{enum_name}.{member_name} ({value})"),
         QueryValue::Boolean { value } => value.to_string(),
+        QueryValue::Alternatives { values } => format!(
+            "({})",
+            values
+                .iter()
+                .map(render_query_value)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ),
         QueryValue::Array { elements } => format!(
             "[{}]",
             elements

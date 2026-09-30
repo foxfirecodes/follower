@@ -16,6 +16,15 @@ pub struct EntryPoint {
     pub export: String,
 }
 
+/// An imported function that returns the result of calling one callback argument.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallbackSelectorImport {
+    pub module: String,
+    pub export: String,
+    pub callback_argument: usize,
+}
+
 fn default_schema_version() -> u32 {
     1
 }
@@ -27,12 +36,19 @@ pub struct ProjectConfig {
     pub schema_version: u32,
     pub name: String,
     pub source_roots: Vec<PathBuf>,
+    /// Text prefilter for directory roots. Explicit file roots are always indexed.
+    #[serde(default)]
+    pub source_contains_any: Vec<String>,
     #[serde(default)]
     pub entries: Vec<EntryPoint>,
     #[serde(default)]
     pub model_files: Vec<PathBuf>,
     #[serde(default)]
     pub resolution_conditions: Vec<String>,
+    #[serde(default)]
+    pub import_aliases: BTreeMap<String, String>,
+    #[serde(default)]
+    pub callback_selector_imports: Vec<CallbackSelectorImport>,
     #[serde(default)]
     pub inputs: BTreeMap<String, Vec<String>>,
 }
@@ -70,6 +86,32 @@ impl Project {
         if config.source_roots.is_empty() {
             bail!("project must configure at least one source root");
         }
+        if config
+            .source_contains_any
+            .iter()
+            .any(|term| term.is_empty())
+        {
+            bail!("source_contains_any terms cannot be empty");
+        }
+        for (alias, target) in &config.import_aliases {
+            if alias.is_empty()
+                || target.is_empty()
+                || alias.matches('*').count() > 1
+                || target.matches('*').count() > 1
+            {
+                bail!("invalid import alias {alias:?} -> {target:?}");
+            }
+            if alias.contains('*') != target.contains('*') {
+                bail!(
+                    "import alias {alias:?} and target {target:?} must both use * or neither use it"
+                );
+            }
+        }
+        for selector in &config.callback_selector_imports {
+            if selector.module.trim().is_empty() || selector.export.trim().is_empty() {
+                bail!("callback selector imports need a module and export name");
+            }
+        }
         let config_hash = hex::encode(Sha256::digest(source.as_bytes()));
         Ok(Self {
             config_path,
@@ -91,13 +133,39 @@ impl Project {
         let mut files = Vec::new();
         for configured_root in &self.config.source_roots {
             let root = self.resolve_path(configured_root);
-            if !root.is_dir() {
+            if !root.exists() {
                 bail!("source root does not exist: {}", root.display());
+            }
+            let root = root.canonicalize().with_context(|| {
+                format!("failed to canonicalize source root {}", root.display())
+            })?;
+            if root.is_file() {
+                if !is_source_file(&root) {
+                    bail!(
+                        "source root is not a supported source file: {}",
+                        root.display()
+                    );
+                }
+                files.push(root);
+                continue;
             }
             for entry in WalkDir::new(&root).follow_links(false) {
                 let entry =
                     entry.with_context(|| format!("failed while walking {}", root.display()))?;
                 if entry.file_type().is_file() && is_source_file(entry.path()) {
+                    if !self.config.source_contains_any.is_empty() {
+                        let source = fs::read_to_string(entry.path()).with_context(|| {
+                            format!("failed to read {}", entry.path().display())
+                        })?;
+                        if !self
+                            .config
+                            .source_contains_any
+                            .iter()
+                            .any(|term| source.contains(term))
+                        {
+                            continue;
+                        }
+                    }
                     files.push(entry.path().to_path_buf());
                 }
             }
@@ -108,7 +176,7 @@ impl Project {
     }
 }
 
-fn is_source_file(path: &Path) -> bool {
+pub(crate) fn is_source_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
         Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")

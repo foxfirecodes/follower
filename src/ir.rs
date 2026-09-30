@@ -187,6 +187,7 @@ pub struct FlowPattern {
 pub enum FlowPatternKind {
     Identifier { name: String },
     Object { fields: Vec<FlowPatternField> },
+    Array { elements: Vec<Option<FlowPattern>> },
     Unsupported { syntax: String },
 }
 
@@ -207,6 +208,14 @@ pub struct FlowExpression {
 pub enum FlowExpressionKind {
     String {
         value: String,
+    },
+    Number {
+        value: i64,
+    },
+    NumericEnumMember {
+        enum_name: String,
+        member_name: String,
+        value: i64,
     },
     Boolean {
         value: bool,
