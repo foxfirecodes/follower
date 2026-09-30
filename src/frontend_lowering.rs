@@ -1,10 +1,12 @@
 use oxc::{
     ast::ast::{
         Argument, ArrowFunctionBody, BindingPattern, Declaration, Expression, FormalParameters,
-        Function, ImportDeclaration, ImportDeclarationSpecifier, ImportOrExportKind,
-        JSXAttributeItem, JSXAttributeValue, JSXElement, JSXElementName, JSXExpression,
-        ObjectPropertyKind, SimpleAssignmentTarget, Statement, VariableDeclaration,
+        Function, IdentifierReference, ImportDeclaration, ImportDeclarationSpecifier,
+        ImportOrExportKind, JSXAttributeItem, JSXAttributeValue, JSXElement, JSXElementName,
+        JSXExpression, ObjectPropertyKind, SimpleAssignmentTarget, Statement, TSEnumDeclaration,
+        VariableDeclaration,
     },
+    semantic::Scoping,
     span::{GetSpan, Span},
     syntax::operator::{AssignmentOperator, BinaryOperator},
 };
@@ -19,10 +21,15 @@ use crate::{
     },
 };
 
-pub fn lower(file_id: FileId, program: &oxc::ast::ast::Program<'_>) -> FlowFileIr {
+pub fn lower(
+    file_id: FileId,
+    program: &oxc::ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> FlowFileIr {
     let mut lowerer = Lowerer {
         file_id,
         output: FlowFileIr::default(),
+        scoping,
     };
     for statement in &program.body {
         lowerer.lower_top_level(statement);
@@ -30,12 +37,22 @@ pub fn lower(file_id: FileId, program: &oxc::ast::ast::Program<'_>) -> FlowFileI
     lowerer.output
 }
 
-struct Lowerer {
+struct Lowerer<'s> {
     file_id: FileId,
     output: FlowFileIr,
+    scoping: &'s Scoping,
 }
 
-impl Lowerer {
+impl Lowerer<'_> {
+    fn is_module_reference(&self, identifier: &IdentifierReference<'_>) -> bool {
+        identifier
+            .reference_id
+            .get()
+            .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
+            .is_some_and(|symbol| {
+                self.scoping.symbol_scope_id(symbol) == self.scoping.root_scope_id()
+            })
+    }
     fn span(&self, span: Span) -> SourceSpan {
         SourceSpan {
             file_id: self.file_id,
@@ -104,7 +121,10 @@ impl Lowerer {
                         },
                     ));
             }
-            Statement::TSEnumDeclaration(_) => {}
+            Statement::TSEnumDeclaration(declaration) => {
+                let binding = self.lower_enum(declaration);
+                self.output.globals.push(binding);
+            }
             _ => self
                 .output
                 .unsupported
@@ -119,11 +139,46 @@ impl Lowerer {
                 self.output.globals.extend(bindings);
             }
             Declaration::FunctionDeclaration(function) => self.lower_function(function),
-            Declaration::TSEnumDeclaration(_) => {}
+            Declaration::TSEnumDeclaration(declaration) => {
+                let binding = self.lower_enum(declaration);
+                self.output.globals.push(binding);
+            }
             _ => self
                 .output
                 .unsupported
                 .push(self.unsupported("unsupported_exported_declaration", declaration.span())),
+        }
+    }
+
+    fn lower_enum(&self, declaration: &TSEnumDeclaration<'_>) -> FlowBinding {
+        let span = self.span(declaration.span);
+        FlowBinding {
+            lexical: true,
+            pattern: FlowPattern {
+                kind: FlowPatternKind::Identifier {
+                    name: declaration.id.name.to_string(),
+                },
+                span: span.clone(),
+            },
+            value: FlowExpression {
+                kind: FlowExpressionKind::Record {
+                    fields: declaration
+                        .body
+                        .members
+                        .iter()
+                        .map(|member| FlowRecordField {
+                            property: member.id.static_name().to_string(),
+                            value: member.initializer.as_ref().map_or_else(
+                                || self.unsupported_expression("implicit_enum_value", member.span),
+                                |expression| self.lower_expression(expression),
+                            ),
+                            span: self.span(member.span),
+                        })
+                        .collect(),
+                },
+                span: span.clone(),
+            },
+            span,
         }
     }
 
@@ -141,11 +196,11 @@ impl Lowerer {
                 declaration
                     .declarations
                     .iter()
-                    .filter_map(|declarator| match &declarator.id {
-                        BindingPattern::BindingIdentifier(identifier) => {
-                            Some(identifier.name.to_string())
-                        }
-                        _ => None,
+                    .flat_map(|declarator| {
+                        crate::link::pattern_names(&self.lower_pattern(&declarator.id))
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
                     })
                     .collect(),
                 declaration.span,
@@ -263,6 +318,7 @@ impl Lowerer {
             .declarations
             .iter()
             .map(|declarator| FlowBinding {
+                lexical: !declaration.kind.is_var(),
                 pattern: self.lower_pattern(&declarator.id),
                 value: declarator.init.as_ref().map_or_else(
                     || self.unsupported_expression("binding_without_initializer", declarator.span),
@@ -277,6 +333,9 @@ impl Lowerer {
         let mut lowered = Vec::new();
         for statement in statements {
             match statement {
+                Statement::TSEnumDeclaration(declaration) => {
+                    lowered.push(FlowStatement::Bind(self.lower_enum(declaration)));
+                }
                 Statement::VariableDeclaration(declaration) => lowered.extend(
                     self.lower_bindings(declaration)
                         .into_iter()
@@ -376,6 +435,7 @@ impl Lowerer {
             },
             Expression::Identifier(identifier) => FlowExpressionKind::Identifier {
                 name: identifier.name.to_string(),
+                module_binding: self.is_module_reference(identifier),
             },
             Expression::ObjectExpression(object) => {
                 let mut fields = Vec::with_capacity(object.properties.len());
@@ -485,6 +545,7 @@ impl Lowerer {
         let tag = match &element.opening_element.name {
             JSXElementName::Identifier(identifier) => FlowJsxTag::Identifier {
                 name: identifier.name.to_string(),
+                module_binding: false,
                 intrinsic: identifier
                     .name
                     .chars()
@@ -494,6 +555,7 @@ impl Lowerer {
             JSXElementName::IdentifierReference(identifier) => FlowJsxTag::Identifier {
                 name: identifier.name.to_string(),
                 intrinsic: false,
+                module_binding: self.is_module_reference(identifier),
             },
             _ => FlowJsxTag::Unsupported {
                 syntax: "unsupported_jsx_tag".to_owned(),

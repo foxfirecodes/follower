@@ -10,7 +10,7 @@ use serde::Serialize;
 
 #[derive(Parser)]
 #[command(
-    name = "flow",
+    name = "follower",
     version,
     about = "Explore callback flow in TypeScript/React source"
 )]
@@ -114,12 +114,13 @@ fn run_query(
         OutputFormat::Text => print_query_report(&report),
     }
     if fail_on_unresolved
-        && report
-            .creations
-            .iter()
-            .any(|creation| creation.conclusion == code_flow::queries::Conclusion::Unresolved)
+        && (!report.coverage.complete
+            || report
+                .creations
+                .iter()
+                .any(|creation| !creation.unresolved.is_empty()))
     {
-        anyhow::bail!("query contains unresolved creations");
+        anyhow::bail!("query has incomplete coverage or unresolved escapes");
     }
     Ok(())
 }
@@ -255,12 +256,13 @@ fn audit(
         }
     }
     if fail_on_unresolved
-        && report
-            .findings
-            .iter()
-            .any(|finding| finding.conclusion == code_flow::queries::Conclusion::Unresolved)
+        && (!report.coverage.complete
+            || report
+                .findings
+                .iter()
+                .any(|finding| !finding.unresolved.is_empty()))
     {
-        anyhow::bail!("audit contains unresolved findings");
+        anyhow::bail!("audit has incomplete coverage or unresolved escapes");
     }
     Ok(())
 }

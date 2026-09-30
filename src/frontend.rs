@@ -73,7 +73,7 @@ pub fn parse_and_lower(file_id: FileId, path: &Path, source: &str) -> Result<Fil
 
     let mut collector = SyntaxCollector::new(file_id);
     collector.visit_program(&program);
-    let flow = crate::frontend_lowering::lower(file_id, &program);
+    let flow = crate::frontend_lowering::lower(file_id, &program, scoping);
 
     let cfg_enabled = semantic.cfg().is_some();
     let blocks = semantic.cfg().map_or_else(Vec::new, |cfg| {

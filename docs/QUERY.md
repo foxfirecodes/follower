@@ -1,6 +1,6 @@
 # Factory-return invocation query
 
-`flow query` runs a declarative, creation-centered query. Its first query kind answers:
+`follower query` runs a declarative, creation-centered query. Its first query kind answers:
 
 1. Where is a configured factory symbol called?
 2. What values reach selected factory argument positions?
@@ -36,7 +36,7 @@ label = "hide_kind"
 Run it with:
 
 ```sh
-flow query --project flow.toml --query query.toml --format json
+follower query --project flow.toml --query query.toml --format json
 ```
 
 ## Semantics
@@ -56,7 +56,9 @@ flow query --project flow.toml --query query.toml --format json
   `absent_within_model` means no invocation or unresolved escape was found in the explored scope.
   An `unresolved` conclusion means no invocation was found and an unsupported or opaque operation
   prevents an absence claim.
-- `--fail-on-unresolved` exits unsuccessfully when a creation's conclusion is `unresolved`.
+- `--fail-on-unresolved` exits unsuccessfully when coverage is incomplete or any creation has
+  unresolved escapes. This includes `candidate_invocation` rows with gaps and ambiguous-linkage
+  reports with no creation rows. The JSON report is still printed before the unsuccessful exit.
 
 Query report schema version 2 includes both stable source byte spans and repository-relative,
 one-based line/column locations for factory calls and invocations. The text renderer uses
@@ -69,15 +71,26 @@ The engine follows destructuring, local calls and closures, records, finite comp
 selection, arrays, exact string/boolean strict-equality branches, conditional expressions,
 literal-array `.map`, JSX component props/spreads, prop renaming, wrapper callbacks, simple
 identifier reassignment, and intrinsic `onClick` handlers. Factory matching and ordinary
-function/component calls use canonical identities across named import aliases, explicit renamed
-re-exports, local imported-then-exported aliases, `export *` chains, and direct namespace member
-calls. Same-named declarations in unrelated modules therefore do not enter the call graph.
+function/component calls, enums, and module values use canonical identities across named import
+aliases, explicit renamed re-exports, local imported-then-exported aliases, `export *` chains,
+namespace re-exports, and nested namespace access. Same-named declarations in unrelated modules
+therefore do not change projected values or enter the call graph. Conflicting star exports are
+ambiguous; explicit exports take precedence, and multiple paths to the same declaration are valid.
+An ambiguous factory matcher is an error. Used ambiguous or missing import paths produce coverage
+gaps. Module initializers follow entry import dependencies; unimported module creations are only
+included by `all_creations`, with unknown reachability. Local enum and lexical branch bindings do
+not overwrite outer bindings.
 
 An unknown `.map` receiver gets one symbolic element. It becomes a coverage gap only when the
 callback, mapped result, or symbolic iteration contains a capability selected by the query.
-Unknown conditions explore both branches; a branch that returns on only one side likewise records
-a gap only when that partial return contains a selected capability. Record-property assignment is
-lowered, but a mutation involving a tracked callback is conservatively unresolved because another
-record alias may observe the old or new property. Namespace re-exports (`export * as ns`), precise
-heap aliasing, general truthiness, non-strict comparisons, loops, and array methods other than
-`.map` still require additional IR and solver work.
+Unknown conditions explore both branches. A partially returning branch also explores the
+continuing path. Modified bindings retain joined alternatives; callback-bearing joins are
+unresolved rather than disappearing after the branch. Strict equality involving an unknown value
+remains unknown, and projected factory captures containing unknown or joined values carry gaps.
+Reassignment of captured bindings and opaque calls receiving callback-bearing namespaces are
+conservatively unresolved. Record-property assignment is lowered, but a mutation involving a
+tracked callback is conservatively unresolved because another
+record alias may observe the old or new property. Precise branch correlation, heap aliasing and
+live closure cells, general truthiness, non-strict comparisons, loops, and array methods other than
+`.map` still require additional IR and solver work. Unsupported syntax can still hide creations or
+dependencies; the current acceptance tests do not establish production absence guarantees.

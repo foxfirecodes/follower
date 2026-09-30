@@ -11,7 +11,7 @@ name = "code_flow"
 path = "src/lib.rs"
 
 [[bin]]
-name = "flow"
+name = "follower"
 path = "src/main.rs"
 
 [dependencies]
@@ -35,4 +35,3 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
-

@@ -126,6 +126,8 @@ pub struct FlowBinding {
     pub pattern: FlowPattern,
     pub value: FlowExpression,
     pub span: SourceSpan,
+    #[serde(default)]
+    pub lexical: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -211,6 +213,9 @@ pub enum FlowExpressionKind {
     },
     Identifier {
         name: String,
+        /// Whether Oxc bound this reference in the module scope.
+        #[serde(default)]
+        module_binding: bool,
     },
     Record {
         fields: Vec<FlowRecordField>,
@@ -270,8 +275,15 @@ pub enum FlowArrowBody {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FlowJsxTag {
-    Identifier { name: String, intrinsic: bool },
-    Unsupported { syntax: String },
+    Identifier {
+        name: String,
+        intrinsic: bool,
+        #[serde(default)]
+        module_binding: bool,
+    },
+    Unsupported {
+        syntax: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

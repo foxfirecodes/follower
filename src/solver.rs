@@ -1,6 +1,10 @@
 #![allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -13,7 +17,7 @@ use crate::{
         FlowFunction, FlowJsxProp, FlowJsxTag, FlowPattern, FlowPatternKind, FlowStatement,
         SourceSpan,
     },
-    link::SymbolLinker,
+    link::{LinkedSymbol, LinkedValue, SymbolLinker, ValueResolution, pattern_names},
     models::{CallbackFactoryModel, CaptureSource, ModelEvidence, ModelValue, ModeledOperation},
     project::Project,
     queries::{AuditFinding, AuditReport, Conclusion, Coverage, FindingRef},
@@ -68,6 +72,7 @@ enum AbstractValue {
     Array(Vec<TrackedValue>),
     Union(Vec<TrackedValue>),
     Function(FunctionKey),
+    Namespace(FileId),
     ModelFunction,
     Closure(ClosureValue),
     Capability(usize),
@@ -169,7 +174,7 @@ pub fn execute_query(
         if query.scope == QueryScope::Reachable {
             bail!("a reachable query requires at least one configured entry point");
         }
-        solver.prepare_globals();
+        solver.prepare_globals(None);
     } else {
         solver.run()?;
     }
@@ -185,9 +190,12 @@ struct Solver<'a> {
     model: CallbackFactoryModel,
     functions: BTreeMap<FunctionKey, FunctionDef>,
     symbol_linker: SymbolLinker<'a>,
+    model_symbol: LinkedSymbol,
     globals_ir: Vec<(FileId, FlowBinding)>,
-    enum_globals: Environment,
-    globals: Environment,
+    global_bindings: BTreeMap<LinkedSymbol, usize>,
+    evaluating_globals: BTreeSet<usize>,
+    initialized_globals: BTreeSet<usize>,
+    globals: BTreeMap<LinkedSymbol, TrackedValue>,
     evidence: Vec<Evidence>,
     capabilities: Vec<CapabilityState>,
     diagnostics: Vec<String>,
@@ -195,6 +203,7 @@ struct Solver<'a> {
     current_choice: Option<String>,
     current_reachability: Reachability,
     call_depth: usize,
+    active_captures: Vec<BTreeSet<String>>,
 }
 
 impl<'a> Solver<'a> {
@@ -205,7 +214,6 @@ impl<'a> Solver<'a> {
     ) -> Result<Self> {
         let mut functions = BTreeMap::new();
         let mut globals_ir = Vec::new();
-        let mut enum_globals = Environment::new();
         let mut diagnostics = Vec::new();
 
         for file in &snapshot.files {
@@ -232,19 +240,6 @@ impl<'a> Solver<'a> {
                     .cloned()
                     .map(|binding| (file.file_id, binding)),
             );
-
-            let mut enums: BTreeMap<String, BTreeMap<String, TrackedValue>> = BTreeMap::new();
-            for member in &file.enum_members {
-                if let Some(value) = &member.string_value {
-                    enums.entry(member.enum_name.clone()).or_default().insert(
-                        member.member_name.clone(),
-                        TrackedValue::plain(AbstractValue::String(value.clone())),
-                    );
-                }
-            }
-            for (name, members) in enums {
-                enum_globals.insert(name, TrackedValue::plain(AbstractValue::Record(members)));
-            }
         }
 
         if model.r#match.project != project.config.name {
@@ -256,15 +251,44 @@ impl<'a> Solver<'a> {
             );
         }
 
+        let symbol_linker = SymbolLinker::new(project, snapshot);
+        let model_symbol = symbol_linker
+            .resolve_matcher(&model.r#match)
+            .with_context(|| {
+                format!(
+                    "factory matcher {}#{} does not resolve to one value declaration",
+                    model.r#match.module, model.r#match.export
+                )
+            })?;
+        let global_bindings = globals_ir
+            .iter()
+            .enumerate()
+            .flat_map(|(index, (file_id, binding))| {
+                pattern_names(&binding.pattern)
+                    .into_iter()
+                    .map(move |name| {
+                        (
+                            LinkedSymbol {
+                                file_id: *file_id,
+                                name: name.to_owned(),
+                            },
+                            index,
+                        )
+                    })
+            })
+            .collect();
         Ok(Self {
             project,
             snapshot,
             model,
             functions,
-            symbol_linker: SymbolLinker::new(project, snapshot),
+            symbol_linker,
+            model_symbol,
             globals_ir,
-            globals: enum_globals.clone(),
-            enum_globals,
+            global_bindings,
+            evaluating_globals: BTreeSet::new(),
+            initialized_globals: BTreeSet::new(),
+            globals: BTreeMap::new(),
             evidence: Vec::new(),
             capabilities: Vec::new(),
             diagnostics,
@@ -272,6 +296,7 @@ impl<'a> Solver<'a> {
             current_choice: None,
             current_reachability: Reachability::Reachable,
             call_depth: 0,
+            active_captures: Vec::new(),
         })
     }
 
@@ -296,9 +321,18 @@ impl<'a> Solver<'a> {
                 .with_context(|| {
                     format!("entry module was not indexed: {}", entry_path.display())
                 })?;
+            let ValueResolution::Resolved(LinkedValue::Declaration(symbol)) = self
+                .symbol_linker
+                .resolve_exported_value(entry_file.file_id, &entry.export)
+            else {
+                bail!(
+                    "entry export {} does not resolve to one value declaration",
+                    entry.export
+                );
+            };
             let entry_key = FunctionKey {
-                file_id: entry_file.file_id,
-                name: entry.export.clone(),
+                file_id: symbol.file_id,
+                name: symbol.name,
             };
             let parameter_count = self
                 .functions
@@ -317,7 +351,7 @@ impl<'a> Solver<'a> {
             for props in self.entry_input_combinations(&entry.export)? {
                 let choice = choice_label(&props);
                 self.current_choice = Some(choice.clone());
-                self.prepare_globals();
+                self.prepare_globals(Some(entry_file.file_id));
                 let record = props
                     .into_iter()
                     .map(|(name, value)| {
@@ -384,18 +418,162 @@ impl<'a> Solver<'a> {
         Ok(combinations)
     }
 
-    fn prepare_globals(&mut self) {
-        self.globals = self.enum_globals.clone();
-        for (file_id, binding) in self.globals_ir.clone() {
-            let value = self.eval(&binding.value, &self.globals.clone(), file_id);
-            let mut updated = self.globals.clone();
-            self.bind_pattern(
-                &binding.pattern,
-                value,
-                &mut updated,
-                RelationKind::ValueTransfer,
-            );
-            self.globals = updated;
+    fn prepare_globals(&mut self, entry: Option<FileId>) {
+        self.globals.clear();
+        self.initialized_globals.clear();
+        self.evaluating_globals.clear();
+        if let Some(entry) = entry {
+            let mut modules = Vec::new();
+            self.module_initialization_order(entry, &mut BTreeSet::new(), &mut modules);
+            for module in modules {
+                for index in 0..self.globals_ir.len() {
+                    if self.globals_ir[index].0 == module {
+                        self.evaluate_global(index);
+                    }
+                }
+            }
+        }
+    }
+
+    fn module_initialization_order(
+        &self,
+        module: FileId,
+        visited: &mut BTreeSet<FileId>,
+        modules: &mut Vec<FileId>,
+    ) {
+        if !visited.insert(module) {
+            return;
+        }
+        let Some(file) = self
+            .snapshot
+            .files
+            .iter()
+            .find(|file| file.file_id == module)
+        else {
+            return;
+        };
+        for resolution in &self.snapshot.resolutions {
+            if resolution.importer == file.path
+                && let Some(dependency) = resolution
+                    .resolved_path
+                    .as_ref()
+                    .and_then(|path| self.snapshot.files.iter().find(|file| file.path == *path))
+            {
+                self.module_initialization_order(dependency.file_id, visited, modules);
+            }
+        }
+        modules.push(module);
+    }
+
+    fn module_environment(&self, file_id: FileId) -> Environment {
+        let mut environment = self
+            .globals
+            .iter()
+            .filter(|(symbol, _)| symbol.file_id == file_id)
+            .map(|(symbol, value)| (symbol.name.clone(), value.clone()))
+            .collect::<Environment>();
+        if let Some(file) = self
+            .snapshot
+            .files
+            .iter()
+            .find(|file| file.file_id == file_id)
+        {
+            for import in &file.flow.imports {
+                match self.symbol_linker.resolve_binding(file_id, &import.local) {
+                    ValueResolution::Resolved(LinkedValue::Declaration(symbol)) => {
+                        if let Some(value) = self.globals.get(&symbol) {
+                            environment.insert(import.local.clone(), value.clone());
+                        }
+                    }
+                    ValueResolution::Resolved(LinkedValue::Namespace(module)) => {
+                        environment.insert(
+                            import.local.clone(),
+                            TrackedValue::plain(AbstractValue::Namespace(module)),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        environment
+    }
+
+    fn evaluate_global(&mut self, index: usize) {
+        if self.initialized_globals.contains(&index) {
+            return;
+        }
+        let (file_id, binding) = self.globals_ir[index].clone();
+        if !self.evaluating_globals.insert(index) {
+            self.record_coverage_gap("cyclic module value initialization", &binding.span);
+            return;
+        }
+        let environment = self.module_environment(file_id);
+        let value = if matches!(&binding.pattern.kind, FlowPatternKind::Identifier { name } if self.model_symbol.file_id == file_id && self.model_symbol.name == *name)
+        {
+            TrackedValue::plain(AbstractValue::ModelFunction)
+        } else {
+            self.eval(&binding.value, &environment, file_id)
+        };
+        let mut bound = Environment::new();
+        self.bind_pattern(
+            &binding.pattern,
+            value,
+            &mut bound,
+            RelationKind::ValueTransfer,
+        );
+        self.globals.extend(
+            bound
+                .into_iter()
+                .map(|(name, value)| (LinkedSymbol { file_id, name }, value)),
+        );
+        self.evaluating_globals.remove(&index);
+        self.initialized_globals.insert(index);
+    }
+
+    fn linked_value(&mut self, resolution: ValueResolution, span: &SourceSpan) -> TrackedValue {
+        match resolution {
+            ValueResolution::Resolved(LinkedValue::Namespace(file_id)) => {
+                TrackedValue::plain(AbstractValue::Namespace(file_id))
+            }
+            ValueResolution::Resolved(LinkedValue::Declaration(symbol)) => {
+                if symbol == self.model_symbol {
+                    return TrackedValue::plain(AbstractValue::ModelFunction);
+                }
+                let key = FunctionKey {
+                    file_id: symbol.file_id,
+                    name: symbol.name.clone(),
+                };
+                if self.functions.contains_key(&key) {
+                    return TrackedValue::plain(AbstractValue::Function(key));
+                }
+                if let Some(index) = self.global_bindings.get(&symbol).copied() {
+                    self.evaluate_global(index);
+                }
+                self.globals
+                    .get(&symbol)
+                    .cloned()
+                    .unwrap_or_else(|| TrackedValue::unknown("uninitialized_module_value"))
+            }
+            ValueResolution::Ambiguous | ValueResolution::Unresolved => {
+                let reason = if resolution == ValueResolution::Ambiguous {
+                    "ambiguous value linkage"
+                } else {
+                    "unresolved value linkage"
+                };
+                self.record_coverage_gap(reason, span);
+                TrackedValue::unknown(reason)
+            }
+            ValueResolution::Missing => TrackedValue::unknown("missing_value_binding"),
+        }
+    }
+
+    fn record_coverage_gap(&mut self, reason: &str, span: &SourceSpan) {
+        let gap = format!(
+            "{reason} at file {} bytes {}..{}",
+            span.file_id.0, span.start, span.end
+        );
+        if !self.coverage_gaps.contains(&gap) {
+            self.coverage_gaps.push(gap);
         }
     }
 
@@ -415,7 +593,7 @@ impl<'a> Solver<'a> {
             return TrackedValue::unknown(format!("missing_function:{}", key.name));
         };
         self.call_depth += 1;
-        let mut environment = self.globals.clone();
+        let mut environment = self.module_environment(key.file_id);
         for (index, pattern) in definition.function.params.iter().enumerate() {
             let value = arguments
                 .get(index)
@@ -428,11 +606,13 @@ impl<'a> Solver<'a> {
                 RelationKind::RenderPropBinding,
             );
         }
+        self.active_captures.push(BTreeSet::new());
         let returned = self.execute_statements(
             &definition.function.body,
             &mut environment,
             definition.key.file_id,
         );
+        self.active_captures.pop();
         self.call_depth -= 1;
         returned.unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined))
     }
@@ -443,7 +623,7 @@ impl<'a> Solver<'a> {
         environment: &mut Environment,
         file_id: FileId,
     ) -> Option<TrackedValue> {
-        for statement in statements {
+        for (statement_index, statement) in statements.iter().enumerate() {
             match statement {
                 FlowStatement::Bind(binding) => {
                     let value = self.eval(&binding.value, environment, file_id);
@@ -499,14 +679,14 @@ impl<'a> Solver<'a> {
                     match test.value {
                         AbstractValue::Boolean(true) => {
                             if let Some(value) =
-                                self.execute_statements(consequent, environment, file_id)
+                                self.execute_branch(consequent, environment, file_id)
                             {
                                 return Some(value);
                             }
                         }
                         AbstractValue::Boolean(false) => {
                             if let Some(value) =
-                                self.execute_statements(alternate, environment, file_id)
+                                self.execute_branch(alternate, environment, file_id)
                             {
                                 return Some(value);
                             }
@@ -514,40 +694,66 @@ impl<'a> Solver<'a> {
                         _ => {
                             let mut consequent_environment = environment.clone();
                             let mut alternate_environment = environment.clone();
-                            let left = self.execute_statements(
+                            let left = self.execute_branch(
                                 consequent,
                                 &mut consequent_environment,
                                 file_id,
                             );
-                            let right = self.execute_statements(
-                                alternate,
-                                &mut alternate_environment,
-                                file_id,
-                            );
+                            let right =
+                                self.execute_branch(alternate, &mut alternate_environment, file_id);
                             match (left, right) {
                                 (Some(left), Some(right)) => {
                                     return Some(TrackedValue::plain(AbstractValue::Union(vec![
                                         left, right,
                                     ])));
                                 }
-                                (Some(value), None) | (None, Some(value)) => {
-                                    if !capability_ids(&value).is_empty() {
-                                        self.mark_value_unresolved(
-                                            &value,
-                                            "unknown branch returns on only one path",
-                                            span.clone(),
-                                        );
-                                        self.coverage_gaps.push(format!(
-                                            "partially returning unknown branch at file {} bytes {}..{}",
-                                            span.file_id.0, span.start, span.end
-                                        ));
-                                    }
+                                (Some(value), None) => {
+                                    // The other path still executes the rest of the function.
+                                    let continued = self
+                                        .execute_statements(
+                                            &statements[statement_index + 1..],
+                                            &mut alternate_environment,
+                                            file_id,
+                                        )
+                                        .unwrap_or_else(|| {
+                                            TrackedValue::plain(AbstractValue::Undefined)
+                                        });
+                                    self.mark_values_unresolved(
+                                        [&value, &continued].into_iter(),
+                                        "unknown branch returns on only one path",
+                                        span.clone(),
+                                    );
                                     return Some(TrackedValue::plain(AbstractValue::Union(vec![
-                                        value,
-                                        TrackedValue::unknown("non_returning_branch_continuation"),
+                                        value, continued,
                                     ])));
                                 }
-                                (None, None) => {}
+                                (None, Some(value)) => {
+                                    let continued = self
+                                        .execute_statements(
+                                            &statements[statement_index + 1..],
+                                            &mut consequent_environment,
+                                            file_id,
+                                        )
+                                        .unwrap_or_else(|| {
+                                            TrackedValue::plain(AbstractValue::Undefined)
+                                        });
+                                    self.mark_values_unresolved(
+                                        [&value, &continued].into_iter(),
+                                        "unknown branch returns on only one path",
+                                        span.clone(),
+                                    );
+                                    return Some(TrackedValue::plain(AbstractValue::Union(vec![
+                                        continued, value,
+                                    ])));
+                                }
+                                (None, None) => {
+                                    self.join_branch_environments(
+                                        environment,
+                                        &consequent_environment,
+                                        &alternate_environment,
+                                        span,
+                                    );
+                                }
                             }
                         }
                     }
@@ -564,6 +770,86 @@ impl<'a> Solver<'a> {
         None
     }
 
+    fn join_branch_environments(
+        &mut self,
+        environment: &mut Environment,
+        left: &Environment,
+        right: &Environment,
+        span: &SourceSpan,
+    ) {
+        let names = left
+            .keys()
+            .chain(right.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for name in names {
+            let old = environment.get(&name);
+            let unchanged = |value: Option<&TrackedValue>| match (old, value) {
+                (Some(old), Some(value)) => old.evidence == value.evidence,
+                (None, None) => true,
+                _ => false,
+            };
+            if unchanged(left.get(&name)) && unchanged(right.get(&name)) {
+                continue;
+            }
+            let values = [left.get(&name), right.get(&name)].map(|value| {
+                value
+                    .cloned()
+                    .unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined))
+            });
+            self.mark_values_unresolved(
+                values.iter(),
+                "unknown branch changes a callback-bearing binding",
+                span.clone(),
+            );
+            let parents = values.iter().filter_map(|value| value.evidence).collect();
+            let evidence = self.push_evidence(
+                RelationKind::ValueTransfer,
+                "conservative_branch_join",
+                span.clone(),
+                parents,
+                None,
+                &format!("retain alternatives for {name} after an unknown branch"),
+            );
+            environment.insert(
+                name,
+                TrackedValue {
+                    value: AbstractValue::Union(values.into()),
+                    evidence: Some(evidence),
+                    choice: self.current_choice.clone(),
+                },
+            );
+        }
+    }
+
+    fn execute_branch(
+        &mut self,
+        statements: &[FlowStatement],
+        environment: &mut Environment,
+        file_id: FileId,
+    ) -> Option<TrackedValue> {
+        let saved = statements
+            .iter()
+            .filter_map(|statement| match statement {
+                FlowStatement::Bind(binding) if binding.lexical => {
+                    Some(pattern_names(&binding.pattern))
+                }
+                _ => None,
+            })
+            .flatten()
+            .map(|name| (name.to_owned(), environment.get(name).cloned()))
+            .collect::<BTreeMap<_, _>>();
+        let returned = self.execute_statements(statements, environment, file_id);
+        for (name, value) in saved {
+            if let Some(value) = value {
+                environment.insert(name, value);
+            } else {
+                environment.remove(&name);
+            }
+        }
+        returned
+    }
+
     fn assign_target(
         &mut self,
         target: &FlowAssignmentTarget,
@@ -574,6 +860,20 @@ impl<'a> Solver<'a> {
     ) {
         match target {
             FlowAssignmentTarget::Identifier { name } => {
+                if self
+                    .active_captures
+                    .last()
+                    .is_some_and(|captures| captures.contains(name))
+                    || environment
+                        .values()
+                        .any(|value| captures_binding(value, name))
+                {
+                    self.mark_values_unresolved(
+                        environment.values().chain(std::iter::once(&value)),
+                        "reassignment of a captured binding requires live closure cells",
+                        span.clone(),
+                    );
+                }
                 let parents = environment
                     .get(name)
                     .and_then(|previous| previous.evidence)
@@ -627,7 +927,7 @@ impl<'a> Solver<'a> {
         file_id: FileId,
         span: SourceSpan,
     ) {
-        let FlowExpressionKind::Identifier { name } = &object.kind else {
+        let FlowExpressionKind::Identifier { name, .. } = &object.kind else {
             let object = self.eval(object, environment, file_id);
             self.mark_values_unresolved(
                 [&object, &value].into_iter(),
@@ -746,7 +1046,10 @@ impl<'a> Solver<'a> {
             FlowExpressionKind::Boolean { value } => {
                 TrackedValue::plain(AbstractValue::Boolean(*value))
             }
-            FlowExpressionKind::Identifier { name } => {
+            FlowExpressionKind::Identifier {
+                name,
+                module_binding,
+            } => {
                 if let Some(value) = environment.get(name) {
                     let evidence = self.push_evidence(
                         RelationKind::ValueTransfer,
@@ -761,13 +1064,23 @@ impl<'a> Solver<'a> {
                         ..value.clone()
                     };
                 }
-                if self.identifier_matches_model(file_id, name) {
-                    return TrackedValue::plain(AbstractValue::ModelFunction);
+                if !module_binding {
+                    return TrackedValue::unknown(format!("unresolved_local_identifier:{name}"));
                 }
-                self.resolve_function_identifier(file_id, name).map_or_else(
-                    || TrackedValue::unknown(format!("unresolved_identifier:{name}")),
-                    |key| TrackedValue::plain(AbstractValue::Function(key)),
-                )
+                let resolution = self.symbol_linker.resolve_binding(file_id, name);
+                if resolution == ValueResolution::Missing
+                    && self
+                        .snapshot
+                        .files
+                        .iter()
+                        .find(|file| file.file_id == file_id)
+                        .is_some_and(|file| {
+                            file.flow.imports.iter().any(|import| import.local == *name)
+                        })
+                {
+                    self.record_coverage_gap("missing imported value", &expression.span);
+                }
+                self.linked_value(resolution, &expression.span)
             }
             FlowExpressionKind::Record { fields } => {
                 let values = fields
@@ -788,14 +1101,6 @@ impl<'a> Solver<'a> {
                     .collect(),
             )),
             FlowExpressionKind::StaticMember { object, property } => {
-                if self.expression_matches_model(file_id, expression) {
-                    return TrackedValue::plain(AbstractValue::ModelFunction);
-                }
-                if let FlowExpressionKind::Identifier { name } = &object.kind
-                    && let Some(key) = self.resolve_namespace_function(file_id, name, property)
-                {
-                    return TrackedValue::plain(AbstractValue::Function(key));
-                }
                 let object = self.eval(object, environment, file_id);
                 self.read_property(
                     object,
@@ -805,17 +1110,6 @@ impl<'a> Solver<'a> {
                 )
             }
             FlowExpressionKind::ComputedMember { object, property } => {
-                if self.expression_matches_model(file_id, expression) {
-                    return TrackedValue::plain(AbstractValue::ModelFunction);
-                }
-                if let (
-                    FlowExpressionKind::Identifier { name },
-                    FlowExpressionKind::String { value },
-                ) = (&object.kind, &property.kind)
-                    && let Some(key) = self.resolve_namespace_function(file_id, name, value)
-                {
-                    return TrackedValue::plain(AbstractValue::Function(key));
-                }
                 let object = self.eval(object, environment, file_id);
                 let property = self.eval(property, environment, file_id);
                 let AbstractValue::String(property_name) = &property.value else {
@@ -901,10 +1195,37 @@ impl<'a> Solver<'a> {
                 self.invoke_value(callee, arguments, expression.span.clone())
             }
             FlowExpressionKind::Arrow { params, body } => {
-                let mut parents = environment
+                let mut references = ClosureReferences::default();
+                collect_body_references(body, &mut references);
+                let mut captured = environment
+                    .iter()
+                    .filter(|(name, _)| {
+                        references.has_unsupported || references.names.contains(*name)
+                    })
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect::<Environment>();
+                for pattern in params {
+                    for name in pattern_names(pattern) {
+                        captured.remove(name);
+                    }
+                }
+                for name in references.modules {
+                    if let std::collections::btree_map::Entry::Vacant(entry) = captured.entry(name)
+                    {
+                        let resolution = self.symbol_linker.resolve_binding(file_id, entry.key());
+                        let value = self.linked_value(resolution, &expression.span);
+                        entry.insert(value);
+                    }
+                }
+                let mut parents = captured
                     .values()
-                    .filter(|value| !capability_ids(value).is_empty())
-                    .filter_map(|value| value.evidence)
+                    .flat_map(|value| {
+                        value.evidence.into_iter().chain(
+                            self.value_capability_ids(value)
+                                .into_iter()
+                                .map(|id| self.capabilities[id].origin),
+                        )
+                    })
                     .collect::<Vec<_>>();
                 parents.sort();
                 parents.dedup();
@@ -922,7 +1243,7 @@ impl<'a> Solver<'a> {
                     value: AbstractValue::Closure(ClosureValue {
                         body: body.clone(),
                         params: params.clone(),
-                        environment: environment.clone(),
+                        environment: captured,
                         file_id,
                     }),
                     evidence,
@@ -981,7 +1302,7 @@ impl<'a> Solver<'a> {
             }
             _ => {
                 self.mark_values_unresolved(
-                    arguments.iter(),
+                    std::iter::once(&callee).chain(arguments.iter()),
                     "value passed to unsupported call target",
                     span,
                 );
@@ -1075,13 +1396,18 @@ impl<'a> Solver<'a> {
             FlowJsxTag::Identifier {
                 name,
                 intrinsic: true,
+                ..
             } => TrackedValue::plain(AbstractValue::Intrinsic(name.clone())),
             FlowJsxTag::Identifier {
                 name,
                 intrinsic: false,
+                module_binding,
             } => self.eval(
                 &FlowExpression {
-                    kind: FlowExpressionKind::Identifier { name: name.clone() },
+                    kind: FlowExpressionKind::Identifier {
+                        name: name.clone(),
+                        module_binding: *module_binding,
+                    },
                     span: expression.span.clone(),
                 },
                 environment,
@@ -1187,7 +1513,7 @@ impl<'a> Solver<'a> {
         handler: &TrackedValue,
         element_span: &SourceSpan,
     ) {
-        let capability_ids = capability_ids(handler);
+        let capability_ids = self.value_capability_ids(handler);
         for capability in capability_ids {
             let evidence = self.push_evidence(
                 RelationKind::EventRegistration,
@@ -1237,7 +1563,14 @@ impl<'a> Solver<'a> {
         arguments: Vec<TrackedValue>,
     ) -> TrackedValue {
         let mut environment = closure.environment.clone();
+        let mut references = ClosureReferences::default();
+        collect_body_references(&closure.body, &mut references);
+        let mut captures = references.names;
+        captures.retain(|name| closure.environment.contains_key(name));
         for (index, pattern) in closure.params.iter().enumerate() {
+            for name in pattern_names(pattern) {
+                captures.remove(name);
+            }
             let argument = arguments
                 .get(index)
                 .cloned()
@@ -1249,14 +1582,17 @@ impl<'a> Solver<'a> {
                 RelationKind::ValueTransfer,
             );
         }
-        match &closure.body {
+        self.active_captures.push(captures);
+        let returned = match &closure.body {
             FlowArrowBody::Expression { expression } => {
                 self.eval(expression, &environment, closure.file_id)
             }
             FlowArrowBody::Statements { statements } => self
                 .execute_statements(statements, &mut environment, closure.file_id)
                 .unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined)),
-        }
+        };
+        self.active_captures.pop();
+        returned
     }
 
     fn call_model(&mut self, arguments: &[TrackedValue], span: SourceSpan) -> TrackedValue {
@@ -1311,6 +1647,17 @@ impl<'a> Solver<'a> {
                 "callback factory capture could not be resolved from call arguments",
             );
             unresolved.push(evidence);
+        }
+        if captures.values().any(value_is_uncertain) {
+            unresolved.push(self.push_evidence(
+                RelationKind::UnresolvedEscape,
+                "uncertain_callback_factory_capture",
+                span.clone(),
+                vec![origin],
+                Some(self.model.id.clone()),
+                "projected factory argument contains an unknown or joined value",
+            ));
+            self.record_coverage_gap("uncertain callback factory capture", &span);
         }
         if self.current_reachability == Reachability::Unknown {
             unresolved.push(self.push_evidence(
@@ -1441,6 +1788,25 @@ impl<'a> Solver<'a> {
         span: SourceSpan,
         relation: RelationKind,
     ) -> TrackedValue {
+        if let AbstractValue::Namespace(file_id) = object.value {
+            let resolution = self.symbol_linker.resolve_exported_value(file_id, property);
+            if resolution == ValueResolution::Missing {
+                self.record_coverage_gap("missing namespace export", &span);
+            }
+            let mut value = self.linked_value(resolution, &span);
+            let parents = object.evidence.into_iter().chain(value.evidence).collect();
+            let evidence = self.push_evidence(
+                relation,
+                "read_namespace_export",
+                span,
+                parents,
+                None,
+                &format!("read namespace export {property}"),
+            );
+            value.evidence = Some(evidence);
+            value.choice = object.choice.or(value.choice);
+            return value;
+        }
         if let AbstractValue::Union(values) = object.value.clone() {
             return TrackedValue::plain(AbstractValue::Union(
                 values
@@ -1492,79 +1858,39 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn import_matches_model(&self, file_id: FileId, local: &str) -> bool {
-        self.symbol_linker
-            .imported_binding_matches(file_id, local, &self.model.r#match)
-    }
-
-    fn namespace_member_matches_model(&self, file_id: FileId, local: &str, member: &str) -> bool {
-        self.symbol_linker
-            .namespace_member_matches(file_id, local, member, &self.model.r#match)
-    }
-
-    fn local_matches_model(&self, file_id: FileId, name: &str) -> bool {
-        self.symbol_linker
-            .local_declaration_matches(file_id, name, &self.model.r#match)
-    }
-
-    fn identifier_matches_model(&self, file_id: FileId, name: &str) -> bool {
-        self.import_matches_model(file_id, name) || self.local_matches_model(file_id, name)
-    }
-
-    fn resolve_function_identifier(&self, file_id: FileId, name: &str) -> Option<FunctionKey> {
-        let local = FunctionKey {
-            file_id,
-            name: name.to_owned(),
-        };
-        if self.functions.contains_key(&local) {
-            return Some(local);
+    fn linked_expression(&self, file_id: FileId, expression: &FlowExpression) -> ValueResolution {
+        match &expression.kind {
+            FlowExpressionKind::Identifier {
+                name,
+                module_binding: true,
+            } => self.symbol_linker.resolve_binding(file_id, name),
+            FlowExpressionKind::StaticMember { object, property } => {
+                match self.linked_expression(file_id, object) {
+                    ValueResolution::Resolved(LinkedValue::Namespace(module)) => {
+                        self.symbol_linker.resolve_exported_value(module, property)
+                    }
+                    _ => ValueResolution::Missing,
+                }
+            }
+            FlowExpressionKind::ComputedMember { object, property } => {
+                if let FlowExpressionKind::String { value } = &property.kind {
+                    match self.linked_expression(file_id, object) {
+                        ValueResolution::Resolved(LinkedValue::Namespace(module)) => {
+                            self.symbol_linker.resolve_exported_value(module, value)
+                        }
+                        _ => ValueResolution::Missing,
+                    }
+                } else {
+                    ValueResolution::Missing
+                }
+            }
+            _ => ValueResolution::Missing,
         }
-        self.symbol_linker
-            .resolve_imported_binding(file_id, name)
-            .and_then(|symbol| {
-                let key = FunctionKey {
-                    file_id: symbol.file_id,
-                    name: symbol.name,
-                };
-                self.functions.contains_key(&key).then_some(key)
-            })
-    }
-
-    fn resolve_namespace_function(
-        &self,
-        file_id: FileId,
-        namespace: &str,
-        member: &str,
-    ) -> Option<FunctionKey> {
-        self.symbol_linker
-            .resolve_namespace_member(file_id, namespace, member)
-            .and_then(|symbol| {
-                let key = FunctionKey {
-                    file_id: symbol.file_id,
-                    name: symbol.name,
-                };
-                self.functions.contains_key(&key).then_some(key)
-            })
     }
 
     fn expression_matches_model(&self, file_id: FileId, expression: &FlowExpression) -> bool {
-        match &expression.kind {
-            FlowExpressionKind::Identifier { name } => self.identifier_matches_model(file_id, name),
-            FlowExpressionKind::StaticMember { object, property } => {
-                matches!(&object.kind, FlowExpressionKind::Identifier { name }
-                    if self.namespace_member_matches_model(file_id, name, property))
-            }
-            FlowExpressionKind::ComputedMember { object, property } => {
-                matches!(
-                    (&object.kind, &property.kind),
-                    (
-                        FlowExpressionKind::Identifier { name },
-                        FlowExpressionKind::String { value }
-                    ) if self.namespace_member_matches_model(file_id, name, value)
-                )
-            }
-            _ => false,
-        }
+        self.linked_expression(file_id, expression)
+            == ValueResolution::Resolved(LinkedValue::Declaration(self.model_symbol.clone()))
     }
 
     fn seed_unreached_creations(&mut self) {
@@ -1632,7 +1958,7 @@ impl<'a> Solver<'a> {
                 .iter()
                 .any(|capability| capability.callsite == candidate.span)
             {
-                let environment = self.globals.clone();
+                let environment = self.module_environment(candidate.file_id);
                 let arguments = candidate
                     .arguments
                     .iter()
@@ -1662,26 +1988,48 @@ impl<'a> Solver<'a> {
         reason: &str,
         span: SourceSpan,
     ) {
-        let mut ids = values.flat_map(capability_ids).collect::<Vec<_>>();
+        let mut ids = values
+            .flat_map(|value| self.value_capability_ids(value))
+            .collect::<Vec<_>>();
         ids.sort_unstable();
         ids.dedup();
         for capability in ids {
+            let origin = self.capabilities[capability].origin;
             let evidence = self.push_evidence(
                 RelationKind::UnresolvedEscape,
                 "unsupported_reachable_operation",
                 span.clone(),
-                Vec::new(),
+                vec![origin],
                 None,
                 reason,
             );
             if let Some(state) = self.capabilities.get_mut(capability) {
                 state.unresolved.push(evidence);
             }
+            self.record_coverage_gap(reason, &span);
         }
     }
 
     fn mark_value_unresolved(&mut self, value: &TrackedValue, reason: &str, span: SourceSpan) {
         self.mark_values_unresolved(std::iter::once(value), reason, span);
+    }
+
+    fn value_capability_ids(&self, value: &TrackedValue) -> Vec<usize> {
+        let mut ids = capability_ids(value);
+        let mut namespaces = BTreeSet::new();
+        collect_namespace_ids(value, &mut namespaces);
+        let mut modules = BTreeSet::new();
+        for namespace in namespaces {
+            self.module_initialization_order(namespace, &mut modules, &mut Vec::new());
+        }
+        for (symbol, value) in &self.globals {
+            if modules.contains(&symbol.file_id) {
+                ids.extend(capability_ids(value));
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     fn push_evidence(
@@ -1937,6 +2285,201 @@ fn capability_ids(value: &TrackedValue) -> Vec<usize> {
     ids
 }
 
+fn collect_namespace_ids(value: &TrackedValue, ids: &mut BTreeSet<FileId>) {
+    match &value.value {
+        AbstractValue::Namespace(file_id) => {
+            ids.insert(*file_id);
+        }
+        AbstractValue::Record(fields) => {
+            for value in fields.values() {
+                collect_namespace_ids(value, ids);
+            }
+        }
+        AbstractValue::Array(values) | AbstractValue::Union(values) => {
+            for value in values {
+                collect_namespace_ids(value, ids);
+            }
+        }
+        AbstractValue::Closure(closure) => {
+            for value in closure.environment.values() {
+                collect_namespace_ids(value, ids);
+            }
+        }
+        AbstractValue::Element(element) => {
+            collect_namespace_ids(&element.component, ids);
+            for value in element.props.values() {
+                collect_namespace_ids(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn captures_binding(value: &TrackedValue, name: &str) -> bool {
+    match &value.value {
+        AbstractValue::Closure(closure) => {
+            let mut references = ClosureReferences::default();
+            collect_body_references(&closure.body, &mut references);
+            closure.environment.contains_key(name)
+                && references.names.contains(name)
+                && !closure
+                    .params
+                    .iter()
+                    .any(|pattern| pattern_names(pattern).contains(&name))
+        }
+        AbstractValue::Record(fields) => fields.values().any(|value| captures_binding(value, name)),
+        AbstractValue::Array(values) | AbstractValue::Union(values) => {
+            values.iter().any(|value| captures_binding(value, name))
+        }
+        AbstractValue::Element(element) => {
+            captures_binding(&element.component, name)
+                || element
+                    .props
+                    .values()
+                    .any(|value| captures_binding(value, name))
+        }
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct ClosureReferences {
+    names: BTreeSet<String>,
+    modules: BTreeSet<String>,
+    has_unsupported: bool,
+}
+
+fn collect_body_references(body: &FlowArrowBody, references: &mut ClosureReferences) {
+    match body {
+        FlowArrowBody::Expression { expression } => {
+            collect_expression_references(expression, references);
+        }
+        FlowArrowBody::Statements { statements } => {
+            for statement in statements {
+                collect_statement_references(statement, references);
+            }
+        }
+    }
+}
+
+fn collect_expression_references(expression: &FlowExpression, references: &mut ClosureReferences) {
+    match &expression.kind {
+        FlowExpressionKind::Identifier {
+            name,
+            module_binding,
+        } => {
+            references.names.insert(name.clone());
+            if *module_binding {
+                references.modules.insert(name.clone());
+            }
+        }
+        FlowExpressionKind::Record { fields } => {
+            for field in fields {
+                collect_expression_references(&field.value, references);
+            }
+        }
+        FlowExpressionKind::Array { elements } => {
+            for value in elements {
+                collect_expression_references(value, references);
+            }
+        }
+        FlowExpressionKind::StaticMember { object, .. } => {
+            collect_expression_references(object, references);
+        }
+        FlowExpressionKind::ComputedMember { object, property } => {
+            collect_expression_references(object, references);
+            collect_expression_references(property, references);
+        }
+        FlowExpressionKind::StrictEquality { left, right, .. } => {
+            collect_expression_references(left, references);
+            collect_expression_references(right, references);
+        }
+        FlowExpressionKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            for value in [test, consequent, alternate] {
+                collect_expression_references(value, references);
+            }
+        }
+        FlowExpressionKind::Call { callee, arguments } => {
+            collect_expression_references(callee, references);
+            for value in arguments {
+                collect_expression_references(value, references);
+            }
+        }
+        FlowExpressionKind::Arrow { body, .. } => collect_body_references(body, references),
+        FlowExpressionKind::JsxElement { tag, props } => {
+            if matches!(tag, FlowJsxTag::Unsupported { .. }) {
+                references.has_unsupported = true;
+            }
+            if let FlowJsxTag::Identifier {
+                name,
+                intrinsic: false,
+                module_binding,
+            } = tag
+            {
+                references.names.insert(name.clone());
+                if *module_binding {
+                    references.modules.insert(name.clone());
+                }
+            }
+            for prop in props {
+                match prop {
+                    FlowJsxProp::Property { value, .. } | FlowJsxProp::Spread { value, .. } => {
+                        collect_expression_references(value, references);
+                    }
+                    FlowJsxProp::Unsupported(_) => references.has_unsupported = true,
+                }
+            }
+        }
+        FlowExpressionKind::Unsupported { .. } => references.has_unsupported = true,
+        _ => {}
+    }
+}
+
+fn collect_statement_references(statement: &FlowStatement, references: &mut ClosureReferences) {
+    match statement {
+        FlowStatement::Bind(binding) => {
+            collect_expression_references(&binding.value, references);
+        }
+        FlowStatement::Expression { value, .. }
+        | FlowStatement::Return {
+            value: Some(value), ..
+        } => collect_expression_references(value, references),
+        FlowStatement::Assign { target, value, .. } => {
+            collect_expression_references(value, references);
+            match target {
+                FlowAssignmentTarget::Identifier { name } => {
+                    references.names.insert(name.clone());
+                }
+                FlowAssignmentTarget::StaticMember { object, .. } => {
+                    collect_expression_references(object, references);
+                }
+                FlowAssignmentTarget::ComputedMember { object, property } => {
+                    collect_expression_references(object, references);
+                    collect_expression_references(property, references);
+                }
+                FlowAssignmentTarget::Unsupported { .. } => references.has_unsupported = true,
+            }
+        }
+        FlowStatement::If {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            collect_expression_references(test, references);
+            for statement in consequent.iter().chain(alternate) {
+                collect_statement_references(statement, references);
+            }
+        }
+        FlowStatement::Unsupported(_) => references.has_unsupported = true,
+        FlowStatement::Return { value: None, .. } => {}
+    }
+}
+
 fn collect_capability_ids(value: &TrackedValue, ids: &mut Vec<usize>) {
     match &value.value {
         AbstractValue::Capability(id) => ids.push(*id),
@@ -2011,6 +2554,7 @@ fn query_value(value: &TrackedValue) -> QueryValue {
             reason: "record_value".to_owned(),
         },
         AbstractValue::Function(_)
+        | AbstractValue::Namespace(_)
         | AbstractValue::ModelFunction
         | AbstractValue::Closure(_)
         | AbstractValue::Capability(_)
@@ -2026,11 +2570,20 @@ fn exact_equality(left: &AbstractValue, right: &AbstractValue) -> Option<bool> {
         (AbstractValue::String(left), AbstractValue::String(right)) => Some(left == right),
         (AbstractValue::Boolean(left), AbstractValue::Boolean(right)) => Some(left == right),
         (AbstractValue::Undefined, AbstractValue::Undefined) => Some(true),
-        (AbstractValue::String(_) | AbstractValue::Boolean(_) | AbstractValue::Undefined, _)
-        | (_, AbstractValue::String(_) | AbstractValue::Boolean(_) | AbstractValue::Undefined) => {
-            Some(false)
-        }
+        (
+            AbstractValue::String(_) | AbstractValue::Boolean(_) | AbstractValue::Undefined,
+            AbstractValue::String(_) | AbstractValue::Boolean(_) | AbstractValue::Undefined,
+        ) => Some(false),
         _ => None,
+    }
+}
+
+fn value_is_uncertain(value: &TrackedValue) -> bool {
+    match &value.value {
+        AbstractValue::Unknown(_) | AbstractValue::Union(_) => true,
+        AbstractValue::Array(values) => values.iter().any(value_is_uncertain),
+        AbstractValue::Record(fields) => fields.values().any(value_is_uncertain),
+        _ => false,
     }
 }
 

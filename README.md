@@ -1,6 +1,6 @@
-# Rust code-flow explorer prototype
+# Follower prototype
 
-This repository is an executable experiment for a local Rust analyzer that explains callback
+Follower is an executable experiment for a local Rust analyzer that explains callback
 flow through TypeScript/React code. It intentionally implements a narrow semantic fragment first:
 Oxc parsing/binding/CFG extraction, Node/TypeScript import resolution, an owned lowering boundary,
 repository callback-factory models, finite registry choices, React component prop forwarding, and
@@ -9,8 +9,8 @@ intrinsic event registration.
 The reference experiment is configured in `fixtures/reference/flow.toml`.
 
 ```sh
-cargo run -- index --project fixtures/reference/flow.toml
-cargo run -- audit --project fixtures/reference/flow.toml --model notice-dismiss-v1
+cargo run --bin follower -- index --project fixtures/reference/flow.toml
+cargo run --bin follower -- audit --project fixtures/reference/flow.toml --model notice-dismiss-v1
 ```
 
 The first generic query family finds factory calls, projects selected factory arguments, follows a
@@ -18,7 +18,7 @@ selected property of the returned value, and projects arguments at every invocat
 uses an array-valued factory argument and forwards the returned callback through React props:
 
 ```sh
-cargo run -- query \
+cargo run --bin follower -- query \
   --project fixtures/factory-query/flow.toml \
   --query fixtures/factory-query/query.toml
 ```
@@ -30,7 +30,7 @@ The control-flow fixture exercises finite strict-equality branches and row-prese
 `.map`, canonical ordinary-call linkage, and local callback reassignment:
 
 ```sh
-cargo run -- query \
+cargo run --bin follower -- query \
   --project fixtures/query-control-flow/flow.toml \
   --query fixtures/query-control-flow/query.toml
 ```
@@ -39,7 +39,7 @@ The mutation fixture demonstrates the current conservative boundary for an alias
 callback property is overwritten:
 
 ```sh
-cargo run -- query \
+cargo run --bin follower -- query \
   --project fixtures/query-mutation/flow.toml \
   --query fixtures/query-mutation/query.toml
 ```
@@ -48,7 +48,7 @@ To exercise a callback forwarded through three components with prop renaming and
 creation contexts:
 
 ```sh
-cargo run -- audit --project fixtures/prop-chain/flow.toml \
+cargo run --bin follower -- audit --project fixtures/prop-chain/flow.toml \
   --model prop-chain-callback --scope reachable
 ```
 
