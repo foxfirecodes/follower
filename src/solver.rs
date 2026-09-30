@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::Path,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -187,6 +188,7 @@ pub fn execute_query(
         },
     };
     let mut solver = Solver::new(project, snapshot, model)?;
+    let phase_start = Instant::now();
     if project.config.entries.is_empty() {
         if query.scope == QueryScope::Reachable {
             bail!("a reachable query requires at least one configured entry point");
@@ -195,28 +197,58 @@ pub fn execute_query(
     } else {
         solver.run()?;
     }
+    if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+        eprintln!(
+            "query solver roots: {} ms",
+            phase_start.elapsed().as_millis()
+        );
+    }
     if query.scope == QueryScope::AllCreations {
         if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
             eprintln!("query solver: seeding factory creations");
         }
+        let phase_start = Instant::now();
         solver.seed_unreached_creations();
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!(
+                "query solver factory seeds: {} ms",
+                phase_start.elapsed().as_millis()
+            );
+        }
         if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
             eprintln!("query solver: creations seeded; seeding reverse importers");
         }
+        let phase_start = Instant::now();
         solver.seed_reverse_importers(reverse_seed_paths, reverse_producer_paths);
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!(
+                "query solver reverse seeds: {} ms",
+                phase_start.elapsed().as_millis()
+            );
+        }
     }
     let requested_imports = solver.requested_imports.clone();
+    if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+        eprintln!(
+            "query module environments: hits={} misses={}",
+            solver.module_env_cache_hits, solver.module_env_cache_misses
+        );
+    }
     let producer_paths = solver
         .capability_producer_files
         .iter()
         .filter_map(|file_id| snapshot.files.iter().find(|file| file.file_id == *file_id))
         .map(|file| file.path.clone())
         .collect();
-    Ok((
-        solver.query_report(query, query_hash),
-        requested_imports,
-        producer_paths,
-    ))
+    let phase_start = Instant::now();
+    let report = solver.query_report(query, query_hash);
+    if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+        eprintln!(
+            "query solver report: {} ms",
+            phase_start.elapsed().as_millis()
+        );
+    }
+    Ok((report, requested_imports, producer_paths))
 }
 
 struct Solver<'a> {
@@ -231,6 +263,10 @@ struct Solver<'a> {
     evaluating_globals: BTreeSet<usize>,
     initialized_globals: BTreeSet<usize>,
     globals: BTreeMap<LinkedSymbol, TrackedValue>,
+    module_import_links: BTreeMap<FileId, Vec<(String, LinkedValue)>>,
+    module_env_cache: BTreeMap<FileId, Environment>,
+    module_env_cache_hits: usize,
+    module_env_cache_misses: usize,
     evidence: Vec<Evidence>,
     capabilities: Vec<CapabilityState>,
     diagnostics: Vec<String>,
@@ -329,6 +365,10 @@ impl<'a> Solver<'a> {
             evaluating_globals: BTreeSet::new(),
             initialized_globals: BTreeSet::new(),
             globals: BTreeMap::new(),
+            module_import_links: BTreeMap::new(),
+            module_env_cache: BTreeMap::new(),
+            module_env_cache_hits: 0,
+            module_env_cache_misses: 0,
             evidence: Vec::new(),
             capabilities: Vec::new(),
             diagnostics,
@@ -469,6 +509,7 @@ impl<'a> Solver<'a> {
 
     fn prepare_globals(&mut self, entry: Option<FileId>) {
         self.globals.clear();
+        self.module_env_cache.clear();
         self.initialized_globals.clear();
         self.evaluating_globals.clear();
         if let Some(entry) = entry {
@@ -514,36 +555,60 @@ impl<'a> Solver<'a> {
         modules.push(module);
     }
 
-    fn module_environment(&self, file_id: FileId) -> Environment {
+    fn module_environment(&mut self, file_id: FileId) -> Environment {
+        if let Some(environment) = self.module_env_cache.get(&file_id) {
+            self.module_env_cache_hits += 1;
+            return environment.clone();
+        }
+        self.module_env_cache_misses += 1;
         let mut environment = self
             .globals
             .iter()
             .filter(|(symbol, _)| symbol.file_id == file_id)
             .map(|(symbol, value)| (symbol.name.clone(), value.clone()))
             .collect::<Environment>();
-        if let Some(file) = self
-            .snapshot
-            .files
-            .iter()
-            .find(|file| file.file_id == file_id)
-        {
-            for import in &file.flow.imports {
-                match self.symbol_linker.resolve_binding(file_id, &import.local) {
-                    ValueResolution::Resolved(LinkedValue::Declaration(symbol)) => {
-                        if let Some(value) = self.globals.get(&symbol) {
-                            environment.insert(import.local.clone(), value.clone());
+        if !self.module_import_links.contains_key(&file_id) {
+            let links = self
+                .snapshot
+                .files
+                .iter()
+                .find(|file| file.file_id == file_id)
+                .map(|file| {
+                    file.flow
+                        .imports
+                        .iter()
+                        .filter_map(|import| {
+                            if let ValueResolution::Resolved(value) =
+                                self.symbol_linker.resolve_binding(file_id, &import.local)
+                            {
+                                Some((import.local.clone(), value))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.module_import_links.insert(file_id, links);
+        }
+        if let Some(links) = self.module_import_links.get(&file_id) {
+            for (local, value) in links {
+                match value {
+                    LinkedValue::Declaration(symbol) => {
+                        if let Some(value) = self.globals.get(symbol) {
+                            environment.insert(local.clone(), value.clone());
                         }
                     }
-                    ValueResolution::Resolved(LinkedValue::Namespace(module)) => {
+                    LinkedValue::Namespace(module) => {
                         environment.insert(
-                            import.local.clone(),
-                            TrackedValue::plain(AbstractValue::Namespace(module)),
+                            local.clone(),
+                            TrackedValue::plain(AbstractValue::Namespace(*module)),
                         );
                     }
-                    _ => {}
                 }
             }
         }
+        self.module_env_cache.insert(file_id, environment.clone());
         environment
     }
 
@@ -575,6 +640,7 @@ impl<'a> Solver<'a> {
                 .into_iter()
                 .map(|(name, value)| (LinkedSymbol { file_id, name }, value)),
         );
+        self.module_env_cache.clear();
         self.evaluating_globals.remove(&index);
         self.initialized_globals.insert(index);
     }

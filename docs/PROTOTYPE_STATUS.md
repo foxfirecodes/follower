@@ -45,6 +45,9 @@ dependency-management costs without isolating meaningful change.
   and values in query output. Local `.push`, finite array spreads, known-record `Object.values`,
   predicate-aware `.filter`, React memoization hooks,
   array destructuring, JSX children, and default/nested functions cover additional production forms.
+- The query solver reuses resolved import links and module environments within each pass. Module
+  environments are cleared when globals initialize, and profiling reports phase timings without
+  source names. Cross-run cache and incremental solver reuse remain future work.
 - Each configured selector alternative runs in a separate choice context. The reference audit
   preserves the registry row's key, component, callback creation, prop flow, wrapper registration,
   and invocation result.

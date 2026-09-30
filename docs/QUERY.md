@@ -105,7 +105,9 @@ and reuses parsed files within the run. Reverse importer functions in source fil
 limits and the text filter leave coverage incomplete.
 Include enum and constant definitions as explicit file roots. Leave the prefilter unset when a
 complete parse of the configured roots matters more than query latency. Parsed files are not yet
-cached across separate CLI runs.
+cached across separate CLI runs. During each solver pass, module environments and resolved import
+links are reused; environments are invalidated when module globals initialize. Set
+`FOLLOWER_PROFILE_QUERY=1` to print generic phase timings and cache counts to stderr.
 
 `callback_selector_imports` models imported functions that return the result of invoking one
 callback argument. Each entry names the module, exported function, and zero-based argument index.
