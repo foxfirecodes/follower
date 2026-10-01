@@ -129,6 +129,71 @@ fn backward_use_walk_finds_filtered_component_chain_to_entry() {
 }
 
 #[test]
+fn all_creations_explores_configured_roots_when_expansion_budget_stops() {
+    let mut files = vec![
+        (
+            "src/hook.ts".to_owned(),
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }".to_owned(),
+        ),
+        (
+            "src/App.tsx".to_owned(),
+            "import { Host0 } from './Host0'; export function App() { return <Host0 />; }"
+                .to_owned(),
+        ),
+    ];
+    // Each host's factory argument lives in an unfiltered file, so expansion requests more files
+    // than its budget allows in the first round.
+    for index in 0..260 {
+        files.push((
+            format!("src/Host{index}.tsx"),
+            format!(
+                "import {{ useItemSelection }} from './hook'; import {{ values }} from './values{index}'; export function Host{index}() {{ const [, apply] = useItemSelection(values); apply('close'); return null; }}"
+            ),
+        ));
+        files.push((
+            format!("src/values{index}.ts"),
+            "export const values = ['alpha'];".to_owned(),
+        ));
+    }
+    let files = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = TestProject::new(&files);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    assert!(
+        report
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.starts_with("capability import expansion stopped")),
+        "{:?}",
+        report.coverage.gaps
+    );
+    let rendered = report
+        .creations
+        .iter()
+        .filter(|creation| {
+            creation
+                .factory_location
+                .as_ref()
+                .is_some_and(|location| location.path.ends_with("Host0.tsx"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rendered.len(), 1);
+    assert_eq!(rendered[0].reachability, Reachability::Reachable);
+    assert_eq!(rendered[0].invocations.len(), 1);
+}
+
+#[test]
 fn backward_import_without_use_does_not_claim_reachability() {
     let fixture = TestProject::new(&[
         (

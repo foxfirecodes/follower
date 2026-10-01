@@ -134,8 +134,9 @@ use walk follows the containing function or module binding through local referen
 re-exports, and imported references. It parses candidate importers on demand, prioritizing paths
 nearer the entry. The walk indexes resolved import targets as files are added, so repeated symbol
 checks do not rescan the growing resolution list. Root reachability is then evaluated forward
-through modeled calls and JSX in
-the expanded snapshot. An import or symbol reference alone does not prove root reachability or
+through modeled calls and JSX in the expanded snapshot. If an expansion budget stops the query
+first, the roots are still evaluated once on the final snapshot before the report is written, and
+the stop remains a coverage gap. An import or symbol reference alone does not prove root reachability or
 runtime rendering. Unsupported dynamic loaders and registry wiring can still leave paths unknown;
 budget limits are reported as coverage gaps. Each expansion round currently rebuilds the solver and
 re-evaluates previously discovered reverse importer seeds. Query report schema version 7 records

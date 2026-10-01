@@ -396,6 +396,14 @@ impl SourceCatalog {
     }
 }
 
+fn is_expandable_source(path: &Path) -> bool {
+    path.is_file()
+        && is_source_file(path)
+        && !path
+            .components()
+            .any(|component| component.as_os_str() == OsStr::new("node_modules"))
+}
+
 fn module_specifiers(source: &str, include_dynamic_imports: bool) -> Vec<String> {
     let bytes = source.as_bytes();
     let mut specs = BTreeSet::new();
@@ -963,12 +971,7 @@ impl Analyzer {
                 .union(&reverse_requests)
                 .filter(|path| !indexed.contains(*path))
             {
-                if path.is_file()
-                    && is_source_file(path)
-                    && !path
-                        .components()
-                        .any(|component| component.as_os_str() == OsStr::new("node_modules"))
-                {
+                if is_expandable_source(path) {
                     additions.push(path.clone());
                 } else {
                     skipped.insert(path.clone());
@@ -1055,6 +1058,30 @@ impl Analyzer {
                 if additions.is_empty() && !run_roots && round < 8 {
                     run_roots = true;
                     continue;
+                }
+                if !run_roots {
+                    // Expansion stopped before the roots pass. Explore the configured roots on the
+                    // final snapshot so unreached creations are not reported without trying them.
+                    let (roots_report, roots_requests, _, _) = crate::solver::execute_query(
+                        &self.project,
+                        &snapshot,
+                        query,
+                        query_hash,
+                        &reverse_seed_paths,
+                        &reverse_producer_paths,
+                        true,
+                    )?;
+                    report = roots_report;
+                    for path in roots_requests
+                        .iter()
+                        .filter(|path| !indexed.contains(*path))
+                    {
+                        if !is_expandable_source(path) {
+                            skipped.insert(path.clone());
+                        } else if !additions.contains(path) {
+                            additions.push(path.clone());
+                        }
+                    }
                 }
                 if !additions.is_empty() {
                     report.coverage.gaps.push(format!(
