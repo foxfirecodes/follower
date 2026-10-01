@@ -199,6 +199,110 @@ fn filtered_root_path_links_components_through_star_export_barrels() {
     );
 }
 
+const TUPLE_QUERY: &str = "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n";
+
+const HOOK: (&str, &str) = (
+    "src/hook.ts",
+    "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+);
+
+const LEAF: (&str, &str) = (
+    "src/Leaf.tsx",
+    "import { useItemSelection } from './hook'; export function Leaf() { const [, apply] = useItemSelection(['alpha']); apply('close'); return null; }",
+);
+
+#[test]
+fn contract_on_a_package_export_applies_through_re_exporting_barrels() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        LEAF,
+        (
+            "src/App.tsx",
+            "import { Frame } from './ui'; import { Leaf } from './Leaf'; export function App() { return <Frame><Leaf /></Frame>; }",
+        ),
+        ("src/ui/index.ts", "export { Frame } from './frame';"),
+        ("src/ui/frame.ts", "export { Frame } from 'external-frame';"),
+    ]);
+    fixture.write("query.toml", TUPLE_QUERY);
+    let config = "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n";
+    fixture.write("flow.toml", config);
+    assert_eq!(
+        fixture.report().creations[0].reachability,
+        Reachability::Possible
+    );
+    fixture.write(
+        "flow.toml",
+        &format!(
+            "{config}[[component_consumers]]\nmodule = 'external-frame'\nexport = 'Frame'\nforward_children = true\n"
+        ),
+    );
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1, "{:?}", report.coverage.gaps);
+    assert_eq!(report.creations[0].reachability, Reachability::Reachable);
+}
+
+#[test]
+fn a_single_function_child_is_callable_and_text_children_are_strings() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        LEAF,
+        (
+            "src/Theme.tsx",
+            "function Inner({ children }) { return <section>{children}</section>; } export function Theme({ children }) { return <Inner>{children('dark')}</Inner>; } export function Label({ children }) { return typeof children === 'string' ? <span>{children}</span> : null; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Theme, Label } from './Theme'; import { Leaf } from './Leaf'; export function App() {\n  return (\n    <Theme>\n      {(className) => <div className={className}><Label>  title\n  </Label><Leaf /></div>}\n    </Theme>\n  );\n}",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", TUPLE_QUERY);
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1, "{:?}", report.coverage.gaps);
+    assert_eq!(
+        report.creations[0].reachability,
+        Reachability::Reachable,
+        "{:?}",
+        report.coverage.gaps
+    );
+}
+
+#[test]
+fn root_path_parses_the_higher_order_component_it_renders() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        LEAF,
+        (
+            "src/Panel.tsx",
+            "import { Leaf } from './Leaf'; import { withBox } from './withBox'; function Panel() { return <Leaf />; } export const BoxedPanel = withBox(Panel);",
+        ),
+        (
+            "src/withBox.tsx",
+            "import * as React from 'react'; export function withBox(Component) { return React.forwardRef(function Boxed(props, ref) { return <div ref={ref}><Component {...props} /></div>; }); }",
+        ),
+        (
+            "src/App.tsx",
+            "import { BoxedPanel } from './Panel'; export function App() { return <BoxedPanel />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection', 'BoxedPanel']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", TUPLE_QUERY);
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1, "{:?}", report.coverage.gaps);
+    assert_eq!(
+        report.creations[0].reachability,
+        Reachability::Reachable,
+        "{:?}",
+        report.coverage.gaps
+    );
+}
+
 #[test]
 fn all_creations_explores_configured_roots_when_expansion_budget_stops() {
     let mut files = vec![

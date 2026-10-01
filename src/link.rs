@@ -158,6 +158,7 @@ pub struct SymbolLinker<'a> {
     resolutions_by_importer: HashMap<PathBuf, Vec<usize>>,
     /// Text of resolved modules outside the snapshot, read only to rule out exports.
     unparsed_sources: RefCell<HashMap<PathBuf, Option<UnparsedSource>>>,
+    may_export: RefCell<HashMap<(PathBuf, String), bool>>,
 }
 
 struct UnparsedSource {
@@ -217,6 +218,7 @@ impl<'a> SymbolLinker<'a> {
             file_by_path,
             resolutions_by_importer,
             unparsed_sources: RefCell::new(HashMap::new()),
+            may_export: RefCell::new(HashMap::new()),
         }
     }
 
@@ -356,6 +358,18 @@ impl<'a> SymbolLinker<'a> {
         }
     }
 
+    /// Returns the module specifiers and export names, as written at each hop, that linking `local`
+    /// in `file_id` passes through: the import itself, then re-exports on branches that may provide
+    /// the binding. A contract on any of them applies to the binding.
+    pub fn linked_exports(&self, file_id: FileId, local: &str) -> Vec<(String, String)> {
+        let Some(file) = self.file(file_id) else {
+            return Vec::new();
+        };
+        let mut walk = LinkWalk::default();
+        self.resolve_local_binding(file, local, &mut walk);
+        walk.exports
+    }
+
     pub fn resolve_exported_value(&self, file_id: FileId, name: &str) -> ValueResolution {
         let Some(file) = self.file(file_id) else {
             return ValueResolution::Unresolved;
@@ -378,6 +392,8 @@ impl<'a> SymbolLinker<'a> {
             if import.type_only {
                 return ValueResolution::Missing;
             }
+            walk.exports
+                .push((import.module.clone(), import.imported.clone()));
             if import.imported == "*" {
                 return self.resolve_namespace(file, &import.module, walk);
             }
@@ -487,6 +503,7 @@ impl<'a> SymbolLinker<'a> {
         let mut unresolved = false;
         let mut ambiguous = false;
         for export in paths {
+            let hops = walk.exports.len();
             let resolution = match export {
                 FlowExport::ReExport {
                     imported,
@@ -495,6 +512,7 @@ impl<'a> SymbolLinker<'a> {
                     type_only: false,
                     ..
                 } if exported == export_name => {
+                    walk.exports.push((module.clone(), imported.clone()));
                     self.resolve_re_export(file, module, imported, walk)
                 }
                 FlowExport::Local {
@@ -507,7 +525,10 @@ impl<'a> SymbolLinker<'a> {
                     module,
                     type_only: false,
                     ..
-                } => self.resolve_re_export(file, module, export_name, walk),
+                } => {
+                    walk.exports.push((module.clone(), export_name.to_owned()));
+                    self.resolve_re_export(file, module, export_name, walk)
+                }
                 FlowExport::Namespace {
                     module,
                     type_only: false,
@@ -524,7 +545,8 @@ impl<'a> SymbolLinker<'a> {
                 }
                 ValueResolution::Ambiguous => ambiguous = true,
                 ValueResolution::Unresolved => unresolved = true,
-                ValueResolution::Missing => {}
+                // A branch that cannot provide the name did not carry the binding.
+                ValueResolution::Missing => walk.exports.truncate(hops),
             }
         }
         if ambiguous || candidates.len() > 1 {
@@ -561,6 +583,10 @@ impl<'a> SymbolLinker<'a> {
         if !crate::project::is_source_file(path) {
             return true;
         }
+        let key = (path.to_path_buf(), name.to_owned());
+        if let Some(known) = self.may_export.borrow().get(&key) {
+            return *known;
+        }
         let mut sources = self.unparsed_sources.borrow_mut();
         let source = sources.entry(path.to_path_buf()).or_insert_with(|| {
             std::fs::read_to_string(path)
@@ -570,9 +596,11 @@ impl<'a> SymbolLinker<'a> {
                     text,
                 })
         });
-        source
+        let may = source
             .as_ref()
-            .is_none_or(|source| source.forwards || contains_identifier(&source.text, name))
+            .is_none_or(|source| source.forwards || contains_identifier(&source.text, name));
+        self.may_export.borrow_mut().insert(key, may);
+        may
     }
 
     fn resolved_module(&self, importer: &FileIr, module: &str) -> Option<&'a Path> {
@@ -626,11 +654,13 @@ fn contains_identifier(text: &str, name: &str) -> bool {
     identifier_positions(text, name).next().is_some()
 }
 
-/// State for one linkage walk: the recursion stack, plus resolved modules the snapshot lacks.
+/// State for one linkage walk: the recursion stack, resolved modules the snapshot lacks, and the
+/// module specifiers and export names the walk passed through.
 #[derive(Default)]
 struct LinkWalk {
     visited: BTreeSet<(PathBuf, String)>,
     unparsed: BTreeSet<PathBuf>,
+    exports: Vec<(String, String)>,
 }
 
 pub(crate) fn pattern_names(pattern: &FlowPattern) -> Vec<&str> {

@@ -204,7 +204,9 @@ promise_property = "load"
 ```
 
 A consumer contract explores the named render callback, component prop, children, or a
-function-valued child as a possible render. A wrapper contract says the returned component may
+function-valued child as a possible render. It applies to a JSX tag imported from its module and
+export, and to any tag whose import passes through that export on the way to its definition, so
+a contract on a package export also covers barrels that re-export it under the same name. A wrapper contract says the returned component may
 render the component at the given argument index. A lazy factory contract recognizes a callback
 returning a literal `import()` and links its default export. These contracts describe possible
 paths, not guaranteed
@@ -213,7 +215,9 @@ import expressions remain unknown. The backward walk still parses only candidate
 class `render()` methods and direct `this.method()` calls can supply use edges without indexing
 every file.
 Object-rest props, JSX fragments, and configured member tags can forward children through the
-same slice. Contexts created by React `createContext` need no contract: their `Provider` renders
+same slice. As in React, a single JSX child is passed as `children` itself and several children as
+an array, so a component can call a function child. JSX text follows the React whitespace rule:
+indentation-only text is dropped, and other text is a string child. Contexts created by React `createContext` need no contract: their `Provider` renders
 its children and their `Consumer` calls its function child. A configured render callback name filter is intended
 for focused traces; each skipped callback is reported as a coverage gap. Repeated renders at one
 source site are bounded to 16 visits per component and callback identity and per set of JSX it
@@ -240,12 +244,14 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   possible row is never upgraded to reachable; modeling or parsing the component can remove the
   assumption. Function children are called like render functions. A call to an unknown function
   that receives a component, such as an unmodeled higher-order component, returns a value that may
-  render that component with the element's props. Under an assumption, a component is explored
+  render that component with the element's props. When a root path renders such a value, the
+  root phase requests the callee's module, so a parsed higher-order component can replace the
+  assumption on the next round. Under an assumption, a component is explored
   only if the backward use walk found it on a use chain toward a factory callsite (or, when no walk
   ran, if its file is on the entry corridor), or if it receives JSX or callbacks. If the walk stops
   at its budget, components it did not reach can be skipped; the stop is reported as a gap. A
   component is explored once per entry input for the same props, which removes repeated paths
-  that would only duplicate results. Assumed rendering has a 200,000-step budget per entry input;
+  that would only duplicate results; props too deep to fingerprint are always explored. Assumed rendering has a 200,000-step budget per entry input;
   exhausting it is a coverage gap.
 - JSX can also leave the model inside a component that is parsed. On paths from configured roots,
   elements handed to an unknown or unsupported call, or referenced by an unsupported expression,

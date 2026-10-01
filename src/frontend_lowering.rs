@@ -946,18 +946,25 @@ impl Lowerer<'_> {
                 }
             })
             .collect::<Vec<_>>();
-        let children = element
+        let mut children = element
             .children
             .iter()
             .filter_map(|child| self.lower_jsx_child(child))
             .collect::<Vec<_>>();
         if !children.is_empty() {
-            props.push(FlowJsxProp::Property {
-                name: "children".to_owned(),
-                value: FlowExpression {
+            // React passes a single child as is and several as an array, so a function child
+            // can be called.
+            let value = if children.len() == 1 {
+                children.pop().expect("one child")
+            } else {
+                FlowExpression {
                     kind: FlowExpressionKind::Array { elements: children },
                     span: self.span(element.span),
-                },
+                }
+            };
+            props.push(FlowJsxProp::Property {
+                name: "children".to_owned(),
+                value,
                 span: self.span(element.span),
             });
         }
@@ -969,7 +976,10 @@ impl Lowerer<'_> {
 
     fn lower_jsx_child(&self, child: &JSXChild<'_>) -> Option<FlowExpression> {
         match child {
-            JSXChild::Text(_) => None,
+            JSXChild::Text(text) => clean_jsx_text(&text.value).map(|value| FlowExpression {
+                kind: FlowExpressionKind::String { value },
+                span: self.span(text.span),
+            }),
             JSXChild::Element(element) => Some(self.lower_jsx_element(element)),
             JSXChild::Fragment(fragment) => Some(FlowExpression {
                 kind: FlowExpressionKind::Array {
@@ -1000,4 +1010,25 @@ impl Lowerer<'_> {
             span: self.span(span),
         }
     }
+}
+
+/// Applies the JSX whitespace rule: lines are trimmed where they meet a line break, blank lines
+/// are dropped, and the rest are joined with spaces. Text that is only indentation is not a child.
+fn clean_jsx_text(text: &str) -> Option<String> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let last_line = lines.len().saturating_sub(1);
+    let pieces = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = if index == 0 { line } else { line.trim_start() };
+            let line = if index == last_line && !text.ends_with('\n') {
+                line
+            } else {
+                line.trim_end()
+            };
+            (!line.is_empty()).then_some(line)
+        })
+        .collect::<Vec<_>>();
+    (!pieces.is_empty()).then(|| pieces.join(" "))
 }

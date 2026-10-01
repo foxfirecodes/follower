@@ -112,6 +112,9 @@ enum AbstractValue {
     AssumedWrapper {
         reason: String,
         wrapped: Rc<Vec<TrackedValue>>,
+        /// The file and local name of the unknown callee, so a root path that renders the result
+        /// can request the callee's module.
+        callee: Option<Rc<(FileId, String)>>,
     },
 }
 
@@ -980,18 +983,7 @@ impl<'a> Solver<'a> {
     }
 
     fn request_imported_callee(&mut self, file_id: FileId, callee: &FlowExpression) {
-        let local = match &callee.kind {
-            FlowExpressionKind::Identifier { name, .. } => Some(name.as_str()),
-            FlowExpressionKind::StaticMember { object, .. } => {
-                if let FlowExpressionKind::Identifier { name, .. } = &object.kind {
-                    Some(name.as_str())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        if let Some(local) = local {
+        if let Some(local) = imported_callee_local(callee) {
             self.request_import_for_local(file_id, local);
         }
     }
@@ -2050,7 +2042,14 @@ impl<'a> Solver<'a> {
                 {
                     self.request_imported_callee(file_id, callee);
                 }
-                self.invoke_value(callee_value, arguments, expression.span.clone())
+                let mut result =
+                    self.invoke_value(callee_value, arguments, expression.span.clone());
+                if let AbstractValue::AssumedWrapper { callee: source, .. } = &mut result.value
+                    && let Some(local) = imported_callee_local(callee)
+                {
+                    *source = Some(Rc::new((file_id, local.to_owned())));
+                }
+                result
             }
             FlowExpressionKind::Arrow { params, body } => {
                 let mut references = ClosureReferences::default();
@@ -2430,6 +2429,7 @@ impl<'a> Solver<'a> {
                     TrackedValue::plain(AbstractValue::AssumedWrapper {
                         reason: "unknown_call_result".to_owned(),
                         wrapped: Rc::new(wrapped),
+                        callee: None,
                     })
                 }
             }
@@ -2759,8 +2759,15 @@ impl<'a> Solver<'a> {
                     self.project
                         .config
                         .component_consumer(&file.flow, &reference)
+                        .cloned()
                 })
-                .cloned(),
+                .or_else(|| {
+                    let member = match tag {
+                        FlowJsxTag::Member { property, .. } => Some(property.as_str()),
+                        _ => None,
+                    };
+                    self.linked_component_consumer(file_id, name, member)
+                }),
             _ => None,
         };
         let component = if let Some(model) = configured {
@@ -2856,7 +2863,9 @@ impl<'a> Solver<'a> {
                 | FlowJsxTag::Member { object: name, .. } => Some(name.as_str()),
                 _ => None,
             };
-            let renders_content = values.contains_key("children")
+            let renders_content = values
+                .get("children")
+                .is_some_and(|children| !is_primitive(&children.value))
                 || values.contains_key("render")
                 || values.contains_key("component");
             if let Some(local) = local {
@@ -2877,6 +2886,34 @@ impl<'a> Solver<'a> {
             span: expression.span.clone(),
             trace: self.trace.clone(),
         }))
+    }
+
+    /// Finds a configured consumer whose module and export the tag's import chain passes through,
+    /// so a contract on a package export also covers barrels that re-export it.
+    fn linked_component_consumer(
+        &self,
+        file_id: FileId,
+        local: &str,
+        member: Option<&str>,
+    ) -> Option<crate::project::ComponentConsumer> {
+        let consumers = &self.project.config.component_consumers;
+        if consumers.is_empty() {
+            return None;
+        }
+        let hops = self.symbol_linker.linked_exports(file_id, local);
+        consumers
+            .iter()
+            .find(|model| {
+                hops.iter().any(|(module, export)| {
+                    model.module == *module
+                        && match member {
+                            Some(member) if export == "*" => model.export == member,
+                            Some(member) => model.export == format!("{export}.{member}"),
+                            None => model.export == *export,
+                        }
+                })
+            })
+            .cloned()
     }
 
     fn render(&mut self, value: TrackedValue) {
@@ -2988,7 +3025,8 @@ impl<'a> Solver<'a> {
         };
         // Another assumed path to the same component with the same props would only repeat its
         // results, so explore each such render once. A render cut short by a budget is not
-        // remembered, so a later path can still complete it.
+        // remembered, so a later path can still complete it, and props too deep to fingerprint
+        // are always explored.
         let mut memo = None;
         // Unions only dispatch to their alternatives, which are remembered individually.
         if self.current_reachability == Reachability::Possible
@@ -2998,9 +3036,10 @@ impl<'a> Solver<'a> {
             )
         {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let mut complete = true;
             for (name, value) in &element.props {
                 std::hash::Hash::hash(name, &mut hasher);
-                hash_value_fingerprint(&self.heap, value, &mut hasher, 0);
+                complete &= hash_value_fingerprint(&self.heap, value, &mut hasher, 0);
             }
             let fingerprint = std::hash::Hasher::finish(&hasher);
             let component = match &element.component.value {
@@ -3022,11 +3061,13 @@ impl<'a> Solver<'a> {
                 ),
             };
             let memo_key = (self.current_choice.clone(), component, fingerprint);
-            if !self.assumed_component_renders.insert(memo_key.clone()) {
-                self.trace = previous_trace;
-                return;
+            if complete {
+                if !self.assumed_component_renders.insert(memo_key.clone()) {
+                    self.trace = previous_trace;
+                    return;
+                }
+                memo = Some((memo_key, self.render_truncations));
             }
-            memo = Some((memo_key, self.render_truncations));
         }
         // Assumed renders have their own budget so they cannot crowd out exact paths.
         let key = (
@@ -3154,7 +3195,23 @@ impl<'a> Solver<'a> {
                     self.render_through_unmodeled_component(&element, &[]);
                 }
             }
-            AbstractValue::AssumedWrapper { reason, wrapped } => {
+            AbstractValue::AssumedWrapper {
+                reason,
+                wrapped,
+                callee,
+            } => {
+                // A root path renders this wrapper, so its module may model it exactly.
+                if let Some(callee) = callee
+                    && self.current_reachability != Reachability::Unknown
+                {
+                    for path in self
+                        .symbol_linker
+                        .unparsed_link_targets(callee.0, &callee.1)
+                    {
+                        self.request_root_import(&path);
+                        self.requested_imports.insert(path);
+                    }
+                }
                 self.mark_values_unresolved(
                     element.props.values(),
                     &format!("element has unknown component target: {reason}"),
@@ -4945,11 +5002,11 @@ fn hash_value_fingerprint(
     value: &TrackedValue,
     hasher: &mut std::collections::hash_map::DefaultHasher,
     depth: usize,
-) {
+) -> bool {
     use std::hash::Hash;
     if depth > 12 {
         "<deep>".hash(hasher);
-        return;
+        return false;
     }
     // A heap-backed value is read through its current heap cell.
     let current = value
@@ -4957,6 +5014,7 @@ fn hash_value_fingerprint(
         .and_then(|id| heap.get(&id))
         .map(|current| TrackedValue::plain((**current).clone()));
     let value = current.as_ref().unwrap_or(value);
+    let mut complete = true;
     match &value.value {
         AbstractValue::Null => "null".hash(hasher),
         AbstractValue::Undefined => "undefined".hash(hasher),
@@ -4972,13 +5030,13 @@ fn hash_value_fingerprint(
             "record".hash(hasher);
             for (name, value) in fields.iter() {
                 name.hash(hasher);
-                hash_value_fingerprint(heap, value, hasher, depth + 1);
+                complete &= hash_value_fingerprint(heap, value, hasher, depth + 1);
             }
         }
         AbstractValue::Array(values) | AbstractValue::Union(values) => {
             ("list", values.len()).hash(hasher);
             for value in values.iter() {
-                hash_value_fingerprint(heap, value, hasher, depth + 1);
+                complete &= hash_value_fingerprint(heap, value, hasher, depth + 1);
             }
         }
         AbstractValue::Function(key) => ("fn", key.file_id.0, &key.name).hash(hasher),
@@ -4988,16 +5046,16 @@ fn hash_value_fingerprint(
             ("closure", closure.file_id.0, closure.span.start).hash(hasher);
             for (name, value) in &closure.environment {
                 name.hash(hasher);
-                hash_value_fingerprint(heap, value, hasher, depth + 1);
+                complete &= hash_value_fingerprint(heap, value, hasher, depth + 1);
             }
         }
         AbstractValue::Capability(id) => ("cap", id).hash(hasher),
         AbstractValue::Element(element) => {
             ("el", element.span.file_id.0, element.span.start).hash(hasher);
-            hash_value_fingerprint(heap, &element.component, hasher, depth + 1);
+            complete &= hash_value_fingerprint(heap, &element.component, hasher, depth + 1);
             for (name, value) in &element.props {
                 name.hash(hasher);
-                hash_value_fingerprint(heap, value, hasher, depth + 1);
+                complete &= hash_value_fingerprint(heap, value, hasher, depth + 1);
             }
         }
         AbstractValue::Intrinsic(name) => ("intrinsic", name).hash(hasher),
@@ -5008,10 +5066,11 @@ fn hash_value_fingerprint(
         AbstractValue::AssumedWrapper { wrapped, .. } => {
             "wrapper".hash(hasher);
             for value in wrapped.iter() {
-                hash_value_fingerprint(heap, value, hasher, depth + 1);
+                complete &= hash_value_fingerprint(heap, value, hasher, depth + 1);
             }
         }
     }
+    complete
 }
 
 /// Collects source sites of JSX elements and render functions carried by a prop value.
@@ -5480,6 +5539,31 @@ fn returns_capability_data(value: &TrackedValue) -> bool {
         }
         _ => false,
     }
+}
+
+/// The local binding a call goes through: `name(...)` or `name.member(...)`.
+fn imported_callee_local(callee: &FlowExpression) -> Option<&str> {
+    match &callee.kind {
+        FlowExpressionKind::Identifier { name, .. } => Some(name),
+        FlowExpressionKind::StaticMember { object, .. } => match &object.kind {
+            FlowExpressionKind::Identifier { name, .. } => Some(name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Strings and other scalars, such as JSX text children, cannot render components.
+const fn is_primitive(value: &AbstractValue) -> bool {
+    matches!(
+        value,
+        AbstractValue::Null
+            | AbstractValue::Undefined
+            | AbstractValue::String(_)
+            | AbstractValue::Number(_)
+            | AbstractValue::Boolean(_)
+            | AbstractValue::EnumMember { .. }
+    )
 }
 
 fn render_compact_value(value: &TrackedValue) -> String {
