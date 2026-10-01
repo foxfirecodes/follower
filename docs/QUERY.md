@@ -190,8 +190,9 @@ route matches, authorization, loading, or runtime rendering. Unconfigured import
 import expressions remain unknown. The backward walk still parses only candidate importer paths;
 class `render()` methods and direct `this.method()` calls can supply use edges without indexing
 every file.
-Object-rest props, JSX fragments, and configured member tags such as a context provider can
-forward children through the same slice. A configured render callback name filter is intended
+Object-rest props, JSX fragments, and configured member tags can forward children through the
+same slice. Contexts created by React `createContext` need no contract: their `Provider` renders
+its children and their `Consumer` calls its function child. A configured render callback name filter is intended
 for focused traces; each skipped callback is reported as a coverage gap. Repeated renders at one
 source site are bounded to 16 visits per component and callback identity, with a coverage gap if
 the bound is reached. Filtered `all_creations` queries postpone entry execution until import and
@@ -250,7 +251,7 @@ The engine follows object and array destructuring, local calls and closures, rec
 selection, arrays and finite spreads, exact string/boolean/numeric-enum strict-equality branches,
 null comparisons, logical expressions, conditional expressions, finite-array `.map` and `.filter`,
 `Object.values` on known records, local `.push`, JSX component props/children/spreads,
-React `useMemo`, `useCallback`, `useState`, `memo`, and `forwardRef`, prop renaming, wrapper callbacks, simple
+React `useMemo`, `useCallback`, `useState`, `memo`, `forwardRef`, and `createContext`, prop renaming, wrapper callbacks, simple
 identifier reassignment, and intrinsic `onClick` handlers. Factory matching and ordinary
 function/component calls, enums, and module values use canonical identities across named import
 aliases, explicit renamed re-exports, local imported-then-exported aliases, `export *` chains,

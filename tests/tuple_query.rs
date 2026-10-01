@@ -429,6 +429,58 @@ fn configured_route_render_prop_and_wrapper_connect_a_class_route_table() {
 }
 
 #[test]
+fn react_context_provider_and_consumer_render_children_without_contracts() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf({ action }: { action: string }) { const [, apply] = useItemSelection(['alpha']); apply(action); return null; }",
+        ),
+        (
+            "src/contexts.ts",
+            "import * as React from 'react'; import { createContext } from 'react'; export const Theme = createContext('light'); const Session = React.createContext(null); Session.displayName = 'Session'; export default Session;",
+        ),
+        (
+            "src/App.tsx",
+            "import Session, { Theme } from './contexts'; import { Leaf } from './Leaf'; export function App() { return <Theme.Provider value='dark'><Leaf action='open' /><Session.Consumer>{(_session: unknown) => <Leaf action='close' />}</Session.Consumer></Theme.Provider>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let mut actions = report
+        .creations
+        .iter()
+        .inspect(|creation| assert_eq!(creation.reachability, Reachability::Reachable))
+        .flat_map(|creation| &creation.invocations)
+        .map(|invocation| invocation.arguments["action"].clone())
+        .collect::<Vec<_>>();
+    actions.sort_by_key(|value| format!("{value:?}"));
+    assert_eq!(
+        actions,
+        [
+            QueryValue::String {
+                value: "close".to_owned()
+            },
+            QueryValue::String {
+                value: "open".to_owned()
+            },
+        ],
+        "{:?}",
+        report.coverage.gaps
+    );
+}
+
+#[test]
 fn provider_fragment_object_rest_and_function_child_reach_leaf() {
     let fixture = TestProject::new(&[
         (

@@ -1860,6 +1860,27 @@ impl<'a> Solver<'a> {
                             }
                             return callback;
                         }
+                        "createContext" => {
+                            // A context Provider renders its children; a Consumer calls its
+                            // function child with the current value.
+                            let component = |export: &str, forward_children, invoke_children| {
+                                TrackedValue::plain(AbstractValue::ConfiguredComponent(
+                                    ComponentConsumer {
+                                        module: "react".to_owned(),
+                                        export: format!("createContext().{export}"),
+                                        forward_children,
+                                        invoke_children,
+                                        render_props: Vec::new(),
+                                        render_callback_names: Vec::new(),
+                                        component_props: Vec::new(),
+                                    },
+                                ))
+                            };
+                            return TrackedValue::plain(AbstractValue::record(BTreeMap::from([
+                                ("Provider".to_owned(), component("Provider", true, false)),
+                                ("Consumer".to_owned(), component("Consumer", false, true)),
+                            ])));
+                        }
                         "useState" => {
                             // The initializer only describes the first render. A later render
                             // can observe a setter update, including one scheduled by an effect.
@@ -2088,6 +2109,7 @@ impl<'a> Solver<'a> {
                         "useState" => Some("useState"),
                         "memo" => Some("memo"),
                         "forwardRef" => Some("forwardRef"),
+                        "createContext" => Some("createContext"),
                         _ => None,
                     })
                     .flatten()
@@ -2104,6 +2126,7 @@ impl<'a> Solver<'a> {
                         ("react", "useState") => Some("useState"),
                         ("react", "memo") => Some("memo"),
                         ("react", "forwardRef") => Some("forwardRef"),
+                        ("react", "createContext") => Some("createContext"),
                         _ => None,
                     },
                 ),
