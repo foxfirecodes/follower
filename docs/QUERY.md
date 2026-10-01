@@ -118,8 +118,11 @@ Include enum and constant definitions as explicit file roots. Leave the prefilte
 complete parse of the configured roots matters more than query latency. Parsed files are not yet
 cached across separate CLI runs. During each solver pass, module environments and resolved import
 links are reused; environments are invalidated when module globals initialize. Symbol linkage uses
-per-snapshot file and import-resolution indexes instead of repeatedly scanning the snapshot. Set
-`FOLLOWER_PROFILE_QUERY=1` to print generic phase timings and cache counts to stderr.
+per-snapshot file and import-resolution indexes instead of repeatedly scanning the snapshot.
+Solver values share closures, records, arrays, unions, and JSX elements and copy them only on
+write, so branch joins and calls do not deep-copy captured environments. Set
+`FOLLOWER_PROFILE_QUERY=1` to print generic phase timings and cache counts to stderr; use a release
+build when comparing timings.
 
 Configured `[[entries]]` modules are indexed even if the text prefilter does not match them. This
 does not index every source file: the initial parse still uses the filter, then import expansion

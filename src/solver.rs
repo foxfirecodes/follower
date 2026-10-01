@@ -47,12 +47,6 @@ struct FunctionKey {
 }
 
 #[derive(Clone)]
-struct FunctionDef {
-    key: FunctionKey,
-    function: FlowFunction,
-}
-
-#[derive(Clone)]
 struct TrackedValue {
     value: AbstractValue,
     evidence: Option<EvidenceId>,
@@ -88,19 +82,37 @@ enum AbstractValue {
         value: i64,
     },
     Boolean(bool),
-    Record(BTreeMap<String, TrackedValue>),
-    Array(Vec<TrackedValue>),
-    Union(Vec<TrackedValue>),
+    Record(Rc<BTreeMap<String, TrackedValue>>),
+    Array(Rc<Vec<TrackedValue>>),
+    Union(Rc<Vec<TrackedValue>>),
     Function(FunctionKey),
     Namespace(FileId),
     ModelFunction,
-    Closure(ClosureValue),
+    Closure(Rc<ClosureValue>),
     Capability(usize),
-    Element(ElementValue),
+    Element(Rc<ElementValue>),
     Intrinsic(String),
     ConfiguredComponent(ComponentConsumer),
     Undefined,
     Unknown(String),
+}
+
+impl AbstractValue {
+    fn record(fields: BTreeMap<String, TrackedValue>) -> Self {
+        Self::Record(Rc::new(fields))
+    }
+
+    fn array(elements: Vec<TrackedValue>) -> Self {
+        Self::Array(Rc::new(elements))
+    }
+
+    fn union(values: Vec<TrackedValue>) -> Self {
+        Self::Union(Rc::new(values))
+    }
+
+    fn element(element: ElementValue) -> Self {
+        Self::Element(Rc::new(element))
+    }
 }
 
 #[derive(Clone)]
@@ -372,10 +384,10 @@ struct Solver<'a> {
     project: &'a Project,
     snapshot: &'a Snapshot,
     model: CallbackFactoryModel,
-    functions: BTreeMap<FunctionKey, FunctionDef>,
+    functions: BTreeMap<FunctionKey, &'a FlowFunction>,
     symbol_linker: SymbolLinker<'a>,
     model_symbol: LinkedSymbol,
-    globals_ir: Vec<(FileId, FlowBinding)>,
+    globals_ir: Vec<(FileId, &'a FlowBinding)>,
     global_bindings: BTreeMap<LinkedSymbol, usize>,
     evaluating_globals: BTreeSet<usize>,
     initialized_globals: BTreeSet<usize>,
@@ -433,19 +445,12 @@ impl<'a> Solver<'a> {
                     file_id: file.file_id,
                     name: function.name.clone(),
                 };
-                functions.insert(
-                    key.clone(),
-                    FunctionDef {
-                        key,
-                        function: function.clone(),
-                    },
-                );
+                functions.insert(key, function);
             }
             globals_ir.extend(
                 file.flow
                     .globals
                     .iter()
-                    .cloned()
                     .map(|binding| (file.file_id, binding)),
             );
         }
@@ -584,10 +589,9 @@ impl<'a> Solver<'a> {
                         entry.module.display()
                     )
                 })?
-                .function
                 .params
                 .len();
-            let entry_span = self.functions[&entry_key].function.span.clone();
+            let entry_span = self.functions[&entry_key].span.clone();
 
             for props in self.entry_input_combinations(&entry.export)? {
                 let choice = choice_label(&props);
@@ -610,7 +614,7 @@ impl<'a> Solver<'a> {
                 let mut arguments = Vec::with_capacity(parameter_count.max(1));
                 if parameter_count > 0 {
                     arguments.push(TrackedValue {
-                        value: AbstractValue::Record(record),
+                        value: AbstractValue::record(record),
                         evidence: None,
                         choice: Some(choice),
                         heap_id: None,
@@ -775,7 +779,7 @@ impl<'a> Solver<'a> {
         if self.initialized_globals.contains(&index) {
             return;
         }
-        let (file_id, binding) = self.globals_ir[index].clone();
+        let (file_id, binding) = self.globals_ir[index];
         if !self.evaluating_globals.insert(index) {
             self.record_coverage_gap("cyclic module value initialization", &binding.span);
             return;
@@ -921,28 +925,28 @@ impl<'a> Solver<'a> {
                 "call depth budget exhausted",
                 self.functions.get(key).map_or_else(
                     || fallback_span(key.file_id),
-                    |def| def.function.span.clone(),
+                    |function| function.span.clone(),
                 ),
             );
             return TrackedValue::unknown("call_depth_budget_exhausted");
         }
-        let Some(definition) = self.functions.get(key).cloned() else {
+        let Some(function) = self.functions.get(key).copied() else {
             return TrackedValue::unknown(format!("missing_function:{}", key.name));
         };
         let trace_len = self.trace.len();
         if self
             .trace
             .last()
-            .is_none_or(|step| step.span != definition.function.span)
+            .is_none_or(|step| step.span != function.span)
         {
             self.trace.push(TraceStep {
                 kind: QueryCallPathKind::Call,
-                span: definition.function.span.clone(),
+                span: function.span.clone(),
             });
         }
         self.call_depth += 1;
         let mut environment = self.module_environment(key.file_id);
-        for (index, pattern) in definition.function.params.iter().enumerate() {
+        for (index, pattern) in function.params.iter().enumerate() {
             let value = arguments
                 .get(index)
                 .cloned()
@@ -955,11 +959,7 @@ impl<'a> Solver<'a> {
             );
         }
         self.active_captures.push(BTreeSet::new());
-        let returned = self.execute_statements(
-            &definition.function.body,
-            &mut environment,
-            definition.key.file_id,
-        );
+        let returned = self.execute_statements(&function.body, &mut environment, key.file_id);
         self.active_captures.pop();
         self.call_depth -= 1;
         self.trace.truncate(trace_len);
@@ -1084,7 +1084,7 @@ impl<'a> Solver<'a> {
                             );
                             match (left, right) {
                                 (Some(left), Some(right)) => {
-                                    return Some(TrackedValue::plain(AbstractValue::Union(vec![
+                                    return Some(TrackedValue::plain(AbstractValue::union(vec![
                                         left, right,
                                     ])));
                                 }
@@ -1104,7 +1104,7 @@ impl<'a> Solver<'a> {
                                         "unknown branch returns on only one path",
                                         span.clone(),
                                     );
-                                    return Some(TrackedValue::plain(AbstractValue::Union(vec![
+                                    return Some(TrackedValue::plain(AbstractValue::union(vec![
                                         value, continued,
                                     ])));
                                 }
@@ -1123,7 +1123,7 @@ impl<'a> Solver<'a> {
                                         "unknown branch returns on only one path",
                                         span.clone(),
                                     );
-                                    return Some(TrackedValue::plain(AbstractValue::Union(vec![
+                                    return Some(TrackedValue::plain(AbstractValue::union(vec![
                                         continued, value,
                                     ])));
                                 }
@@ -1283,7 +1283,7 @@ impl<'a> Solver<'a> {
             environment.insert(
                 name,
                 TrackedValue {
-                    value: AbstractValue::Union(values.into()),
+                    value: AbstractValue::union(values.into()),
                     evidence: Some(evidence),
                     choice: self.current_choice.clone(),
                     heap_id: None,
@@ -1433,7 +1433,7 @@ impl<'a> Solver<'a> {
             &format!("assign property {name}.{property}"),
         );
         value.evidence = Some(evidence);
-        fields.insert(property.to_owned(), value);
+        Rc::make_mut(&mut fields).insert(property.to_owned(), value);
         let updated = AbstractValue::Record(fields);
         if let Some(id) = previous.heap_id {
             self.heap.insert(id, Rc::new(updated.clone()));
@@ -1489,7 +1489,7 @@ impl<'a> Solver<'a> {
                     let remainder = match self.materialize(&value).value {
                         AbstractValue::Record(mut values) => {
                             for field in fields {
-                                values.remove(&field.source_property);
+                                Rc::make_mut(&mut values).remove(&field.source_property);
                             }
                             TrackedValue::plain(AbstractValue::Record(values))
                         }
@@ -1648,7 +1648,7 @@ impl<'a> Solver<'a> {
                         )
                     })
                     .collect();
-                TrackedValue::plain(AbstractValue::Record(values))
+                TrackedValue::plain(AbstractValue::record(values))
             }
             FlowExpressionKind::Array { elements } => {
                 self.eval_array_literal(elements, environment, file_id, &expression.span)
@@ -1749,7 +1749,7 @@ impl<'a> Solver<'a> {
                 match short_circuits {
                     Some(true) => left,
                     Some(false) => self.eval(right, environment, file_id),
-                    None => TrackedValue::plain(AbstractValue::Union(vec![
+                    None => TrackedValue::plain(AbstractValue::union(vec![
                         left,
                         self.eval(right, environment, file_id),
                     ])),
@@ -1772,7 +1772,7 @@ impl<'a> Solver<'a> {
                 match truthy(&test.value) {
                     Some(true) => self.eval(consequent, environment, file_id),
                     Some(false) => self.eval(alternate, environment, file_id),
-                    _ => TrackedValue::plain(AbstractValue::Union(vec![
+                    _ => TrackedValue::plain(AbstractValue::union(vec![
                         self.eval(consequent, environment, file_id),
                         self.eval(alternate, environment, file_id),
                     ])),
@@ -1907,8 +1907,8 @@ impl<'a> Solver<'a> {
                                 || TrackedValue::plain(AbstractValue::Undefined),
                                 |argument| self.eval(argument, environment, file_id),
                             );
-                            return TrackedValue::plain(AbstractValue::Array(vec![
-                                TrackedValue::plain(AbstractValue::Union(vec![
+                            return TrackedValue::plain(AbstractValue::array(vec![
+                                TrackedValue::plain(AbstractValue::union(vec![
                                     initial,
                                     TrackedValue::unknown("react_state_after_update"),
                                 ])),
@@ -1999,13 +1999,13 @@ impl<'a> Solver<'a> {
                     )
                 });
                 TrackedValue {
-                    value: AbstractValue::Closure(ClosureValue {
+                    value: AbstractValue::Closure(Rc::new(ClosureValue {
                         body: body.clone(),
                         params: params.clone(),
                         environment: captured,
                         file_id,
                         span: expression.span.clone(),
-                    }),
+                    })),
                     evidence,
                     choice: self.current_choice.clone(),
                     heap_id: None,
@@ -2094,7 +2094,7 @@ impl<'a> Solver<'a> {
                         self.record_coverage_gap("heap alternative budget exhausted", span);
                         AbstractValue::Unknown("heap_alternative_budget_exhausted".to_owned())
                     } else {
-                        AbstractValue::Union(alternatives)
+                        AbstractValue::union(alternatives)
                     }
                 }
                 (Some(value), _) | (_, Some(value)) => (**value).clone(),
@@ -2300,7 +2300,7 @@ impl<'a> Solver<'a> {
                 self.scan_callback_bodies(&returned, span, depth + 1);
             }
             AbstractValue::Array(values) | AbstractValue::Union(values) => {
-                for value in values {
+                for value in values.iter() {
                     self.scan_callback_bodies(value, span, depth + 1);
                 }
             }
@@ -2371,12 +2371,12 @@ impl<'a> Solver<'a> {
         }
         let mut values = alternatives
             .into_iter()
-            .map(|elements| TrackedValue::plain(AbstractValue::Array(elements)));
+            .map(|elements| TrackedValue::plain(AbstractValue::array(elements)));
         let first = values
             .next()
-            .unwrap_or_else(|| TrackedValue::plain(AbstractValue::Array(Vec::new())));
+            .unwrap_or_else(|| TrackedValue::plain(AbstractValue::array(Vec::new())));
         if let Some(second) = values.next() {
-            TrackedValue::plain(AbstractValue::Union(
+            TrackedValue::plain(AbstractValue::union(
                 std::iter::once(first)
                     .chain(std::iter::once(second))
                     .chain(values)
@@ -2413,7 +2413,8 @@ impl<'a> Solver<'a> {
             AbstractValue::Array(elements) => {
                 let original = TrackedValue::plain(AbstractValue::Array(elements.clone()));
                 let mapped = elements
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .enumerate()
                     .map(|(index, element)| {
                         self.invoke_value(
@@ -2430,10 +2431,10 @@ impl<'a> Solver<'a> {
                         )
                     })
                     .collect();
-                TrackedValue::plain(AbstractValue::Array(mapped))
+                TrackedValue::plain(AbstractValue::array(mapped))
             }
-            AbstractValue::Union(values) => TrackedValue::plain(AbstractValue::Union(
-                values
+            AbstractValue::Union(values) => TrackedValue::plain(AbstractValue::union(
+                Rc::unwrap_or_clone(values)
                     .into_iter()
                     .map(|value| self.eval_array_map_value(value, callback, span))
                     .collect(),
@@ -2469,7 +2470,7 @@ impl<'a> Solver<'a> {
                         }
                     }
                 }
-                TrackedValue::plain(AbstractValue::Array(vec![mapped]))
+                TrackedValue::plain(AbstractValue::array(vec![mapped]))
             }
             _ => {
                 self.mark_value_unresolved(
@@ -2492,7 +2493,7 @@ impl<'a> Solver<'a> {
             AbstractValue::Array(elements) if elements.len() <= 8 => {
                 let original = TrackedValue::plain(AbstractValue::Array(elements.clone()));
                 let mut subsets = vec![Vec::new()];
-                for (index, element) in elements.into_iter().enumerate() {
+                for (index, element) in elements.iter().cloned().enumerate() {
                     let predicate = self.invoke_value(
                         callback.clone(),
                         vec![
@@ -2525,12 +2526,12 @@ impl<'a> Solver<'a> {
                 }
                 let mut alternatives = subsets
                     .into_iter()
-                    .map(|elements| TrackedValue::plain(AbstractValue::Array(elements)));
+                    .map(|elements| TrackedValue::plain(AbstractValue::array(elements)));
                 let first = alternatives
                     .next()
-                    .unwrap_or_else(|| TrackedValue::plain(AbstractValue::Array(Vec::new())));
+                    .unwrap_or_else(|| TrackedValue::plain(AbstractValue::array(Vec::new())));
                 if let Some(second) = alternatives.next() {
-                    TrackedValue::plain(AbstractValue::Union(
+                    TrackedValue::plain(AbstractValue::union(
                         std::iter::once(first)
                             .chain(std::iter::once(second))
                             .chain(alternatives)
@@ -2540,8 +2541,8 @@ impl<'a> Solver<'a> {
                     first
                 }
             }
-            AbstractValue::Union(values) => TrackedValue::plain(AbstractValue::Union(
-                values
+            AbstractValue::Union(values) => TrackedValue::plain(AbstractValue::union(
+                Rc::unwrap_or_clone(values)
                     .into_iter()
                     .map(|value| self.eval_array_filter_value(value, callback, span))
                     .collect(),
@@ -2668,7 +2669,7 @@ impl<'a> Solver<'a> {
                 FlowJsxProp::Spread { value, span } => {
                     let spread = self.eval(value, environment, file_id);
                     if let AbstractValue::Record(fields) = spread.value {
-                        values.extend(fields);
+                        values.extend(Rc::unwrap_or_clone(fields));
                     } else {
                         self.mark_value_unresolved(
                             &spread,
@@ -2695,7 +2696,7 @@ impl<'a> Solver<'a> {
         {
             self.request_import_for_local(file_id, name);
         }
-        TrackedValue::plain(AbstractValue::Element(ElementValue {
+        TrackedValue::plain(AbstractValue::element(ElementValue {
             component: Box::new(component),
             props: values,
             span: expression.span.clone(),
@@ -2725,9 +2726,9 @@ impl<'a> Solver<'a> {
             }
         }
         let element = match value.value {
-            AbstractValue::Element(element) => element,
+            AbstractValue::Element(element) => Rc::unwrap_or_clone(element),
             AbstractValue::Array(values) | AbstractValue::Union(values) => {
-                for value in values {
+                for value in Rc::unwrap_or_clone(values) {
                     self.render(value);
                 }
                 return;
@@ -2790,7 +2791,7 @@ impl<'a> Solver<'a> {
             AbstractValue::Function(key) => {
                 let props = element.props.clone();
                 let argument = TrackedValue {
-                    value: AbstractValue::Record(element.props),
+                    value: AbstractValue::record(element.props),
                     evidence: element.component.evidence,
                     choice: element.component.choice.clone(),
                     heap_id: None,
@@ -2805,7 +2806,7 @@ impl<'a> Solver<'a> {
             }
             AbstractValue::Closure(closure) => {
                 let props = element.props.clone();
-                let argument = TrackedValue::plain(AbstractValue::Record(element.props));
+                let argument = TrackedValue::plain(AbstractValue::record(element.props));
                 let returned = self.invoke_value(
                     TrackedValue::plain(AbstractValue::Closure(closure.clone())),
                     vec![argument],
@@ -2850,7 +2851,7 @@ impl<'a> Solver<'a> {
                 }
                 for prop in &model.component_props {
                     if let Some(component) = element.props.get(prop) {
-                        self.render(TrackedValue::plain(AbstractValue::Element(ElementValue {
+                        self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
                             component: Box::new(component.clone()),
                             props: BTreeMap::new(),
                             span: element.span.clone(),
@@ -2882,8 +2883,8 @@ impl<'a> Solver<'a> {
                 }
             }
             AbstractValue::Union(components) => {
-                for component in components.clone() {
-                    self.render(TrackedValue::plain(AbstractValue::Element(ElementValue {
+                for component in components.iter().cloned() {
+                    self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
                         component: Box::new(component),
                         props: element.props.clone(),
                         span: element.span.clone(),
@@ -2910,7 +2911,7 @@ impl<'a> Solver<'a> {
     fn render_child_callback(&mut self, child: TrackedValue, span: &SourceSpan) {
         match child.value {
             AbstractValue::Array(children) | AbstractValue::Union(children) => {
-                for child in children {
+                for child in Rc::unwrap_or_clone(children) {
                     self.render_child_callback(child, span);
                 }
             }
@@ -3185,7 +3186,7 @@ impl<'a> Solver<'a> {
             let mut elements = vec![TrackedValue::unknown("unselected_return_element"); index + 1];
             elements[index] = capability;
             TrackedValue {
-                value: AbstractValue::Array(elements),
+                value: AbstractValue::array(elements),
                 evidence: Some(origin),
                 choice: self.current_choice.clone(),
                 heap_id: None,
@@ -3194,7 +3195,7 @@ impl<'a> Solver<'a> {
             let mut returned = capability;
             for property in self.model.returned_property.iter().rev() {
                 returned = TrackedValue {
-                    value: AbstractValue::Record(BTreeMap::from([(property.clone(), returned)])),
+                    value: AbstractValue::record(BTreeMap::from([(property.clone(), returned)])),
                     evidence: Some(origin),
                     choice: self.current_choice.clone(),
                     heap_id: None,
@@ -3263,9 +3264,10 @@ impl<'a> Solver<'a> {
             return value;
         }
         if let AbstractValue::Union(values) = object.value.clone() {
-            return TrackedValue::plain(AbstractValue::Union(
+            return TrackedValue::plain(AbstractValue::union(
                 values
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .map(|value| self.read_property(value, property, span.clone(), relation))
                     .collect(),
             ));
@@ -3434,7 +3436,7 @@ impl<'a> Solver<'a> {
                 let parameter_count = self
                     .functions
                     .get(key)
-                    .map_or(0, |definition| definition.function.params.len());
+                    .map_or(0, |function| function.params.len());
                 let arguments = (0..parameter_count)
                     .map(|_| TrackedValue::unknown("unreached_function_parameter"))
                     .collect();
@@ -3549,20 +3551,20 @@ impl<'a> Solver<'a> {
         let statements = candidate
             .enclosing_function
             .as_ref()
-            .and_then(|key| self.functions.get(key))
-            .map(|definition| definition.function.body.clone())
+            .and_then(|key| self.functions.get(key).copied())
+            .map(|function| function.body.as_slice())
             .unwrap_or_default();
-        let globals = self
-            .snapshot
+        let snapshot = self.snapshot;
+        let globals = snapshot
             .files
             .iter()
             .find(|file| file.file_id == candidate.file_id)
-            .map(|file| file.flow.globals.clone())
+            .map(|file| file.flow.globals.as_slice())
             .unwrap_or_default();
         for _ in 0..8 {
             let before = names.len();
-            extend_binding_dependencies(&statements, &mut names);
-            for binding in &globals {
+            extend_binding_dependencies(statements, &mut names);
+            for binding in globals {
                 if pattern_names(&binding.pattern)
                     .iter()
                     .any(|name| names.contains(*name))
@@ -4393,7 +4395,7 @@ fn collect_heap_alternatives(value: &AbstractValue, alternatives: &mut Vec<Track
         return;
     }
     if let AbstractValue::Union(values) = value {
-        for value in values {
+        for value in values.iter() {
             collect_heap_alternatives(&value.value, alternatives);
             if alternatives.len() > MAX_HEAP_ALTERNATIVES {
                 break;
@@ -4407,11 +4409,11 @@ fn collect_heap_alternatives(value: &AbstractValue, alternatives: &mut Vec<Track
 fn append_array_values(receiver: &AbstractValue, added: &[TrackedValue]) -> Option<AbstractValue> {
     match receiver {
         AbstractValue::Array(elements) => {
-            let mut result = elements.clone();
+            let mut result = elements.to_vec();
             result.extend_from_slice(added);
-            Some(AbstractValue::Array(result))
+            Some(AbstractValue::array(result))
         }
-        AbstractValue::Union(values) => Some(AbstractValue::Union(
+        AbstractValue::Union(values) => Some(AbstractValue::union(
             values
                 .iter()
                 .map(|value| {
@@ -4430,10 +4432,10 @@ fn append_array_values(receiver: &AbstractValue, added: &[TrackedValue]) -> Opti
 
 fn finite_array_parts(value: &AbstractValue) -> Option<Vec<Vec<TrackedValue>>> {
     match value {
-        AbstractValue::Array(elements) => Some(vec![elements.clone()]),
+        AbstractValue::Array(elements) => Some(vec![elements.to_vec()]),
         AbstractValue::Union(values) => {
             let mut parts = Vec::new();
-            for value in values {
+            for value in values.iter() {
                 parts.extend(finite_array_parts(&value.value)?);
                 if parts.len() > 64 {
                     return None;
@@ -4448,9 +4450,9 @@ fn finite_array_parts(value: &AbstractValue) -> Option<Vec<Vec<TrackedValue>>> {
 fn object_values(value: &AbstractValue) -> Option<AbstractValue> {
     match value {
         AbstractValue::Record(fields) => {
-            Some(AbstractValue::Array(fields.values().cloned().collect()))
+            Some(AbstractValue::array(fields.values().cloned().collect()))
         }
-        AbstractValue::Union(values) => Some(AbstractValue::Union(
+        AbstractValue::Union(values) => Some(AbstractValue::union(
             values
                 .iter()
                 .map(|value| Some(TrackedValue::plain(object_values(&value.value)?)))
@@ -4481,7 +4483,7 @@ fn collect_namespace_ids(value: &TrackedValue, ids: &mut BTreeSet<FileId>) {
             }
         }
         AbstractValue::Array(values) | AbstractValue::Union(values) => {
-            for value in values {
+            for value in values.iter() {
                 collect_namespace_ids(value, ids);
             }
         }
@@ -4744,7 +4746,7 @@ fn collect_capability_ids(value: &TrackedValue, ids: &mut Vec<usize>) {
             }
         }
         AbstractValue::Array(elements) | AbstractValue::Union(elements) => {
-            for element in elements {
+            for element in elements.iter() {
                 collect_capability_ids(element, ids);
             }
         }
@@ -4939,7 +4941,7 @@ fn refine_environment_for_condition(
             if narrowed.len() == 1 {
                 binding.value = narrowed.remove(0).value;
             } else if !narrowed.is_empty() {
-                binding.value = AbstractValue::Union(narrowed);
+                binding.value = AbstractValue::union(narrowed);
             }
         }
         _ => {}
