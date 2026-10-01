@@ -198,6 +198,183 @@ fn backward_use_walk_crosses_filtered_reexport() {
 }
 
 #[test]
+fn backward_use_walk_crosses_class_render_and_helper_method() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf() { const [, apply] = useItemSelection(['alpha']); apply('close'); return null; }",
+        ),
+        (
+            "src/Panel.tsx",
+            "import { Leaf } from './Leaf'; export class Panel { renderBody() { return <Leaf />; } render() { return this.renderBody(); } }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Panel } from './Panel'; export function App() { return <Panel />; }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1);
+    assert_eq!(
+        report.creations[0].reachability,
+        Reachability::Reachable,
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert_eq!(report.coverage.processed_files, 4);
+}
+
+#[test]
+fn configured_lazy_factory_connects_literal_dynamic_import_without_widening_parse() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf() { const [, apply] = useItemSelection(['alpha']); apply('close'); return null; }",
+        ),
+        (
+            "src/Page.tsx",
+            "import { Leaf } from './Leaf'; export default function Page() { return <Leaf />; }",
+        ),
+        (
+            "src/lazy.ts",
+            "export function loadComponent(_options: unknown) { return null; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { loadComponent } from './lazy'; const LazyPage = loadComponent({ loadModule: () => import('./Page') }); export function App() { return <LazyPage />; }",
+        ),
+        ("src/Noise.tsx", "export function Noise() { return null; }"),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[lazy_component_factories]]\nmodule = './lazy'\nexport = 'loadComponent'\npromise_property = 'loadModule'\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1);
+    assert_eq!(
+        report.creations[0].reachability,
+        Reachability::Reachable,
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert_eq!(report.coverage.processed_files, 4);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
+    let unmodeled = fixture.report();
+    assert_eq!(unmodeled.creations[0].reachability, Reachability::Unknown);
+}
+
+#[test]
+fn configured_route_render_prop_and_wrapper_connect_a_class_route_table() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf() { const [, apply] = useItemSelection(['alpha']); apply('close'); return null; }",
+        ),
+        (
+            "src/Chat.tsx",
+            "import { Leaf } from './Leaf'; import * as React from 'react'; function Chat() { return <Leaf />; } export default React.memo(Chat);",
+        ),
+        (
+            "src/wrap.tsx",
+            "export function protect(Component: any) { return function Protected() { return <Component />; }; }",
+        ),
+        (
+            "src/router.tsx",
+            "export function Route(_props: any) { return null; }",
+        ),
+        (
+            "src/View.tsx",
+            "import Chat from './Chat'; import { protect } from './wrap'; import { Route } from './router'; const routed = protect(Chat); const routes = [{render: routed}]; export class View { render() { return <Route render={routes[0].render} />; } }",
+        ),
+        (
+            "src/App.tsx",
+            "import { View } from './View'; export function App() { return <View />; }",
+        ),
+        (
+            "src/Unused.tsx",
+            "export function Unused() { return null; }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[component_wrappers]]\nmodule = './wrap'\nexport = 'protect'\ncomponent_argument = 0\n[[component_consumers]]\nmodule = './router'\nexport = 'Route'\nrender_props = ['render']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1);
+    assert_eq!(
+        report.creations[0].reachability,
+        Reachability::Reachable,
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert_eq!(report.coverage.processed_files, 5);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[component_wrappers]]\nmodule = './wrap'\nexport = 'protect'\ncomponent_argument = 0\n[[component_consumers]]\nmodule = './other-router'\nexport = 'Route'\nrender_props = ['render']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
+    let unmodeled_route = fixture.report();
+    assert_eq!(
+        unmodeled_route.creations[0].reachability,
+        Reachability::Unknown
+    );
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[component_wrappers]]\nmodule = './wrap'\nexport = 'protect'\ncomponent_argument = 0\n[[component_consumers]]\nmodule = './router'\nexport = 'Route'\nrender_props = ['render']\nrender_callback_names = ['Elsewhere']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
+    let filtered_route = fixture.report();
+    assert_eq!(
+        filtered_route.creations[0].reachability,
+        Reachability::Unknown
+    );
+    assert!(
+        filtered_route
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("configured render callback filter"))
+    );
+}
+
+#[test]
+fn provider_fragment_object_rest_and_function_child_reach_leaf() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf() { const [, apply] = useItemSelection(['alpha']); apply('close'); return null; }",
+        ),
+        (
+            "src/context.tsx",
+            "const Context = {Provider: (_props: unknown) => null}; export default Context;",
+        ),
+        (
+            "src/overlay.tsx",
+            "export default function Overlay(_props: unknown) { return null; }",
+        ),
+        (
+            "src/Wrapper.tsx",
+            "export function Wrapper({label, ...rest}: {label: string; children: unknown}) { return <div {...rest} />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import * as React from 'react'; import Context from './context'; import Overlay from './overlay'; import { Wrapper } from './Wrapper'; import { Leaf } from './Leaf'; export class App { render() { return <React.Fragment><Context.Provider><Wrapper label='x'><Overlay>{() => <Leaf />}</Overlay></Wrapper></Context.Provider></React.Fragment>; } }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[component_consumers]]\nmodule = './context'\nexport = 'default.Provider'\nforward_children = true\n[[component_consumers]]\nmodule = './overlay'\nexport = 'default'\ninvoke_children = true\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1, "{:?}", report.coverage.gaps);
+    assert_eq!(report.creations[0].reachability, Reachability::Reachable);
+}
+
+#[test]
 fn filtered_query_follows_callback_bearing_imports_across_multiple_files() {
     let fixture = TestProject::new(&[
         (

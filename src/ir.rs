@@ -185,10 +185,20 @@ pub struct FlowPattern {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FlowPatternKind {
-    Identifier { name: String },
-    Object { fields: Vec<FlowPatternField> },
-    Array { elements: Vec<Option<FlowPattern>> },
-    Unsupported { syntax: String },
+    Identifier {
+        name: String,
+    },
+    Object {
+        fields: Vec<FlowPatternField>,
+        #[serde(default)]
+        rest: Option<Box<FlowPattern>>,
+    },
+    Array {
+        elements: Vec<Option<FlowPattern>>,
+    },
+    Unsupported {
+        syntax: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -247,6 +257,9 @@ pub enum FlowExpressionKind {
     Call {
         callee: Box<FlowExpression>,
         arguments: Vec<FlowExpression>,
+    },
+    DynamicImport {
+        module: String,
     },
     StrictEquality {
         left: Box<FlowExpression>,
@@ -307,6 +320,47 @@ pub enum FlowArrowBody {
     Statements { statements: Vec<FlowStatement> },
 }
 
+/// Recognize a configured lazy factory only when one record property contains
+/// an arrow returning a literal dynamic import. The caller checks the factory
+/// symbol before using this result.
+pub fn lazy_component_import<'a>(
+    expression: &'a FlowExpression,
+    promise_property: &str,
+) -> Option<&'a str> {
+    let FlowExpressionKind::Call { arguments, .. } = &expression.kind else {
+        return None;
+    };
+    let FlowExpressionKind::Record { fields } = &arguments.first()?.kind else {
+        return None;
+    };
+    let callback = &fields
+        .iter()
+        .find(|field| field.property == promise_property)?
+        .value;
+    let FlowExpressionKind::Arrow { body, .. } = &callback.kind else {
+        return None;
+    };
+    let imported = match body {
+        FlowArrowBody::Expression { expression } => expression.as_ref(),
+        FlowArrowBody::Statements { statements } => {
+            let [
+                FlowStatement::Return {
+                    value: Some(expression),
+                    ..
+                },
+            ] = statements.as_slice()
+            else {
+                return None;
+            };
+            expression
+        }
+    };
+    match &imported.kind {
+        FlowExpressionKind::DynamicImport { module } => Some(module),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FlowJsxTag {
@@ -314,6 +368,11 @@ pub enum FlowJsxTag {
         name: String,
         intrinsic: bool,
         #[serde(default)]
+        module_binding: bool,
+    },
+    Member {
+        object: String,
+        property: String,
         module_binding: bool,
     },
     Unsupported {

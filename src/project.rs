@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use crate::ir::{FlowExpression, FlowExpressionKind, FlowFileIr};
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryPoint {
@@ -23,6 +25,42 @@ pub struct CallbackSelectorImport {
     pub module: String,
     pub export: String,
     pub callback_argument: usize,
+}
+
+/// An imported factory whose configured callback returns a lazy component module.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LazyComponentFactory {
+    pub module: String,
+    pub export: String,
+    pub promise_property: String,
+}
+
+/// An imported higher-order component that may render a component argument.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentWrapper {
+    pub module: String,
+    pub export: String,
+    pub component_argument: usize,
+}
+
+/// An imported component that may render one or more of its props.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentConsumer {
+    pub module: String,
+    pub export: String,
+    #[serde(default)]
+    pub forward_children: bool,
+    #[serde(default)]
+    pub invoke_children: bool,
+    #[serde(default)]
+    pub render_props: Vec<String>,
+    #[serde(default)]
+    pub render_callback_names: Vec<String>,
+    #[serde(default)]
+    pub component_props: Vec<String>,
 }
 
 fn default_schema_version() -> u32 {
@@ -50,7 +88,113 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub callback_selector_imports: Vec<CallbackSelectorImport>,
     #[serde(default)]
+    pub lazy_component_factories: Vec<LazyComponentFactory>,
+    #[serde(default)]
+    pub component_wrappers: Vec<ComponentWrapper>,
+    #[serde(default)]
+    pub component_consumers: Vec<ComponentConsumer>,
+    #[serde(default)]
     pub inputs: BTreeMap<String, Vec<String>>,
+}
+
+impl ProjectConfig {
+    pub fn imported_export(
+        &self,
+        file: &FlowFileIr,
+        expression: &FlowExpression,
+    ) -> Option<(String, String)> {
+        let (local, member) = match &expression.kind {
+            FlowExpressionKind::Identifier {
+                name,
+                module_binding: true,
+            } => (name.as_str(), None),
+            FlowExpressionKind::StaticMember { object, property } => {
+                let FlowExpressionKind::Identifier {
+                    name,
+                    module_binding: true,
+                } = &object.kind
+                else {
+                    return None;
+                };
+                (name.as_str(), Some(property.as_str()))
+            }
+            _ => return None,
+        };
+        let import = file
+            .imports
+            .iter()
+            .find(|import| import.local == local && !import.type_only)?;
+        let exported = match member {
+            Some(name) if import.imported == "*" => name,
+            Some(name) => {
+                return Some((
+                    import.module.clone(),
+                    format!("{}.{}", import.imported, name),
+                ));
+            }
+            None => import.imported.as_str(),
+        };
+        Some((import.module.clone(), exported.to_owned()))
+    }
+
+    pub fn lazy_factory_property<'a>(
+        &'a self,
+        file: &FlowFileIr,
+        callee: &FlowExpression,
+    ) -> Option<&'a str> {
+        let (local, member) = match &callee.kind {
+            FlowExpressionKind::Identifier {
+                name,
+                module_binding: true,
+            } => (name.as_str(), None),
+            FlowExpressionKind::StaticMember { object, property } => {
+                let FlowExpressionKind::Identifier {
+                    name,
+                    module_binding: true,
+                } = &object.kind
+                else {
+                    return None;
+                };
+                (name.as_str(), Some(property.as_str()))
+            }
+            _ => return None,
+        };
+        let import = file
+            .imports
+            .iter()
+            .find(|import| import.local == local && !import.type_only)?;
+        let exported = match member {
+            Some(name) if import.imported == "*" => name,
+            None => import.imported.as_str(),
+            _ => return None,
+        };
+        self.lazy_component_factories
+            .iter()
+            .find(|factory| factory.module == import.module && factory.export == exported)
+            .map(|factory| factory.promise_property.as_str())
+    }
+
+    pub fn component_wrapper<'a>(
+        &'a self,
+        file: &FlowFileIr,
+        callee: &FlowExpression,
+    ) -> Option<&'a ComponentWrapper> {
+        let (module, export) = self.imported_export(file, callee)?;
+        self.component_wrappers
+            .iter()
+            .find(|model| model.module == module && model.export == export)
+    }
+
+    pub fn component_consumer<'a>(
+        &'a self,
+        file: &FlowFileIr,
+        component: &FlowExpression,
+    ) -> Option<&'a ComponentConsumer> {
+        let (module, export) = self.imported_export(file, component)?;
+        self.component_consumers
+            .iter()
+            .find(|model| model.module == module && model.export == export)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +254,35 @@ impl Project {
         for selector in &config.callback_selector_imports {
             if selector.module.trim().is_empty() || selector.export.trim().is_empty() {
                 bail!("callback selector imports need a module and export name");
+            }
+        }
+        for factory in &config.lazy_component_factories {
+            if factory.module.trim().is_empty()
+                || factory.export.trim().is_empty()
+                || factory.promise_property.trim().is_empty()
+            {
+                bail!("lazy component factories need a module, export, and promise_property");
+            }
+        }
+        for wrapper in &config.component_wrappers {
+            if wrapper.module.trim().is_empty() || wrapper.export.trim().is_empty() {
+                bail!("component wrappers need a module and export");
+            }
+        }
+        for consumer in &config.component_consumers {
+            if consumer.module.trim().is_empty()
+                || consumer.export.trim().is_empty()
+                || consumer
+                    .render_props
+                    .iter()
+                    .chain(&consumer.component_props)
+                    .any(|prop| prop.trim().is_empty())
+                || consumer
+                    .render_callback_names
+                    .iter()
+                    .any(|name| name.trim().is_empty())
+            {
+                bail!("component consumers need a module, export, and nonempty prop names");
             }
         }
         let config_hash = hex::encode(Sha256::digest(source.as_bytes()));

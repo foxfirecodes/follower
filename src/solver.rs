@@ -18,11 +18,11 @@ use crate::{
     ir::{
         FlowArrowBody, FlowAssignmentTarget, FlowBinding, FlowExpression, FlowExpressionKind,
         FlowFunction, FlowJsxProp, FlowJsxTag, FlowLogicalOperator, FlowPattern, FlowPatternKind,
-        FlowStatement, SourceSpan,
+        FlowStatement, SourceSpan, lazy_component_import,
     },
     link::{LinkedSymbol, LinkedValue, SymbolLinker, ValueResolution, pattern_names},
     models::{CallbackFactoryModel, CaptureSource, ModelEvidence, ModelValue, ModeledOperation},
-    project::Project,
+    project::{ComponentConsumer, Project},
     queries::{AuditFinding, AuditReport, Conclusion, Coverage, FindingRef},
     query::{
         QueryCallsiteInventory, QueryCreation, QueryGap, QueryInvocation, QueryLocation,
@@ -35,6 +35,7 @@ const MAX_CALL_DEPTH: usize = 128;
 const MAX_REVERSE_IMPORTER_EVALUATIONS: usize = 5_000;
 const MAX_REVERSE_IMPORTER_SOURCE_BYTES: usize = 20_000;
 const MAX_HEAP_ALTERNATIVES: usize = 32;
+const MAX_RENDER_VISITS_PER_SITE: usize = 16;
 const TEXT_FILTER_GAP: &str =
     "directory sources were text-filtered; files without a configured term were not analyzed";
 
@@ -96,6 +97,7 @@ enum AbstractValue {
     Capability(usize),
     Element(ElementValue),
     Intrinsic(String),
+    ConfiguredComponent(ComponentConsumer),
     Undefined,
     Unknown(String),
 }
@@ -235,6 +237,7 @@ pub fn execute_query(
     query_hash: &str,
     reverse_seed_paths: &BTreeSet<std::path::PathBuf>,
     reverse_producer_paths: &BTreeSet<std::path::PathBuf>,
+    run_roots: bool,
 ) -> Result<(
     QueryReport,
     BTreeSet<std::path::PathBuf>,
@@ -278,8 +281,10 @@ pub fn execute_query(
             bail!("a reachable query requires at least one configured entry point");
         }
         solver.prepare_globals(None);
-    } else {
+    } else if run_roots {
         solver.run()?;
+    } else {
+        solver.prepare_globals(None);
     }
     if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
         eprintln!(
@@ -390,6 +395,7 @@ struct Solver<'a> {
     reverse_evaluations: usize,
     reverse_budget_active: bool,
     reverse_budget_reported: bool,
+    render_visits: BTreeMap<(Option<String>, FileId, u32, String), usize>,
 }
 
 impl<'a> Solver<'a> {
@@ -509,6 +515,7 @@ impl<'a> Solver<'a> {
             reverse_evaluations: 0,
             reverse_budget_active: false,
             reverse_budget_reported: false,
+            render_visits: BTreeMap::new(),
         })
     }
 
@@ -1429,7 +1436,7 @@ impl<'a> Solver<'a> {
                     },
                 );
             }
-            FlowPatternKind::Object { fields } => {
+            FlowPatternKind::Object { fields, rest } => {
                 for field in fields {
                     let selected = self.read_property(
                         value.clone(),
@@ -1438,6 +1445,25 @@ impl<'a> Solver<'a> {
                         relation,
                     );
                     self.bind_pattern(&field.target, selected, environment, relation);
+                }
+                if let Some(rest) = rest {
+                    let remainder = match self.materialize(&value).value {
+                        AbstractValue::Record(mut values) => {
+                            for field in fields {
+                                values.remove(&field.source_property);
+                            }
+                            TrackedValue::plain(AbstractValue::Record(values))
+                        }
+                        _ => {
+                            self.mark_value_unresolved(
+                                &value,
+                                "object rest source is not a known record",
+                                pattern.span.clone(),
+                            );
+                            TrackedValue::unknown("unknown_object_rest")
+                        }
+                    };
+                    self.bind_pattern(rest, remainder, environment, relation);
                 }
             }
             FlowPatternKind::Array { elements } => {
@@ -1527,6 +1553,15 @@ impl<'a> Solver<'a> {
                 }
                 if name == "undefined" && !module_binding {
                     return TrackedValue::plain(AbstractValue::Undefined);
+                }
+                if !module_binding && name.contains('.') {
+                    let key = FunctionKey {
+                        file_id,
+                        name: name.clone(),
+                    };
+                    if self.functions.contains_key(&key) {
+                        return TrackedValue::plain(AbstractValue::Function(key));
+                    }
                 }
                 if !module_binding {
                     return TrackedValue::unknown(format!("unresolved_local_identifier:{name}"));
@@ -1687,6 +1722,74 @@ impl<'a> Solver<'a> {
                 }
             }
             FlowExpressionKind::Call { callee, arguments } => {
+                if let Some(wrapper) = self
+                    .snapshot
+                    .files
+                    .iter()
+                    .find(|file| file.file_id == file_id)
+                    .and_then(|file| self.project.config.component_wrapper(&file.flow, callee))
+                    .cloned()
+                {
+                    let Some(component) = arguments.get(wrapper.component_argument) else {
+                        self.record_coverage_gap(
+                            "configured component wrapper argument is missing",
+                            &expression.span,
+                        );
+                        return TrackedValue::unknown("missing_wrapped_component");
+                    };
+                    let mut component = self.eval(component, environment, file_id);
+                    let evidence = self.push_evidence(
+                        RelationKind::ValueTransfer,
+                        "configured_component_wrapper",
+                        expression.span.clone(),
+                        component.evidence.into_iter().collect(),
+                        None,
+                        "configured wrapper may render its component argument",
+                    );
+                    component.evidence = Some(evidence);
+                    return component;
+                }
+                if let Some(property) = self
+                    .snapshot
+                    .files
+                    .iter()
+                    .find(|file| file.file_id == file_id)
+                    .and_then(|file| {
+                        self.project
+                            .config
+                            .lazy_factory_property(&file.flow, callee)
+                    })
+                    && let Some(module) = lazy_component_import(expression, property)
+                {
+                    let target = self
+                        .snapshot
+                        .files
+                        .iter()
+                        .find(|file| file.file_id == file_id)
+                        .and_then(|file| {
+                            self.snapshot.resolutions.iter().find(|resolution| {
+                                resolution.importer == file.path && resolution.specifier == module
+                            })
+                        })
+                        .and_then(|resolution| resolution.resolved_path.clone());
+                    if let Some(target) = target {
+                        if let Some(file) =
+                            self.snapshot.files.iter().find(|file| file.path == target)
+                        {
+                            let exported = self
+                                .symbol_linker
+                                .resolve_exported_value(file.file_id, "default");
+                            return self.linked_value(exported, &expression.span);
+                        }
+                        self.requested_imports.insert(target);
+                    } else {
+                        self.record_coverage_gap(
+                            "lazy component import did not resolve",
+                            &expression.span,
+                        );
+                    }
+                    return TrackedValue::unknown("unresolved_lazy_component");
+                }
                 if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
                     && property == "values"
                     && matches!(&object.kind, FlowExpressionKind::Identifier { name, .. } if name == "Object")
@@ -1852,6 +1955,9 @@ impl<'a> Solver<'a> {
             }
             FlowExpressionKind::JsxElement { tag, props } => {
                 self.create_element(tag, props, expression, environment, file_id)
+            }
+            FlowExpressionKind::DynamicImport { .. } => {
+                TrackedValue::unknown("unmodeled_dynamic_import")
             }
             FlowExpressionKind::Unsupported { syntax, references } => {
                 if syntax == "symbolic_for_of_iteration" {
@@ -2390,28 +2496,89 @@ impl<'a> Solver<'a> {
         environment: &Environment,
         file_id: FileId,
     ) -> TrackedValue {
-        let component = match tag {
-            FlowJsxTag::Identifier {
-                name,
-                intrinsic: true,
-                ..
-            } => TrackedValue::plain(AbstractValue::Intrinsic(name.clone())),
+        let configured = match tag {
             FlowJsxTag::Identifier {
                 name,
                 intrinsic: false,
-                module_binding,
-            } => self.eval(
-                &FlowExpression {
-                    kind: FlowExpressionKind::Identifier {
-                        name: name.clone(),
-                        module_binding: *module_binding,
+                ..
+            }
+            | FlowJsxTag::Member { object: name, .. } => self
+                .snapshot
+                .files
+                .iter()
+                .find(|file| file.file_id == file_id)
+                .and_then(|file| {
+                    let object = FlowExpression {
+                        kind: FlowExpressionKind::Identifier {
+                            name: name.clone(),
+                            module_binding: true,
+                        },
+                        span: expression.span.clone(),
+                    };
+                    let reference = match tag {
+                        FlowJsxTag::Member { property, .. } => FlowExpression {
+                            kind: FlowExpressionKind::StaticMember {
+                                object: Box::new(object),
+                                property: property.clone(),
+                            },
+                            span: expression.span.clone(),
+                        },
+                        _ => object,
+                    };
+                    self.project
+                        .config
+                        .component_consumer(&file.flow, &reference)
+                })
+                .cloned(),
+            _ => None,
+        };
+        let component = if let Some(model) = configured {
+            TrackedValue::plain(AbstractValue::ConfiguredComponent(model))
+        } else {
+            match tag {
+                FlowJsxTag::Identifier {
+                    name,
+                    intrinsic: true,
+                    ..
+                } => TrackedValue::plain(AbstractValue::Intrinsic(name.clone())),
+                FlowJsxTag::Identifier {
+                    name,
+                    intrinsic: false,
+                    module_binding,
+                } => self.eval(
+                    &FlowExpression {
+                        kind: FlowExpressionKind::Identifier {
+                            name: name.clone(),
+                            module_binding: *module_binding,
+                        },
+                        span: expression.span.clone(),
                     },
-                    span: expression.span.clone(),
-                },
-                environment,
-                file_id,
-            ),
-            FlowJsxTag::Unsupported { syntax } => TrackedValue::unknown(syntax.clone()),
+                    environment,
+                    file_id,
+                ),
+                FlowJsxTag::Unsupported { syntax } => TrackedValue::unknown(syntax.clone()),
+                FlowJsxTag::Member {
+                    object,
+                    property,
+                    module_binding,
+                } => self.eval(
+                    &FlowExpression {
+                        kind: FlowExpressionKind::StaticMember {
+                            object: Box::new(FlowExpression {
+                                kind: FlowExpressionKind::Identifier {
+                                    name: object.clone(),
+                                    module_binding: *module_binding,
+                                },
+                                span: expression.span.clone(),
+                            }),
+                            property: property.clone(),
+                        },
+                        span: expression.span.clone(),
+                    },
+                    environment,
+                    file_id,
+                ),
+            }
         };
         let mut values = BTreeMap::new();
         for prop in props {
@@ -2449,10 +2616,13 @@ impl<'a> Solver<'a> {
             }
         }
         if matches!(&component.value, AbstractValue::Unknown(_))
-            && values
-                .values()
-                .any(|value| !capability_ids(value).is_empty())
             && let FlowJsxTag::Identifier { name, .. } = tag
+            && (values.contains_key("children")
+                || values.contains_key("render")
+                || values.contains_key("component")
+                || values
+                    .values()
+                    .any(|value| !capability_ids(value).is_empty()))
         {
             self.request_import_for_local(file_id, name);
         }
@@ -2474,6 +2644,44 @@ impl<'a> Solver<'a> {
             }
             _ => return,
         };
+        let identity = match &element.component.value {
+            AbstractValue::Function(key) => format!("function:{}:{}", key.file_id.0, key.name),
+            AbstractValue::ConfiguredComponent(model) => {
+                let rendered = model
+                    .render_props
+                    .iter()
+                    .chain(&model.component_props)
+                    .filter_map(|prop| element.props.get(prop))
+                    .map(|value| match &value.value {
+                        AbstractValue::Function(key) => format!("{}:{}", key.file_id.0, key.name),
+                        AbstractValue::Closure(_) => "closure".to_owned(),
+                        _ => "other".to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("configured:{}#{}:{rendered}", model.module, model.export)
+            }
+            AbstractValue::Closure(_) => "closure".to_owned(),
+            AbstractValue::Intrinsic(name) => format!("intrinsic:{name}"),
+            _ => "other".to_owned(),
+        };
+        let key = (
+            self.current_choice.clone(),
+            element.span.file_id,
+            element.span.start,
+            identity,
+        );
+        let visits = self.render_visits.entry(key).or_default();
+        *visits += 1;
+        if *visits > MAX_RENDER_VISITS_PER_SITE {
+            self.record_coverage_gap("render visit budget exhausted", &element.span);
+            self.mark_values_unresolved(
+                element.props.values(),
+                "render visit budget exhausted",
+                element.span,
+            );
+            return;
+        }
         match &element.component.value {
             AbstractValue::Function(key) => {
                 let props = element.props.clone();
@@ -2515,6 +2723,47 @@ impl<'a> Solver<'a> {
                     }
                 }
             }
+            AbstractValue::ConfiguredComponent(model) => {
+                for prop in &model.render_props {
+                    if let Some(callback) = element.props.get(prop) {
+                        if !model.render_callback_names.is_empty()
+                            && !matches!(&callback.value, AbstractValue::Function(key)
+                                if model.render_callback_names.contains(&key.name))
+                        {
+                            self.record_coverage_gap(
+                                "configured render callback filter skipped a callback",
+                                &element.span,
+                            );
+                            continue;
+                        }
+                        let returned = self.invoke_value(
+                            callback.clone(),
+                            vec![TrackedValue::unknown("component_render_props")],
+                            element.span.clone(),
+                        );
+                        self.render(returned);
+                    }
+                }
+                for prop in &model.component_props {
+                    if let Some(component) = element.props.get(prop) {
+                        self.render(TrackedValue::plain(AbstractValue::Element(ElementValue {
+                            component: Box::new(component.clone()),
+                            props: BTreeMap::new(),
+                            span: element.span.clone(),
+                        })));
+                    }
+                }
+                if model.forward_children {
+                    if let Some(children) = element.props.get("children") {
+                        self.render(children.clone());
+                    }
+                }
+                if model.invoke_children {
+                    if let Some(children) = element.props.get("children") {
+                        self.render_child_callback(children.clone(), &element.span);
+                    }
+                }
+            }
             AbstractValue::Unknown(reason) => {
                 self.mark_values_unresolved(
                     element.props.values(),
@@ -2547,6 +2796,25 @@ impl<'a> Solver<'a> {
                         self.scan_callback_bodies(prop, &element.span, 0);
                     }
                 }
+            }
+        }
+    }
+
+    fn render_child_callback(&mut self, child: TrackedValue, span: &SourceSpan) {
+        match child.value {
+            AbstractValue::Array(children) | AbstractValue::Union(children) => {
+                for child in children {
+                    self.render_child_callback(child, span);
+                }
+            }
+            AbstractValue::Element(_) => self.render(child),
+            _ => {
+                let returned = self.invoke_value(
+                    child,
+                    vec![TrackedValue::unknown("render_child_props")],
+                    span.clone(),
+                );
+                self.render(returned);
             }
         }
     }
@@ -4177,6 +4445,17 @@ fn collect_expression_references(expression: &FlowExpression, references: &mut C
                     references.modules.insert(name.clone());
                 }
             }
+            if let FlowJsxTag::Member {
+                object,
+                module_binding,
+                ..
+            } = tag
+            {
+                references.names.insert(object.clone());
+                if *module_binding {
+                    references.modules.insert(object.clone());
+                }
+            }
             for prop in props {
                 match prop {
                     FlowJsxProp::Property { value, .. } | FlowJsxProp::Spread { value, .. } => {
@@ -4400,7 +4679,8 @@ fn query_value(value: &TrackedValue) -> QueryValue {
         | AbstractValue::Closure(_)
         | AbstractValue::Capability(_)
         | AbstractValue::Element(_)
-        | AbstractValue::Intrinsic(_) => QueryValue::Unknown {
+        | AbstractValue::Intrinsic(_)
+        | AbstractValue::ConfiguredComponent(_) => QueryValue::Unknown {
             reason: "non_data_value".to_owned(),
         },
     }
@@ -4641,6 +4921,7 @@ fn collect_factory_calls(
         | FlowExpressionKind::NumericEnumMember { .. }
         | FlowExpressionKind::Boolean { .. }
         | FlowExpressionKind::Identifier { .. }
+        | FlowExpressionKind::DynamicImport { .. }
         | FlowExpressionKind::Unsupported { .. } => {}
     }
 }
@@ -4768,6 +5049,7 @@ fn collect_import_uses(
         | FlowExpressionKind::NumericEnumMember { .. }
         | FlowExpressionKind::Boolean { .. }
         | FlowExpressionKind::Identifier { .. }
+        | FlowExpressionKind::DynamicImport { .. }
         | FlowExpressionKind::Unsupported { .. } => {}
     }
 }

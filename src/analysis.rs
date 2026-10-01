@@ -12,7 +12,7 @@ use crate::{
     cache::{FRONTEND_VERSION, SNAPSHOT_SCHEMA_VERSION, Snapshot},
     frontend::parse_and_lower,
     ids::FileId,
-    ir::{FileIr, FlowExport, SourceSpan},
+    ir::{FileIr, FlowExport, FlowExpressionKind, SourceSpan, lazy_component_import},
     link::{LinkedValue, ModuleLinker, SymbolLinker, ValueResolution, pattern_names},
     models::{Model, load_model_files},
     project::{Project, is_source_file},
@@ -171,7 +171,14 @@ impl SourceCatalog {
             if source.contains(&query.factory.export) {
                 candidate_paths.insert(path.clone());
             }
-            let specifiers = module_specifiers(&source);
+            let may_use_configured_lazy_factory = project
+                .config
+                .lazy_component_factories
+                .iter()
+                .any(|factory| {
+                    source.contains(&factory.module) && source.contains(&factory.export)
+                });
+            let specifiers = module_specifiers(&source, may_use_configured_lazy_factory);
             for specifier in specifiers {
                 if let Some(stem) = Path::new(&specifier)
                     .file_stem()
@@ -391,7 +398,7 @@ impl SourceCatalog {
     }
 }
 
-fn module_specifiers(source: &str) -> Vec<String> {
+fn module_specifiers(source: &str, include_dynamic_imports: bool) -> Vec<String> {
     let bytes = source.as_bytes();
     let mut specs = BTreeSet::new();
     let mut index = 0;
@@ -418,7 +425,11 @@ fn module_specifiers(source: &str) -> Vec<String> {
         while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
             next += 1;
         }
-        if keyword == b"require" && bytes.get(next) == Some(&b'(') {
+        if keyword == b"import" && bytes.get(next) == Some(&b'(') && !include_dynamic_imports {
+            index += keyword.len();
+            continue;
+        }
+        if (keyword == b"require" || keyword == b"import") && bytes.get(next) == Some(&b'(') {
             next += 1;
             while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
                 next += 1;
@@ -696,6 +707,42 @@ impl Analyzer {
                             );
                         }
                     }
+                    if exported.contains("default") {
+                        for binding in &importer.flow.globals {
+                            let FlowExpressionKind::Call { callee, .. } = &binding.value.kind
+                            else {
+                                continue;
+                            };
+                            let Some(property) = self
+                                .project
+                                .config
+                                .lazy_factory_property(&importer.flow, callee)
+                            else {
+                                continue;
+                            };
+                            let Some(module) = lazy_component_import(&binding.value, property)
+                            else {
+                                continue;
+                            };
+                            if !matches_target(module) {
+                                continue;
+                            }
+                            for owner in pattern_names(&binding.pattern) {
+                                enqueue_backward_task(
+                                    &mut pending,
+                                    &mut sequence,
+                                    corridor,
+                                    &path,
+                                    depth,
+                                    BackwardTask::Symbol {
+                                        file_id: importer_id,
+                                        symbol: owner.to_owned(),
+                                        depth,
+                                    },
+                                );
+                            }
+                        }
+                    }
                     for export in &importer.flow.exports {
                         let forwarded = match export {
                             FlowExport::ReExport {
@@ -776,6 +823,9 @@ impl Analyzer {
         let mut entry_path_not_found = 0;
         let mut corridor_seeds = BTreeSet::new();
         let mut entry_corridor = BTreeMap::new();
+        let mut run_roots = query.scope != crate::query::QueryScope::AllCreations
+            || self.project.config.entries.is_empty()
+            || self.project.config.source_contains_any.is_empty();
         for round in 0..=8 {
             let (mut report, requests, producers, reachable_seed_callsites) =
                 crate::solver::execute_query(
@@ -785,6 +835,7 @@ impl Analyzer {
                     query_hash,
                     &reverse_seed_paths,
                     &reverse_producer_paths,
+                    run_roots,
                 )?;
             if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
                 eprintln!(
@@ -899,6 +950,10 @@ impl Analyzer {
                 }
             }
             if additions.is_empty() || round == 8 || followed + additions.len() > 256 {
+                if additions.is_empty() && !run_roots && round < 8 {
+                    run_roots = true;
+                    continue;
+                }
                 if !additions.is_empty() {
                     report.coverage.gaps.push(format!(
                         "capability import expansion stopped after {followed} files and {round} rounds; {} requested files remain",

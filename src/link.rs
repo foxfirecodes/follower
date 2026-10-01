@@ -469,9 +469,10 @@ impl<'a> SymbolLinker<'a> {
 pub(crate) fn pattern_names(pattern: &FlowPattern) -> Vec<&str> {
     match &pattern.kind {
         FlowPatternKind::Identifier { name } => vec![name],
-        FlowPatternKind::Object { fields } => fields
+        FlowPatternKind::Object { fields, rest } => fields
             .iter()
             .flat_map(|field| pattern_names(&field.target))
+            .chain(rest.iter().flat_map(|rest| pattern_names(rest)))
             .collect(),
         FlowPatternKind::Array { elements } => {
             elements.iter().flatten().flat_map(pattern_names).collect()

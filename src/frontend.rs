@@ -194,6 +194,17 @@ impl<'a> Visit<'a> for SyntaxCollector {
         walk::walk_import_declaration(self, declaration);
     }
 
+    fn visit_import_expression(&mut self, expression: &oxc::ast::ast::ImportExpression<'a>) {
+        if let Expression::StringLiteral(source) = &expression.source {
+            self.imports.push(ImportIr {
+                specifier: source.value.to_string(),
+                span: owned_span(self.file_id, expression.span),
+                type_only: false,
+            });
+        }
+        walk::walk_import_expression(self, expression);
+    }
+
     fn visit_export_from_declaration(&mut self, declaration: &ExportFromDeclaration<'a>) {
         self.imports.push(ImportIr {
             specifier: declaration.source.value.to_string(),

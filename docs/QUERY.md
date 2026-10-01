@@ -137,6 +137,54 @@ individual references; strict exit checks use the count.
 callback argument. Each entry names the module, exported function, and zero-based argument index.
 This keeps library-specific selector behavior in the project definition.
 
+Reachability can use explicit contracts for imported routing and code-splitting helpers:
+
+```toml
+[[component_consumers]]
+module = "@sample/router"
+export = "Route"
+render_props = ["render"]
+component_props = ["component"]
+# For a focused run, optionally explore only named callbacks. Skips are coverage gaps.
+render_callback_names = ["showMain"]
+
+[[component_consumers]]
+module = "@sample/router"
+export = "Switch"
+forward_children = true
+
+[[component_consumers]]
+module = "@sample/overlay"
+export = "Overlay"
+invoke_children = true
+
+[[component_wrappers]]
+module = "@sample/auth"
+export = "withAccess"
+component_argument = 0
+
+[[lazy_component_factories]]
+module = "@sample/lazy"
+export = "loadComponent"
+promise_property = "loadModule"
+```
+
+A consumer contract explores the named render callback, component prop, children, or a
+function-valued child as a possible render. A wrapper contract says the returned component may
+render the component at the given argument index. A lazy factory contract recognizes a callback
+returning a literal `import()` and links its default export. These contracts describe possible
+paths, not guaranteed
+route matches, authorization, loading, or runtime rendering. Unconfigured imports and dynamic
+import expressions remain unknown. The backward walk still parses only candidate importer paths;
+class `render()` methods and direct `this.method()` calls can supply use edges without indexing
+every file.
+Object-rest props, JSX fragments, and configured member tags such as a context provider can
+forward children through the same slice. A configured render callback name filter is intended
+for focused traces; each skipped callback is reported as a coverage gap. Repeated renders at one
+source site are bounded to 16 visits per component and callback identity, with a coverage gap if
+the bound is reached. Filtered `all_creations` queries postpone entry execution until import and
+backward-use expansion has settled, avoiding repeated full entry walks during early rounds.
+
 ## Semantics
 
 - Each result is centered on one dynamic creation context. Multiple finite root inputs at the same

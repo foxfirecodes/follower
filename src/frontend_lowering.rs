@@ -2,11 +2,12 @@ use std::collections::BTreeSet;
 
 use oxc::{
     ast::ast::{
-        Argument, ArrayExpressionElement, ArrowFunctionBody, BindingPattern, Declaration,
-        ExportDefaultDeclarationKind, Expression, FormalParameters, Function, IdentifierReference,
-        ImportDeclaration, ImportDeclarationSpecifier, ImportOrExportKind, JSXAttributeItem,
-        JSXAttributeValue, JSXChild, JSXElement, JSXElementName, JSXExpression, ObjectPropertyKind,
-        SimpleAssignmentTarget, Statement, TSEnumDeclaration, VariableDeclaration,
+        Argument, ArrayExpressionElement, ArrowFunctionBody, BindingPattern, Class, ClassElement,
+        Declaration, ExportDefaultDeclarationKind, Expression, FormalParameters, Function,
+        IdentifierReference, ImportDeclaration, ImportDeclarationSpecifier, ImportOrExportKind,
+        JSXAttributeItem, JSXAttributeValue, JSXChild, JSXElement, JSXElementName, JSXExpression,
+        ObjectPropertyKind, SimpleAssignmentTarget, Statement, TSEnumDeclaration,
+        VariableDeclaration,
     },
     ast_visit::Visit,
     semantic::Scoping,
@@ -33,6 +34,7 @@ pub fn lower(
         file_id,
         output: FlowFileIr::default(),
         scoping,
+        current_class: None,
     };
     for statement in &program.body {
         lowerer.lower_top_level(statement);
@@ -59,6 +61,7 @@ struct Lowerer<'s> {
     file_id: FileId,
     output: FlowFileIr,
     scoping: &'s Scoping,
+    current_class: Option<String>,
 }
 
 impl Lowerer<'_> {
@@ -94,14 +97,13 @@ impl Lowerer<'_> {
                 self.output.globals.extend(bindings);
             }
             Statement::FunctionDeclaration(function) => self.lower_function(function),
+            Statement::ClassDeclaration(class) => self.lower_class(class),
             Statement::ExportDeclaration(export) => {
                 self.record_direct_exports(&export.declaration);
                 self.lower_declaration(&export.declaration);
             }
-            Statement::ExportDefaultDeclaration(export) => {
-                if let ExportDefaultDeclarationKind::FunctionDeclaration(function) =
-                    &export.declaration
-                {
+            Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+                ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
                     if let Some(identifier) = &function.id {
                         self.output.exports.push(FlowExport::Local {
                             local: identifier.name.to_string(),
@@ -111,12 +113,43 @@ impl Lowerer<'_> {
                         });
                     }
                     self.lower_function(function);
-                } else {
-                    self.output
-                        .unsupported
-                        .push(self.unsupported("unsupported_default_export", export.span));
                 }
-            }
+                ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                    if let Some(identifier) = &class.id {
+                        self.output.exports.push(FlowExport::Local {
+                            local: identifier.name.to_string(),
+                            exported: "default".to_owned(),
+                            type_only: false,
+                            span: self.span(export.span),
+                        });
+                    }
+                    self.lower_class(class);
+                }
+                declaration => {
+                    if let Some(expression) = declaration.as_expression() {
+                        let name = "__follower_default_export".to_owned();
+                        self.output.exports.push(FlowExport::Local {
+                            local: name.clone(),
+                            exported: "default".to_owned(),
+                            type_only: false,
+                            span: self.span(export.span),
+                        });
+                        self.output.globals.push(FlowBinding {
+                            lexical: true,
+                            pattern: FlowPattern {
+                                kind: FlowPatternKind::Identifier { name },
+                                span: self.span(export.span),
+                            },
+                            value: self.lower_expression(expression),
+                            span: self.span(export.span),
+                        });
+                    } else {
+                        self.output
+                            .unsupported
+                            .push(self.unsupported("unsupported_default_export", export.span));
+                    }
+                }
+            },
             Statement::ExportNamedDeclaration(export) => {
                 for specifier in &export.specifiers {
                     self.output.exports.push(FlowExport::Local {
@@ -176,6 +209,7 @@ impl Lowerer<'_> {
                 self.output.globals.extend(bindings);
             }
             Declaration::FunctionDeclaration(function) => self.lower_function(function),
+            Declaration::ClassDeclaration(class) => self.lower_class(class),
             Declaration::TSEnumDeclaration(declaration) => {
                 let binding = self.lower_enum(declaration);
                 self.output.globals.push(binding);
@@ -262,6 +296,10 @@ impl Lowerer<'_> {
             Declaration::TSEnumDeclaration(declaration) => {
                 (vec![declaration.id.name.to_string()], declaration.span)
             }
+            Declaration::ClassDeclaration(class) => (
+                class.id.iter().map(|id| id.name.to_string()).collect(),
+                class.span,
+            ),
             _ => return,
         };
         let span = self.span(span);
@@ -327,6 +365,53 @@ impl Lowerer<'_> {
         });
     }
 
+    fn lower_class(&mut self, class: &Class<'_>) {
+        let Some(identifier) = &class.id else {
+            self.output
+                .unsupported
+                .push(self.unsupported("anonymous_class", class.span));
+            return;
+        };
+        let class_name = identifier.name.to_string();
+        self.current_class = Some(class_name.clone());
+        for element in &class.body.body {
+            let ClassElement::MethodDefinition(method) = element else {
+                continue;
+            };
+            if method.r#static
+                || method.computed
+                || method.kind != oxc::ast::ast::MethodDefinitionKind::Method
+            {
+                continue;
+            }
+            let Some(method_name) = method.key.static_name() else {
+                continue;
+            };
+            let Some(body) = &method.value.body else {
+                continue;
+            };
+            let props = FlowPattern {
+                kind: FlowPatternKind::Identifier {
+                    name: "props".to_owned(),
+                },
+                span: self.span(method.span),
+            };
+            let mut params = vec![props];
+            params.extend(self.lower_params(&method.value.params));
+            self.output.functions.push(FlowFunction {
+                name: if method_name == "render" {
+                    class_name.clone()
+                } else {
+                    format!("{class_name}.{method_name}")
+                },
+                params,
+                body: self.lower_statements(&body.statements),
+                span: self.span(method.span),
+            });
+        }
+        self.current_class = None;
+    }
+
     fn lower_params(&self, params: &FormalParameters<'_>) -> Vec<FlowPattern> {
         params
             .items
@@ -340,7 +425,7 @@ impl Lowerer<'_> {
             BindingPattern::BindingIdentifier(identifier) => FlowPatternKind::Identifier {
                 name: identifier.name.to_string(),
             },
-            BindingPattern::ObjectPattern(object) if object.rest.is_none() => {
+            BindingPattern::ObjectPattern(object) => {
                 let fields = object
                     .properties
                     .iter()
@@ -355,7 +440,13 @@ impl Lowerer<'_> {
                         }
                     })
                     .collect();
-                FlowPatternKind::Object { fields }
+                FlowPatternKind::Object {
+                    fields,
+                    rest: object
+                        .rest
+                        .as_ref()
+                        .map(|rest| Box::new(self.lower_pattern(&rest.argument))),
+                }
             }
             BindingPattern::ArrayPattern(array) if array.rest.is_none() => FlowPatternKind::Array {
                 elements: array
@@ -603,6 +694,24 @@ impl Lowerer<'_> {
                 }
                 FlowExpressionKind::Array { elements }
             }
+            Expression::StaticMemberExpression(member)
+                if matches!(&member.object, Expression::ThisExpression(_))
+                    && self.current_class.is_some() =>
+            {
+                let property = member.property.name.as_str();
+                FlowExpressionKind::Identifier {
+                    name: if property == "props" {
+                        "props".to_owned()
+                    } else {
+                        format!(
+                            "{}.{}",
+                            self.current_class.as_deref().unwrap_or_default(),
+                            property
+                        )
+                    },
+                    module_binding: false,
+                }
+            }
             Expression::StaticMemberExpression(member) => FlowExpressionKind::StaticMember {
                 object: Box::new(self.lower_expression(&member.object)),
                 property: member.property.name.to_string(),
@@ -612,7 +721,7 @@ impl Lowerer<'_> {
                 property: Box::new(self.lower_expression(&member.expression)),
             },
             Expression::CallExpression(call) => {
-                let arguments = call
+                let mut arguments: Vec<_> = call
                     .arguments
                     .iter()
                     .map(|argument| match argument {
@@ -622,11 +731,35 @@ impl Lowerer<'_> {
                         _ => self.lower_expression(argument.to_expression()),
                     })
                     .collect();
+                if let Expression::StaticMemberExpression(member) = &call.callee
+                    && matches!(&member.object, Expression::ThisExpression(_))
+                    && self.current_class.is_some()
+                {
+                    arguments.insert(
+                        0,
+                        FlowExpression {
+                            kind: FlowExpressionKind::Identifier {
+                                name: "props".to_owned(),
+                                module_binding: false,
+                            },
+                            span: self.span(call.span),
+                        },
+                    );
+                }
                 FlowExpressionKind::Call {
                     callee: Box::new(self.lower_expression(&call.callee)),
                     arguments,
                 }
             }
+            Expression::ImportExpression(import) => match &import.source {
+                Expression::StringLiteral(source) => FlowExpressionKind::DynamicImport {
+                    module: source.value.to_string(),
+                },
+                _ => FlowExpressionKind::Unsupported {
+                    syntax: "nonliteral_dynamic_import".to_owned(),
+                    references: referenced_names(&import.source),
+                },
+            },
             Expression::BinaryExpression(binary)
                 if matches!(
                     binary.operator,
@@ -697,6 +830,13 @@ impl Lowerer<'_> {
                 }
             }
             Expression::JSXElement(element) => return self.lower_jsx_element(element),
+            Expression::JSXFragment(fragment) => FlowExpressionKind::Array {
+                elements: fragment
+                    .children
+                    .iter()
+                    .filter_map(|child| self.lower_jsx_child(child))
+                    .collect(),
+            },
             Expression::ParenthesizedExpression(parenthesized) => {
                 return self.lower_expression(&parenthesized.expression);
             }
@@ -735,6 +875,30 @@ impl Lowerer<'_> {
                 name: identifier.name.to_string(),
                 intrinsic: false,
                 module_binding: self.is_module_reference(identifier),
+            },
+            JSXElementName::MemberExpression(member)
+                if member.property.name == "Fragment"
+                    && matches!(&member.object, oxc::ast::ast::JSXMemberExpressionObject::IdentifierReference(identifier)
+                        if self.output.imports.iter().any(|import|
+                            import.local == identifier.name.as_str() && import.imported == "*" && import.module == "react")) =>
+            {
+                FlowJsxTag::Identifier {
+                    name: "fragment".to_owned(),
+                    intrinsic: true,
+                    module_binding: false,
+                }
+            }
+            JSXElementName::MemberExpression(member) => match &member.object {
+                oxc::ast::ast::JSXMemberExpressionObject::IdentifierReference(identifier) => {
+                    FlowJsxTag::Member {
+                        object: identifier.name.to_string(),
+                        property: member.property.name.to_string(),
+                        module_binding: self.is_module_reference(identifier),
+                    }
+                }
+                _ => FlowJsxTag::Unsupported {
+                    syntax: "nested_jsx_member_tag".to_owned(),
+                },
             },
             _ => FlowJsxTag::Unsupported {
                 syntax: "unsupported_jsx_tag".to_owned(),
