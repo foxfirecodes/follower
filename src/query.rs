@@ -149,6 +149,8 @@ pub fn load_query(path: &Path) -> Result<(QuerySpec, String)> {
 #[serde(rename_all = "snake_case")]
 pub enum Reachability {
     Reachable,
+    /// Reached from a configured root only if unmodeled components render the path.
+    Possible,
     Unknown,
 }
 
@@ -210,6 +212,8 @@ pub enum QueryCallPathKind {
     Call,
     Render,
     ModeledRender,
+    /// A render through a component whose behavior is not modeled.
+    AssumedRender,
     Factory,
     Invocation,
 }

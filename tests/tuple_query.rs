@@ -429,6 +429,94 @@ fn configured_route_render_prop_and_wrapper_connect_a_class_route_table() {
 }
 
 #[test]
+fn unmodeled_component_renders_children_and_jsx_props_as_possible_reachability() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf({ action }: { action: string }) { const [, apply] = useItemSelection(['alpha']); apply(action); return null; }",
+        ),
+        (
+            "src/Page.tsx",
+            "import { Leaf } from './Leaf'; export function Page() { return <Leaf action='component' />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Frame } from 'external-frame'; import { useItemSelection } from './hook'; import { Leaf } from './Leaf'; import { Page } from './Page'; export function App() { const [, select] = useItemSelection(['beta']); return <div><Leaf action='direct' /><Frame title='x'><Leaf action='child' /></Frame><Frame header={<Leaf action='element' />} render={() => <Leaf action='render' />} component={Page} onSelect={() => select('select')} /></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let mut by_action = report
+        .creations
+        .iter()
+        .flat_map(|creation| {
+            creation.invocations.iter().map(move |invocation| {
+                let QueryValue::String { value } = &invocation.arguments["action"] else {
+                    panic!("action is not a string: {invocation:?}");
+                };
+                (value.clone(), creation, invocation)
+            })
+        })
+        .collect::<Vec<_>>();
+    by_action.sort_by(|left, right| left.0.cmp(&right.0));
+    let actions = by_action
+        .iter()
+        .map(|(action, creation, _)| (action.as_str(), creation.reachability))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actions,
+        [
+            ("child", Reachability::Possible),
+            ("component", Reachability::Possible),
+            ("direct", Reachability::Reachable),
+            ("element", Reachability::Possible),
+            ("render", Reachability::Possible),
+        ],
+        "{:?}",
+        report.coverage.gaps
+    );
+    for (_, creation, invocation) in by_action
+        .iter()
+        .filter(|(_, creation, _)| creation.reachability == Reachability::Possible)
+    {
+        assert!(
+            invocation
+                .call_path
+                .iter()
+                .any(|step| step.kind == QueryCallPathKind::AssumedRender)
+        );
+        assert_ne!(creation.conclusion, Conclusion::AbsentWithinModel);
+        assert!(report.gaps.iter().any(|gap| {
+            gap.kind == "render_assumed_through_unmodeled_component"
+                && gap.assessment == QueryGapAssessment::Direct
+                && gap
+                    .links
+                    .iter()
+                    .any(|link| link.creation_id.as_deref() == Some(creation.creation_id.as_str()))
+        }));
+    }
+    let select = report
+        .creations
+        .iter()
+        .find(|creation| {
+            creation.reachability == Reachability::Reachable && creation.invocations.is_empty()
+        })
+        .expect("callback passed to the unmodeled component is not invoked");
+    assert_eq!(select.conclusion, Conclusion::Unresolved);
+}
+
+#[test]
 fn react_context_provider_and_consumer_render_children_without_contracts() {
     let fixture = TestProject::new(&[
         (

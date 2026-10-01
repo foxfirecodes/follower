@@ -412,6 +412,7 @@ struct Solver<'a> {
     caller_producer_files: BTreeSet<FileId>,
     current_choice: Option<String>,
     current_reachability: Reachability,
+    assumed_renders: Vec<SourceSpan>,
     current_reverse_importer: Option<ReverseImporterSeed>,
     call_depth: usize,
     active_captures: Vec<BTreeSet<String>>,
@@ -422,7 +423,7 @@ struct Solver<'a> {
     unreached_render_budget_active: bool,
     unreached_render_budget_reported: bool,
     unreached_render_seed_span: Option<SourceSpan>,
-    render_visits: BTreeMap<(Option<String>, FileId, u32, String), usize>,
+    render_visits: BTreeMap<(Option<String>, bool, FileId, u32, String), usize>,
     trace: Vec<TraceStep>,
 }
 
@@ -530,6 +531,7 @@ impl<'a> Solver<'a> {
             caller_producer_files: BTreeSet::new(),
             current_choice: None,
             current_reachability: Reachability::Reachable,
+            assumed_renders: Vec::new(),
             current_reverse_importer: None,
             call_depth: 0,
             active_captures: Vec::new(),
@@ -2713,13 +2715,12 @@ impl<'a> Solver<'a> {
         let previous_trace = std::mem::take(&mut self.trace);
         self.trace = merge_trace(&previous_trace, &element.trace);
         self.trace.push(TraceStep {
-            kind: if matches!(
-                element.component.value,
-                AbstractValue::ConfiguredComponent(_)
-            ) {
-                QueryCallPathKind::ModeledRender
-            } else {
-                QueryCallPathKind::Render
+            kind: match &element.component.value {
+                AbstractValue::ConfiguredComponent(_) => QueryCallPathKind::ModeledRender,
+                AbstractValue::Unknown(_) if self.current_reachability != Reachability::Unknown => {
+                    QueryCallPathKind::AssumedRender
+                }
+                _ => QueryCallPathKind::Render,
             },
             span: element.span.clone(),
         });
@@ -2744,8 +2745,10 @@ impl<'a> Solver<'a> {
             AbstractValue::Intrinsic(name) => format!("intrinsic:{name}"),
             _ => "other".to_owned(),
         };
+        // Assumed renders have their own budget so they cannot crowd out exact paths.
         let key = (
             self.current_choice.clone(),
+            self.current_reachability == Reachability::Possible,
             element.span.file_id,
             element.span.start,
             identity,
@@ -2856,6 +2859,9 @@ impl<'a> Solver<'a> {
                         self.scan_callback_bodies(prop, &element.span, 0);
                     }
                 }
+                if self.current_reachability != Reachability::Unknown {
+                    self.render_through_unmodeled_component(&element);
+                }
             }
             AbstractValue::Union(components) => {
                 for component in components.iter().cloned() {
@@ -2881,6 +2887,48 @@ impl<'a> Solver<'a> {
             }
         }
         self.trace = previous_trace;
+    }
+
+    /// Explores what an unmodeled component may render on a path from a configured root.
+    ///
+    /// Children, JSX-valued props, component props, and render functions that return JSX are
+    /// treated as rendered. Anything reached this way is only possibly reachable, and creations
+    /// record each assumed component so the assumption can be resolved later.
+    fn render_through_unmodeled_component(&mut self, element: &ElementValue) {
+        let previous = self.current_reachability;
+        self.current_reachability = Reachability::Possible;
+        self.assumed_renders.push(element.span.clone());
+        for value in element.props.values() {
+            match &value.value {
+                AbstractValue::Function(key) => {
+                    if self
+                        .functions
+                        .get(key)
+                        .is_some_and(|function| statements_render_jsx(&function.body))
+                    {
+                        self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
+                            component: Box::new(value.clone()),
+                            props: BTreeMap::new(),
+                            span: element.span.clone(),
+                            trace: self.trace.clone(),
+                        })));
+                    }
+                }
+                AbstractValue::Closure(closure) => {
+                    if arrow_body_renders_jsx(&closure.body) {
+                        let returned = self.invoke_value(
+                            value.clone(),
+                            vec![TrackedValue::unknown("unmodeled_component_argument")],
+                            element.span.clone(),
+                        );
+                        self.render(returned);
+                    }
+                }
+                _ => self.render(value.clone()),
+            }
+        }
+        self.assumed_renders.pop();
+        self.current_reachability = previous;
     }
 
     fn render_child_callback(&mut self, child: TrackedValue, span: &SourceSpan) {
@@ -3072,6 +3120,25 @@ impl<'a> Solver<'a> {
                 "projected factory argument contains an unknown or joined value",
             ));
             self.record_coverage_gap("uncertain callback factory capture", &span);
+        }
+        if self.current_reachability == Reachability::Possible {
+            let mut assumed = Vec::<SourceSpan>::new();
+            for span in &self.assumed_renders {
+                if !assumed.contains(span) {
+                    assumed.push(span.clone());
+                }
+            }
+            for span in assumed {
+                unresolved.push(self.push_evidence(
+                    RelationKind::UnresolvedEscape,
+                    "factory_callsite_reached_through_unmodeled_component",
+                    span.clone(),
+                    vec![origin],
+                    Some(self.model.id.clone()),
+                    "factory callsite is reached only if an unmodeled component renders it",
+                ));
+                self.record_coverage_gap("render assumed through unmodeled component", &span);
+            }
         }
         if self.current_reachability == Reachability::Unknown {
             unresolved.push(self.push_evidence(
@@ -4222,7 +4289,7 @@ impl<'a> Solver<'a> {
             })
             .collect();
         QueryReport {
-            schema_version: 7,
+            schema_version: 8,
             snapshot_id: self.snapshot.snapshot_id.clone(),
             config_hash: self.snapshot.config_hash.clone(),
             query_hash: query_hash.to_owned(),
@@ -4338,6 +4405,48 @@ fn gap_kind(reason: &str) -> String {
         );
     }
     kind.trim_matches('_').to_owned()
+}
+
+fn statements_render_jsx(statements: &[FlowStatement]) -> bool {
+    statements.iter().any(|statement| match statement {
+        FlowStatement::Return {
+            value: Some(value), ..
+        } => expression_renders_jsx(value),
+        FlowStatement::If {
+            consequent,
+            alternate,
+            ..
+        } => statements_render_jsx(consequent) || statements_render_jsx(alternate),
+        _ => false,
+    })
+}
+
+fn arrow_body_renders_jsx(body: &FlowArrowBody) -> bool {
+    match body {
+        FlowArrowBody::Expression { expression } => expression_renders_jsx(expression),
+        FlowArrowBody::Statements { statements } => statements_render_jsx(statements),
+    }
+}
+
+/// Returns whether a returned expression syntactically produces JSX.
+fn expression_renders_jsx(expression: &FlowExpression) -> bool {
+    match &expression.kind {
+        FlowExpressionKind::JsxElement { .. } => true,
+        FlowExpressionKind::Array { elements } => elements.iter().any(expression_renders_jsx),
+        FlowExpressionKind::Spread { value } => expression_renders_jsx(value),
+        FlowExpressionKind::Logical { left, right, .. } => {
+            expression_renders_jsx(left) || expression_renders_jsx(right)
+        }
+        FlowExpressionKind::Conditional {
+            consequent,
+            alternate,
+            ..
+        } => expression_renders_jsx(consequent) || expression_renders_jsx(alternate),
+        FlowExpressionKind::Call { arguments, .. } => arguments.iter().any(|argument| {
+            matches!(&argument.kind, FlowExpressionKind::Arrow { body, .. } if arrow_body_renders_jsx(body))
+        }),
+        _ => false,
+    }
 }
 
 fn capability_ids(value: &TrackedValue) -> Vec<usize> {

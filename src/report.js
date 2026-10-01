@@ -107,7 +107,7 @@
       const row = button('', () => { selectedCreation = creation.creation_id; renderCreationList(); renderCreationDetail(); }, `row ${creation.creation_id === selectedCreation ? 'active' : ''}`);
       const main = node('div', 'row-main');
       main.append(node('span', '', creation.choice || 'default context'), badge(status(creation), creation.conclusion));
-      if (creation.reachability === 'unknown') main.append(badge('reachability unknown', 'unknown'));
+      if (creation.reachability !== 'reachable') main.append(reachabilityBadge(creation));
       row.append(main, node('div', 'row-small mono', creation.creation_id));
       if (creation.reverse_importer) row.append(node('div', 'row-small', `via ${creation.reverse_importer.symbol || 'module binding'} · ${loc(creation.reverse_importer.location)}`));
       fragment.append(row);
@@ -130,9 +130,12 @@
   function relatedGaps(creation) {
     return report.gaps.filter(gap => gap.links.some(link => link.creation_id === creation.creation_id));
   }
+  function reachabilityBadge(creation) {
+    return creation.reachability === 'possible' ? badge('reachability possible', 'conditional') : badge('reachability unknown', 'unknown');
+  }
   function callPath(invocation, reachability) {
     const section = node('div', 'call-path');
-    section.append(node('h4', '', reachability === 'reachable' ? 'Path to this invocation' : 'Local path to this invocation'));
+    section.append(node('h4', '', reachability === 'reachable' ? 'Path to this invocation' : reachability === 'possible' ? 'Assumed path to this invocation' : 'Local path to this invocation'));
     const full = invocation.call_path || [];
     if (!full.length) {
       section.append(node('p', 'muted', 'No path was recorded. Rerun the query with the current engine.'));
@@ -140,7 +143,7 @@
     }
     const prefix = sharedDirectory(full.map(step => step.location));
     if (prefix) section.append(node('p', 'call-root mono muted', `Relative to ${prefix}`));
-    const compact = full.filter((step, index) => index === 0 || index === full.length - 1 || step.location.path !== full[index + 1].location.path || step.kind === 'factory' || step.kind === 'invocation');
+    const compact = full.filter((step, index) => index === 0 || index === full.length - 1 || step.location.path !== full[index + 1].location.path || step.kind === 'factory' || step.kind === 'invocation' || step.kind === 'assumed_render');
     const chain = node('ol', 'call-chain');
     let expanded = false;
     const toggle = button('', () => { expanded = !expanded; renderSteps(); });
@@ -157,7 +160,8 @@
     renderSteps();
     section.append(chain);
     if (compact.length < full.length) section.append(toggle);
-    section.append(node('p', 'aside', `${reachability === 'reachable' ? 'A possible path from a configured entry.' : 'Entry reachability is unknown; this path starts at a locally explored call.'} The compact view shows cross-file handoffs plus creation and invocation; the full view includes same-file calls and renders. Factory creation and callback invocation may occur at different times.`));
+    const reach = reachability === 'reachable' ? 'A possible path from a configured entry.' : reachability === 'possible' ? 'A path from a configured entry that holds only if each assumed render step renders what it was given; those components are not analyzed and each is listed as a gap.' : 'Entry reachability is unknown; this path starts at a locally explored call.';
+    section.append(node('p', 'aside', `${reach} The compact view shows cross-file handoffs plus creation and invocation; the full view includes same-file calls and renders. Factory creation and callback invocation may occur at different times.`));
     return section;
   }
   function renderCreationDetail() {
@@ -169,7 +173,7 @@
     const title = node('div');
     title.append(node('p', 'eyebrow', 'Creation context'), node('h2', '', creation.choice || 'default context'), node('p', 'mono muted', loc(creation.factory_location)));
     head.append(title, badge(status(creation), creation.conclusion));
-    if (creation.reachability === 'unknown') head.append(badge('reachability unknown', 'unknown'));
+    if (creation.reachability !== 'reachable') head.append(reachabilityBadge(creation));
     detail.append(head);
     const definition = node('dl', 'kv');
     [['Creation ID', creation.creation_id], ['Reachability', creation.reachability], ['Capability path', creation.capability_path.join(' → ') || 'return value'], ['Registrations', creation.registrations.length], ['Invocations', creation.invocations.length], ['Unresolved', creation.unresolved_count]].forEach(([label, value]) => definition.append(node('dt', '', label), node('dd', 'mono', value)));

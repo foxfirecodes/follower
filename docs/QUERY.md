@@ -139,8 +139,8 @@ first, the roots are still evaluated once on the final snapshot before the repor
 the stop remains a coverage gap. An import or symbol reference alone does not prove root reachability or
 runtime rendering. Unsupported dynamic loaders and registry wiring can still leave paths unknown;
 budget limits are reported as coverage gaps. Each expansion round currently rebuilds the solver and
-re-evaluates previously discovered reverse importer seeds. Query report schema version 7 records
-the seed's function or module binding, source location, matched import names, and evaluation mode
+re-evaluates previously discovered reverse importer seeds. Since query report schema version 7, the
+report records the seed's function or module binding, source location, matched import names, and evaluation mode
 in each creation's optional `reverse_importer` field. The HTML detail and creation list show it.
 `unresolved_count` remains available even when `include_unresolved_escapes = false` hides the
 individual references; strict exit checks use the count.
@@ -207,6 +207,15 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   remains a set of possible arrays instead of collapsing to one merged list. String enum members
   currently project to their string values.
 - `reachable` reports creations explored from configured entry points and finite input domains.
+- A path from an entry can pass through a component whose behavior is not modeled, such as one
+  imported from a file the text prefilter skipped or from an external package. The explorer then
+  assumes the component renders its children, JSX-valued props, component props, and render
+  functions that return JSX. Creations found below it have `reachability = "possible"`, an
+  unresolved reference at each assumed component, and a directly linked
+  `render_assumed_through_unmodeled_component` gap. Invocation paths mark the step as
+  `assumed_render`. Callbacks passed to the component are not called by this assumption. A
+  possible row is never upgraded to reachable; modeling or parsing the component can remove the
+  assumption.
 - `all_creations` additionally scans the owned IR for every resolved factory callsite. It explores
   an otherwise-unreached enclosing function once with unknown parameters. Such rows have
   `reachability = "unknown"`, an unresolved reference, and an incomplete-coverage gap; they are
@@ -222,10 +231,11 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   unresolved escapes. This includes `candidate_invocation` rows with gaps and ambiguous-linkage
   reports with no creation rows. The JSON report is still printed before the unsuccessful exit.
 
-Query report schema version 7 includes both stable source byte spans and file paths with one-based
+Query report schema version 8 includes both stable source byte spans and file paths with one-based
 line/column locations for factory calls and invocations. Each invocation now includes
-`call_path`: ordered entry, call, render, modeled render, factory, and invocation locations from
-the explored path. The HTML view shows file transitions by default and can expand every same-file
+`call_path`: ordered entry, call, render, modeled render, assumed render, factory, and invocation
+locations from the explored path. Version 8 adds `possible` reachability and `assumed_render` path
+steps. The HTML view shows file transitions by default and can expand every same-file
 step. The path is a modeled possibility; a factory call and later callback invocation need not
 occur in one runtime stack. JSON also includes
 `callsite_inventory`: syntactic calls found in parsed candidate files, labeled `analyzed`,
