@@ -116,6 +116,8 @@ struct BackwardUseWalk {
     reached_entry: bool,
     limit_hit: bool,
     skipped_files: usize,
+    /// Functions and module bindings whose uses lead toward a factory callsite.
+    symbols: BTreeSet<(FileId, String)>,
 }
 
 enum BackwardTask {
@@ -883,6 +885,7 @@ impl Analyzer {
                 }
             }
         }
+        result.symbols = visited;
         result
     }
 
@@ -932,6 +935,7 @@ impl Analyzer {
         let mut entry_path_not_found = 0;
         let mut corridor_seeds = BTreeSet::new();
         let mut entry_corridor = BTreeMap::new();
+        let mut use_chain = BTreeSet::new();
         let mut run_roots = query.scope != crate::query::QueryScope::AllCreations
             || self.project.config.entries.is_empty()
             || self.project.config.source_contains_any.is_empty();
@@ -944,6 +948,7 @@ impl Analyzer {
                 &reverse_seed_paths,
                 &reverse_producer_paths,
                 &entry_corridor,
+                &use_chain,
                 run_roots,
             )?
             .report;
@@ -973,6 +978,7 @@ impl Analyzer {
                 &reverse_seed_paths,
                 &reverse_producer_paths,
                 &entry_corridor,
+                &use_chain,
                 run_roots,
             )?;
             if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
@@ -1111,9 +1117,16 @@ impl Analyzer {
                         );
                     }
                     if walk.reached_entry && walk.added_files > 0 {
+                        use_chain.extend(walk.symbols);
                         followed += walk.added_files;
                         continue;
                     }
+                    // File IDs of rolled-back files will be reused, so keep only earlier symbols.
+                    use_chain.extend(
+                        walk.symbols
+                            .into_iter()
+                            .filter(|(file_id, _)| (file_id.0 as usize) < original_files),
+                    );
                     snapshot.files.truncate(original_files);
                     snapshot.resolutions.truncate(original_resolutions);
                     snapshot.snapshot_id = original_snapshot_id;

@@ -34,7 +34,7 @@ use crate::{
 const MAX_CALL_DEPTH: usize = 128;
 const MAX_REVERSE_IMPORTER_EVALUATIONS: usize = 5_000;
 const MAX_UNREACHED_RENDER_EVALUATIONS: usize = 5_000;
-const MAX_ASSUMED_RENDER_EVALUATIONS: usize = 20_000;
+const MAX_ASSUMED_RENDER_EVALUATIONS: usize = 200_000;
 const MAX_REVERSE_IMPORTER_SOURCE_BYTES: usize = 20_000;
 const MAX_HEAP_ALTERNATIVES: usize = 32;
 const MAX_RENDER_VISITS_PER_SITE: usize = 16;
@@ -282,6 +282,7 @@ pub fn execute_query(
     reverse_seed_paths: &BTreeSet<std::path::PathBuf>,
     reverse_producer_paths: &BTreeSet<std::path::PathBuf>,
     entry_corridor: &BTreeMap<std::path::PathBuf, usize>,
+    use_chain: &BTreeSet<(FileId, String)>,
     run_roots: bool,
 ) -> Result<QueryPass> {
     let captures = query
@@ -316,6 +317,13 @@ pub fn execute_query(
     };
     let mut solver = Solver::new(project, snapshot, model)?;
     solver.entry_corridor = entry_corridor.keys().cloned().collect();
+    solver.use_chain = use_chain
+        .iter()
+        .map(|(file_id, name)| FunctionKey {
+            file_id: *file_id,
+            name: name.clone(),
+        })
+        .collect();
     if !entry_corridor.is_empty() {
         let mut corridor_files = entry_corridor
             .keys()
@@ -446,6 +454,12 @@ struct Solver<'a> {
     entry_corridor: BTreeSet<std::path::PathBuf>,
     /// Files on the entry corridor plus factory hosts. Empty when the corridor is unknown.
     corridor_files: BTreeSet<FileId>,
+    /// Functions found by the backward use walk. Empty when no walk ran.
+    use_chain: BTreeSet<FunctionKey>,
+    /// Components already explored under an assumption, keyed by choice, component, and props.
+    assumed_component_renders: BTreeSet<(Option<String>, String, u64)>,
+    /// Counts budget stops that may have cut a render short.
+    render_truncations: usize,
     assumed_evaluations: usize,
     assumed_budget_reported: bool,
     capability_producer_files: BTreeSet<FileId>,
@@ -570,6 +584,9 @@ impl<'a> Solver<'a> {
             root_requested_imports: BTreeSet::new(),
             entry_corridor: BTreeSet::new(),
             corridor_files: BTreeSet::new(),
+            use_chain: BTreeSet::new(),
+            assumed_component_renders: BTreeSet::new(),
+            render_truncations: 0,
             assumed_evaluations: 0,
             assumed_budget_reported: false,
             capability_producer_files: BTreeSet::new(),
@@ -968,6 +985,7 @@ impl<'a> Solver<'a> {
 
     fn call_function(&mut self, key: &FunctionKey, arguments: Vec<TrackedValue>) -> TrackedValue {
         if self.call_depth >= MAX_CALL_DEPTH {
+            self.render_truncations += 1;
             self.mark_values_unresolved(
                 arguments.iter(),
                 "call depth budget exhausted",
@@ -2822,11 +2840,11 @@ impl<'a> Solver<'a> {
             if self.assumed_budget_exhausted() {
                 return;
             }
-            // Under an assumption, explore only what can lead toward a factory host: corridor
-            // components, or components handed JSX or callbacks from the path above.
+            // Under an assumption, explore only what can lead toward a factory host: components
+            // on a backward use chain (or, without one, in corridor files), or components handed
+            // JSX or callbacks from the path above.
             if let AbstractValue::Function(key) = &element.component.value
-                && !self.corridor_files.is_empty()
-                && !self.corridor_files.contains(&key.file_id)
+                && !self.leads_toward_factory(key)
                 && !element.props.values().any(|value| {
                     self.carries_render_content(value, 0) || !capability_ids(value).is_empty()
                 })
@@ -2869,6 +2887,68 @@ impl<'a> Solver<'a> {
             AbstractValue::Intrinsic(name) => format!("intrinsic:{name}"),
             _ => "other".to_owned(),
         };
+        // A shared wrapper renders different children at each use. Key its visits by the JSX it
+        // receives so one busy wrapper cannot exhaust the budget for content passed elsewhere.
+        let mut content = Vec::new();
+        for value in element.props.values() {
+            collect_render_content_sites(value, &mut content, 0);
+        }
+        content.sort_unstable();
+        content.dedup();
+        let identity = if content.is_empty() {
+            identity
+        } else {
+            format!(
+                "{identity}|{}",
+                content
+                    .iter()
+                    .map(|(file, start)| format!("{file}:{start}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        // Another assumed path to the same component with the same props would only repeat its
+        // results, so explore each such render once. A render cut short by a budget is not
+        // remembered, so a later path can still complete it.
+        let mut memo = None;
+        // Unions only dispatch to their alternatives, which are remembered individually.
+        if self.current_reachability == Reachability::Possible
+            && !matches!(
+                element.component.value,
+                AbstractValue::Intrinsic(_) | AbstractValue::Union(_)
+            )
+        {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for (name, value) in &element.props {
+                std::hash::Hash::hash(name, &mut hasher);
+                hash_value_fingerprint(&self.heap, value, &mut hasher, 0);
+            }
+            let fingerprint = std::hash::Hasher::finish(&hasher);
+            let component = match &element.component.value {
+                AbstractValue::Function(key) => format!("function:{}:{}", key.file_id.0, key.name),
+                AbstractValue::Closure(closure) => {
+                    format!("closure:{}:{}", closure.file_id.0, closure.span.start)
+                }
+                AbstractValue::ConfiguredComponent(model) => {
+                    format!("configured:{}#{}", model.module, model.export)
+                }
+                AbstractValue::Unknown(_) | AbstractValue::AssumedWrapper { .. } => {
+                    format!("unknown:{}:{}", element.span.file_id.0, element.span.start)
+                }
+                _ => format!(
+                    "other:{}:{}:{}",
+                    element.span.file_id.0,
+                    element.span.start,
+                    render_compact_value(&element.component)
+                ),
+            };
+            let memo_key = (self.current_choice.clone(), component, fingerprint);
+            if !self.assumed_component_renders.insert(memo_key.clone()) {
+                self.trace = previous_trace;
+                return;
+            }
+            memo = Some((memo_key, self.render_truncations));
+        }
         // Assumed renders have their own budget so they cannot crowd out exact paths.
         let key = (
             self.current_choice.clone(),
@@ -2880,6 +2960,10 @@ impl<'a> Solver<'a> {
         let visits = self.render_visits.entry(key).or_default();
         *visits += 1;
         if *visits > MAX_RENDER_VISITS_PER_SITE {
+            self.render_truncations += 1;
+            if let Some((memo_key, _)) = &memo {
+                self.assumed_component_renders.remove(memo_key);
+            }
             self.record_coverage_gap("render visit budget exhausted", &element.span);
             self.mark_values_unresolved(
                 element.props.values(),
@@ -3025,6 +3109,11 @@ impl<'a> Solver<'a> {
                 }
             }
         }
+        if let Some((memo_key, truncations)) = memo
+            && self.render_truncations != truncations
+        {
+            self.assumed_component_renders.remove(&memo_key);
+        }
         self.trace = previous_trace;
     }
 
@@ -3093,12 +3182,20 @@ impl<'a> Solver<'a> {
         }
     }
 
+    fn leads_toward_factory(&self, key: &FunctionKey) -> bool {
+        if !self.use_chain.is_empty() {
+            return self.use_chain.contains(key) || self.corridor_files.is_empty();
+        }
+        self.corridor_files.is_empty() || self.corridor_files.contains(&key.file_id)
+    }
+
     /// Counts one assumed-render step and reports when the per-root budget is exhausted.
     fn assumed_budget_exhausted(&mut self) -> bool {
         self.assumed_evaluations += 1;
         if self.assumed_evaluations <= MAX_ASSUMED_RENDER_EVALUATIONS {
             return false;
         }
+        self.render_truncations += 1;
         if !self.assumed_budget_reported {
             self.assumed_budget_reported = true;
             if let Some(span) = self.assumed_renders.first().cloned() {
@@ -4614,6 +4711,98 @@ fn gap_kind(reason: &str) -> String {
         );
     }
     kind.trim_matches('_').to_owned()
+}
+
+/// Hashes the parts of a value that can change what a component renders or invokes.
+fn hash_value_fingerprint(
+    heap: &BTreeMap<u64, Rc<AbstractValue>>,
+    value: &TrackedValue,
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    depth: usize,
+) {
+    use std::hash::Hash;
+    if depth > 12 {
+        "<deep>".hash(hasher);
+        return;
+    }
+    // A heap-backed value is read through its current heap cell.
+    let current = value
+        .heap_id
+        .and_then(|id| heap.get(&id))
+        .map(|current| TrackedValue::plain((**current).clone()));
+    let value = current.as_ref().unwrap_or(value);
+    match &value.value {
+        AbstractValue::Null => "null".hash(hasher),
+        AbstractValue::Undefined => "undefined".hash(hasher),
+        AbstractValue::String(value) => ("s", value).hash(hasher),
+        AbstractValue::Number(value) => ("n", value).hash(hasher),
+        AbstractValue::Boolean(value) => ("b", value).hash(hasher),
+        AbstractValue::EnumMember {
+            enum_name,
+            member_name,
+            ..
+        } => ("e", enum_name, member_name).hash(hasher),
+        AbstractValue::Record(fields) => {
+            "record".hash(hasher);
+            for (name, value) in fields.iter() {
+                name.hash(hasher);
+                hash_value_fingerprint(heap, value, hasher, depth + 1);
+            }
+        }
+        AbstractValue::Array(values) | AbstractValue::Union(values) => {
+            ("list", values.len()).hash(hasher);
+            for value in values.iter() {
+                hash_value_fingerprint(heap, value, hasher, depth + 1);
+            }
+        }
+        AbstractValue::Function(key) => ("fn", key.file_id.0, &key.name).hash(hasher),
+        AbstractValue::Namespace(file_id) => ("ns", file_id.0).hash(hasher),
+        AbstractValue::ModelFunction => "model".hash(hasher),
+        AbstractValue::Closure(closure) => {
+            ("closure", closure.file_id.0, closure.span.start).hash(hasher);
+            for (name, value) in &closure.environment {
+                name.hash(hasher);
+                hash_value_fingerprint(heap, value, hasher, depth + 1);
+            }
+        }
+        AbstractValue::Capability(id) => ("cap", id).hash(hasher),
+        AbstractValue::Element(element) => {
+            ("el", element.span.file_id.0, element.span.start).hash(hasher);
+            hash_value_fingerprint(heap, &element.component, hasher, depth + 1);
+            for (name, value) in &element.props {
+                name.hash(hasher);
+                hash_value_fingerprint(heap, value, hasher, depth + 1);
+            }
+        }
+        AbstractValue::Intrinsic(name) => ("intrinsic", name).hash(hasher),
+        AbstractValue::ConfiguredComponent(model) => {
+            ("cfg", &model.module, &model.export).hash(hasher);
+        }
+        AbstractValue::Unknown(reason) => ("unknown", reason).hash(hasher),
+        AbstractValue::AssumedWrapper { wrapped, .. } => {
+            "wrapper".hash(hasher);
+            for value in wrapped.iter() {
+                hash_value_fingerprint(heap, value, hasher, depth + 1);
+            }
+        }
+    }
+}
+
+/// Collects source sites of JSX elements and render functions carried by a prop value.
+fn collect_render_content_sites(value: &TrackedValue, sites: &mut Vec<(u32, u32)>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    match &value.value {
+        AbstractValue::Element(element) => sites.push((element.span.file_id.0, element.span.start)),
+        AbstractValue::Closure(closure) => sites.push((closure.span.file_id.0, closure.span.start)),
+        AbstractValue::Array(values) | AbstractValue::Union(values) => {
+            for value in values.iter() {
+                collect_render_content_sites(value, sites, depth + 1);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn statements_render_jsx(statements: &[FlowStatement]) -> bool {

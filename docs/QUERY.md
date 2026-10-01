@@ -199,8 +199,9 @@ Object-rest props, JSX fragments, and configured member tags can forward childre
 same slice. Contexts created by React `createContext` need no contract: their `Provider` renders
 its children and their `Consumer` calls its function child. A configured render callback name filter is intended
 for focused traces; each skipped callback is reported as a coverage gap. Repeated renders at one
-source site are bounded to 16 visits per component and callback identity, with a coverage gap if
-the bound is reached. Filtered `all_creations` queries postpone entry execution until import and
+source site are bounded to 16 visits per component and callback identity and per set of JSX it
+receives, with a coverage gap if the bound is reached; a wrapper used in many places therefore
+still renders the children given at each use. Filtered `all_creations` queries postpone entry execution until import and
 backward-use expansion has settled, avoiding repeated full entry walks during early rounds.
 
 ## Semantics
@@ -222,9 +223,13 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   possible row is never upgraded to reachable; modeling or parsing the component can remove the
   assumption. Function children are called like render functions. A call to an unknown function
   that receives a component, such as an unmodeled higher-order component, returns a value that may
-  render that component with the element's props. Under an assumption, components from files off
-  the entry corridor are skipped unless they receive JSX or callbacks, and assumed rendering has a
-  20,000-step budget per entry input; exhausting it is a coverage gap.
+  render that component with the element's props. Under an assumption, a component is explored
+  only if the backward use walk found it on a use chain toward a factory callsite (or, when no walk
+  ran, if its file is on the entry corridor), or if it receives JSX or callbacks. If the walk stops
+  at its budget, components it did not reach can be skipped; the stop is reported as a gap. A
+  component is explored once per entry input for the same props, which removes repeated paths
+  that would only duplicate results. Assumed rendering has a 200,000-step budget per entry input;
+  exhausting it is a coverage gap.
 - `all_creations` additionally scans the owned IR for every resolved factory callsite. It explores
   an otherwise-unreached enclosing function once with unknown parameters. Such rows have
   `reachability = "unknown"`, an unresolved reference, and an incomplete-coverage gap; they are

@@ -596,6 +596,123 @@ fn unmodeled_higher_order_component_renders_wrapped_component_as_possible() {
 }
 
 #[test]
+fn conditional_component_renders_children_under_an_assumption() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf({ action }: { action: string }) { const [, apply] = useItemSelection(['alpha']); apply(action); return null; }",
+        ),
+        (
+            "src/Panel.tsx",
+            "import { Tab } from 'external-tabs'; import { Leaf } from './Leaf'; export function Panel({ tabbed }: { tabbed: boolean }) { const Box = tabbed ? Tab : 'section'; return <Box><Leaf action='boxed' /></Box>; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Frame } from 'external-frame'; import { Panel } from './Panel'; export function App({ tabbed }: { tabbed: boolean }) { return <Frame><Panel tabbed={tabbed} /><Panel tabbed={tabbed} /></Frame>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    assert!(
+        report.creations.iter().any(|creation| {
+            creation.reachability == Reachability::Possible && creation.invocations.len() == 1
+        }),
+        "{:?}",
+        report.coverage.gaps
+    );
+}
+
+#[test]
+fn shared_provider_renders_children_at_every_use() {
+    // One provider element site is shared by every use of the wrapper component. Its visit
+    // budget must not stop later uses from rendering their own children.
+    let uses = (0..20)
+        .map(|index| format!("<Shell><Leaf action='use-{index}' /></Shell>"))
+        .collect::<Vec<_>>()
+        .concat();
+    let app = format!(
+        "import {{ Shell }} from './shell'; import {{ Leaf }} from './Leaf'; export function App() {{ return <div>{uses}</div>; }}"
+    );
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf({ action }: { action: string }) { const [, apply] = useItemSelection(['alpha']); apply(action); return null; }",
+        ),
+        (
+            "src/shell.tsx",
+            "import * as React from 'react'; const ShellContext = React.createContext(null); export function Shell({ children }: { children: unknown }) { return <ShellContext.Provider value={null}>{children}</ShellContext.Provider>; }",
+        ),
+        ("src/App.tsx", app.as_str()),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let actions = report
+        .creations
+        .iter()
+        .filter(|creation| creation.reachability == Reachability::Reachable)
+        .flat_map(|creation| &creation.invocations)
+        .map(|invocation| format!("{:?}", invocation.arguments["action"]))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actions.len(), 20, "{:?}", report.coverage.gaps);
+}
+
+#[test]
+fn provider_component_forwards_children_through_typed_context() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf() { const [, apply] = useItemSelection(['alpha']); apply('open'); return null; }",
+        ),
+        (
+            "src/location.tsx",
+            "import * as React from 'react'; type Locations = string[]; export const LocationContext = React.createContext<Locations>([]); export function LocationProvider({children, value}: {children: React.ReactNode; value: Locations}) { return <LocationContext.Provider value={value}>{children}</LocationContext.Provider>; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { LocationProvider } from './location'; import { Leaf } from './Leaf'; export function App({ flag }: { flag: boolean }) { return <LocationProvider value={['a']}>{flag ? <span /> : null}<div><Leaf /></div></LocationProvider>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1, "{:?}", report.coverage.gaps);
+    assert_eq!(report.creations[0].reachability, Reachability::Reachable);
+    assert_eq!(report.creations[0].invocations.len(), 1);
+}
+
+#[test]
 fn react_context_provider_and_consumer_render_children_without_contracts() {
     let fixture = TestProject::new(&[
         (
