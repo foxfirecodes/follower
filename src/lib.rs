@@ -5,6 +5,7 @@ pub mod cache;
 pub mod evidence;
 pub mod frontend;
 mod frontend_lowering;
+pub mod html_report;
 pub mod ids;
 pub mod ir;
 pub mod link;

@@ -39,6 +39,12 @@ Run it with:
 follower query --project flow.toml --query query.toml --format json
 ```
 
+Add `--html-report` to write an interactive, self-contained report to a new owner-readable file
+in `/tmp`. The command prints its path to stderr and leaves JSON or text stdout unchanged. Set
+`[report] html = true` in the query TOML to generate it on every run. The report is also written
+before a `--fail-on-unresolved` failure. It contains query values and paths, so treat the file as
+private and remove it when finished.
+
 For a hook that returns `[selectedItem, applyAction]`, select the second element with
 `returned_index = 1` instead of `returned_property`. These selectors are mutually exclusive.
 Use `scan_callback_bodies = true` at the top level of the query when you want calls inside
@@ -139,7 +145,7 @@ This keeps library-specific selector behavior in the project definition.
   unresolved escapes. This includes `candidate_invocation` rows with gaps and ambiguous-linkage
   reports with no creation rows. The JSON report is still printed before the unsuccessful exit.
 
-Query report schema version 4 includes both stable source byte spans and repository-relative,
+Query report schema version 5 includes both stable source byte spans and repository-relative,
 one-based line/column locations for factory calls and invocations. JSON also includes
 `callsite_inventory`: syntactic calls found in parsed candidate files, labeled `analyzed`,
 `filtered`, `unresolved`, or `skipped`. Inventory discovery scans every configured source for the
@@ -148,6 +154,14 @@ an independent check on the solver's creation rows, but dynamic property calls a
 by assignments can still escape the syntactic inventory. The report gives configured and candidate
 file counts plus any importer candidates skipped by the inventory budget. The text renderer uses
 `path:line:column` and prints inventory counts; JSON retains locations and the evidence graph.
+Each projected argument also has an optional evidence ID. The `gaps` array gives each coverage
+gap a stable ID, kind, location when available, context choice, assessment, and links to affected
+creations, argument projections, or inventory callsites. `direct` means the solver recorded
+unresolved evidence for that creation or an unknown factory projection at that call. `may_affect`
+is a possible relationship at an invocation or excluded callsite. `unknown_relevance` means the
+gap's impact could not be established; `unlinked` means no source location or target was available.
+The old `coverage.gaps` strings remain for compatibility. A gap link is static provenance, not
+proof that an event executed at runtime.
 Snapshot reuse is not implemented yet.
 
 ## Current analysis fragment

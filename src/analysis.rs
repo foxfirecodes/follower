@@ -345,6 +345,7 @@ impl Analyzer {
             }
             if self.project.config.source_contains_any.is_empty() {
                 self.attach_callsite_inventory(&mut report, &snapshot, query, None)?;
+                report.finish_gaps();
                 return Ok(report);
             }
             reverse_producer_paths.extend(producers);
@@ -395,6 +396,7 @@ impl Analyzer {
                     report.coverage.complete = false;
                 }
                 self.attach_callsite_inventory(&mut report, &snapshot, query, catalog.as_ref())?;
+                report.finish_gaps();
                 return Ok(report);
             }
             followed += additions.len();

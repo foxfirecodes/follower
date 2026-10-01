@@ -1,0 +1,233 @@
+(() => {
+  'use strict';
+  const report = JSON.parse(document.getElementById('report-data').textContent);
+  const app = document.getElementById('app');
+  app.innerHTML = `<main class="shell">
+    <header class="top"><div><p class="eyebrow">Follower / Query report</p><h1 id="title"></h1><p class="sub" id="subtitle"></p></div><div class="snapshot mono" id="snapshot"></div></header>
+    <div class="metrics" id="metrics"></div>
+    <nav class="tabs" aria-label="Report sections"><button class="tab active" data-tab="creations">Creations</button><button class="tab" data-tab="coverage">Coverage</button><button class="tab" data-tab="evidence">Evidence</button></nav>
+    <section id="creations" class="panel active"><div class="toolbar"><input class="search" id="creation-search" type="search" placeholder="Search creation, choice, value, or file" aria-label="Search creations"><select class="filter" id="creation-filter" aria-label="Filter creation status"><option value="all">All conclusions</option><option value="candidate_invocation">Invoked</option><option value="unresolved">Unresolved</option><option value="absent_within_model">No invocation</option></select><span class="count" id="creation-count"></span></div><div class="split"><div class="list"><div class="list-title">Creation contexts</div><div id="creation-list"></div></div><div class="detail" id="creation-detail"></div></div></section>
+    <section id="coverage" class="panel"><div class="notice" id="coverage-notice"></div><div class="coverage-grid"><div class="coverage-card"><header><h2>Coverage gaps</h2><span class="count" id="gap-count"></span></header><div class="toolbar"><input class="search" id="gap-search" type="search" placeholder="Search gaps" aria-label="Search gaps"><select class="filter" id="gap-filter" aria-label="Filter gap assessment"><option value="all">All assessments</option><option value="direct">Direct</option><option value="may_affect">May affect</option><option value="unknown_relevance">Unknown relevance</option><option value="unlinked">Unlinked</option></select></div><div id="gap-list"></div></div><div class="coverage-card"><header><h2>Callsite inventory</h2><span class="count" id="inventory-count"></span></header><div class="toolbar"><input class="search" id="inventory-search" type="search" placeholder="Search file or reason" aria-label="Search callsites"><select class="filter" id="inventory-filter" aria-label="Filter callsite status"><option value="all">All callsites</option><option value="analyzed">Analyzed</option><option value="filtered">Filtered</option><option value="unresolved">Unresolved</option><option value="skipped">Skipped</option></select></div><div id="inventory-list"></div></div></div></section>
+    <section id="evidence" class="panel"><div class="evidence-card"><div class="toolbar"><input class="search" id="evidence-search" type="search" placeholder="Search evidence ID, rule, summary" aria-label="Search evidence"><span class="count" id="evidence-count"></span></div><div id="evidence-list" class="evidence-list"></div></div></section>
+    <p class="footer">Static analysis describes possible flow within configured roots and model limits. A candidate invocation does not prove runtime execution. This file is self-contained and stored locally.</p>
+  </main>`;
+
+  const $ = selector => document.querySelector(selector);
+  const node = (tag, className, content) => {
+    const element = document.createElement(tag);
+    if (className) element.className = className;
+    if (content !== undefined) element.textContent = String(content);
+    return element;
+  };
+  const button = (label, handler, className='button') => {
+    const element = node('button', className, label);
+    element.type = 'button';
+    element.addEventListener('click', handler);
+    return element;
+  };
+  const badge = (label, type=label) => node('span', `chip ${type}`, label.replaceAll('_', ' '));
+  const loc = location => location ? `${location.path}:${location.start_line}:${location.start_column}` : 'location unavailable';
+  const status = creation => creation.conclusion === 'candidate_invocation' ? 'candidate invocation' : creation.conclusion === 'absent_within_model' ? 'no invocation' : 'unresolved';
+  const valueText = value => {
+    if (!value) return '—';
+    switch (value.kind) {
+      case 'null': return 'null';
+      case 'undefined': return 'undefined';
+      case 'string': return JSON.stringify(value.value);
+      case 'number': case 'boolean': return String(value.value);
+      case 'enum_member': return `${value.enum_name}.${value.member_name}`;
+      case 'array': return `[${value.elements.map(valueText).join(', ')}]`;
+      case 'alternatives': return value.values.map(valueText).join('  |  ');
+      case 'unknown': return `unknown (${value.reason})`;
+      default: return JSON.stringify(value);
+    }
+  };
+  const certainty = value => {
+    if (!value) return 'unknown';
+    if (value.kind === 'unknown') return 'unknown';
+    const children = value.kind === 'array' ? value.elements : value.kind === 'alternatives' ? value.values : [];
+    if (children.some(child => certainty(child) === 'unknown')) return 'unknown';
+    if (value.kind === 'alternatives' || children.some(child => certainty(child) === 'conditional')) return 'conditional';
+    return 'exact';
+  };
+  const evidenceById = new Map(report.evidence.map(item => [`E${item.id}`, item]));
+  const creationById = new Map(report.creations.map(item => [item.creation_id, item]));
+  const tabs = [...document.querySelectorAll('.tab')];
+  function showTab(name) {
+    tabs.forEach(tab => tab.classList.toggle('active', tab.dataset.tab === name));
+    document.querySelectorAll('.panel').forEach(panel => panel.classList.toggle('active', panel.id === name));
+  }
+  tabs.forEach(tab => tab.addEventListener('click', () => showTab(tab.dataset.tab)));
+
+  $('#title').textContent = report.query_id;
+  $('#subtitle').textContent = `${report.kind.replaceAll('_', ' ')} · ${report.scope.replaceAll('_', ' ')}`;
+  $('#snapshot').textContent = `snapshot ${report.snapshot_id.slice(0, 16)} · schema ${report.schema_version}`;
+  const unresolvedCount = report.creations.filter(creation => creation.unresolved.length).length;
+  const metrics = [
+    ['Creations', report.creations.length],
+    ['Candidate calls', report.creations.reduce((sum, creation) => sum + creation.invocations.length, 0)],
+    ['Unresolved rows', unresolvedCount],
+    ['Coverage gaps', report.gaps.length],
+    ['Callsites', report.callsite_inventory.callsites.length],
+  ];
+  metrics.forEach(([label, count]) => {
+    const card = node('div', `metric ${label === 'Coverage gaps' && count ? 'alert' : ''}`);
+    card.append(node('strong', '', count), node('span', '', label));
+    $('#metrics').append(card);
+  });
+
+  let selectedCreation = report.creations[0]?.creation_id;
+  let creationLimit = 120;
+  const creationsBySite = [...report.creations].sort((a, b) =>
+    loc(a.factory_location).localeCompare(loc(b.factory_location)) || a.choice.localeCompare(b.choice));
+  const creationSearch = $('#creation-search');
+  const creationFilter = $('#creation-filter');
+  const creationHaystack = creation => [creation.creation_id, creation.choice, loc(creation.factory_location), ...Object.values(creation.factory_arguments).map(valueText), ...creation.invocations.flatMap(invocation => Object.values(invocation.arguments).map(valueText))].join(' ').toLowerCase();
+  function renderCreationList() {
+    const search = creationSearch.value.trim().toLowerCase();
+    const filtered = creationsBySite.filter(creation => (creationFilter.value === 'all' || creation.conclusion === creationFilter.value) && (!search || creationHaystack(creation).includes(search)));
+    $('#creation-count').textContent = `${filtered.length} of ${report.creations.length}`;
+    const list = $('#creation-list');
+    list.replaceChildren();
+    if (!filtered.length) { list.append(node('p', 'empty', 'No matching creations.')); return; }
+    const fragment = document.createDocumentFragment();
+    let group = '';
+    filtered.slice(0, creationLimit).forEach(creation => {
+      const site = loc(creation.factory_location);
+      if (site !== group) { group = site; fragment.append(node('div', 'group-title mono', site)); }
+      const row = button('', () => { selectedCreation = creation.creation_id; renderCreationList(); renderCreationDetail(); }, `row ${creation.creation_id === selectedCreation ? 'active' : ''}`);
+      const main = node('div', 'row-main');
+      main.append(node('span', '', creation.choice || 'default context'), badge(status(creation), creation.conclusion));
+      if (creation.reachability === 'unknown') main.append(badge('reachability unknown', 'unknown'));
+      row.append(main, node('div', 'row-small mono', creation.creation_id));
+      fragment.append(row);
+    });
+    list.append(fragment);
+    if (filtered.length > creationLimit) list.append(button(`Show more (${filtered.length - creationLimit} remaining)`, () => { creationLimit += 120; renderCreationList(); }, 'load'));
+  }
+  function valueRows(values, evidenceMap={}) {
+    const wrap = node('div');
+    Object.entries(values).forEach(([label, value]) => {
+      const row = node('div', 'value-row');
+      row.append(node('span', 'value-label', label), badge(certainty(value)), node('span', 'value-text mono', valueText(value)));
+      const evidenceId = evidenceMap[label];
+      if (evidenceId) row.append(button(evidenceId, () => showEvidence(evidenceId)));
+      wrap.append(row);
+    });
+    if (!Object.keys(values).length) wrap.append(node('p', 'muted', 'No projected arguments.'));
+    return wrap;
+  }
+  function relatedGaps(creation) {
+    return report.gaps.filter(gap => gap.links.some(link => link.creation_id === creation.creation_id));
+  }
+  function renderCreationDetail() {
+    const detail = $('#creation-detail');
+    detail.replaceChildren();
+    const creation = creationById.get(selectedCreation);
+    if (!creation) { detail.append(node('p', 'empty', 'Choose a creation context to inspect its flow.')); return; }
+    const head = node('div', 'detail-head');
+    const title = node('div');
+    title.append(node('p', 'eyebrow', 'Creation context'), node('h2', '', creation.choice || 'default context'), node('p', 'mono muted', loc(creation.factory_location)));
+    head.append(title, badge(status(creation), creation.conclusion));
+    if (creation.reachability === 'unknown') head.append(badge('reachability unknown', 'unknown'));
+    detail.append(head);
+    const definition = node('dl', 'kv');
+    [['Creation ID', creation.creation_id], ['Reachability', creation.reachability], ['Capability path', creation.capability_path.join(' → ') || 'return value'], ['Registrations', creation.registrations.length], ['Invocations', creation.invocations.length], ['Unresolved', creation.unresolved.length]].forEach(([label, value]) => definition.append(node('dt', '', label), node('dd', 'mono', value)));
+    detail.append(definition);
+    const factory = node('div', 'section'); factory.append(node('h3', '', 'Factory arguments'), valueRows(creation.factory_arguments, creation.factory_argument_evidence)); detail.append(factory);
+    const invocations = node('div', 'section'); invocations.append(node('h3', '', `Invocations (${creation.invocations.length})`));
+    creation.invocations.forEach(invocation => {
+      const card = node('div', 'invocation'); const top = node('div', 'invocation-head');
+      top.append(node('span', 'mono', loc(invocation.location)), button(invocation.evidence_id, () => showEvidence(invocation.evidence_id)));
+      card.append(top, valueRows(invocation.arguments, invocation.argument_evidence)); invocations.append(card);
+    });
+    if (!creation.invocations.length) invocations.append(node('p', 'muted', 'No invocation found within the explored model.'));
+    detail.append(invocations);
+    const gaps = relatedGaps(creation);
+    const caveats = node('div', 'section'); caveats.append(node('h3', '', `Linked coverage gaps (${gaps.length})`));
+    gaps.forEach(gap => { const line = node('div', 'mini'); line.append(badge(gap.assessment), node('span', '', ` ${gap.summary}`)); caveats.append(line); });
+    if (!gaps.length) caveats.append(node('p', 'muted', 'No gap was directly linked to this creation. Check Coverage for gaps with unknown relevance.'));
+    detail.append(caveats);
+  }
+  creationSearch.addEventListener('input', () => { creationLimit = 120; renderCreationList(); });
+  creationFilter.addEventListener('change', () => { creationLimit = 120; renderCreationList(); });
+
+  $('#coverage-notice').textContent = report.coverage.complete ? 'Coverage is complete within the configured model and source scope.' : 'Coverage is incomplete. Direct links are proven by solver evidence; “may affect” is possible; unknown relevance and unlinked gaps need manual review.';
+  let gapLimit = 100;
+  function renderGaps() {
+    const search = $('#gap-search').value.trim().toLowerCase();
+    const filter = $('#gap-filter').value;
+    const filtered = report.gaps.filter(gap => (filter === 'all' || gap.assessment === filter) && (!search || `${gap.kind} ${gap.summary} ${loc(gap.location)}`.toLowerCase().includes(search)));
+    $('#gap-count').textContent = `${filtered.length} of ${report.gaps.length}`;
+    const list = $('#gap-list'); list.replaceChildren();
+    if (!filtered.length) { list.append(node('p', 'empty', 'No matching gaps.')); return; }
+    const counts = new Map(); filtered.forEach(gap => counts.set(gap.kind, (counts.get(gap.kind) || 0) + 1));
+    const grouped = [...filtered].sort((a,b) => a.kind.localeCompare(b.kind) || a.gap_id.localeCompare(b.gap_id));
+    let group = '';
+    grouped.slice(0, gapLimit).forEach(gap => {
+      if (gap.kind !== group) { group = gap.kind; list.append(node('div', 'group-title', `${group.replaceAll('_', ' ')} · ${counts.get(group)}`)); }
+      const card = node('details', 'gap'); const summary = node('summary'); summary.append(badge(gap.assessment), node('span', 'gap-kind', gap.summary)); card.append(summary);
+      const body = node('div', 'gap-body'); body.append(node('div', 'mono', `${gap.gap_id} · ${loc(gap.location)}`));
+      if (gap.choice) body.append(node('div', 'mini', `Context: ${gap.choice}`));
+      gap.links.forEach(link => {
+        const line = node('div', 'mini'); line.append(badge(link.assessment));
+        const destination = link.creation_id || (link.callsite_index !== null ? `callsite #${link.callsite_index + 1}` : 'unknown target');
+        line.append(node('span', '', ` ${link.target.replaceAll('_',' ')}: ${destination}${link.label ? ` / ${link.label}` : ''}`));
+        if (link.creation_id) line.append(button('View creation', () => { selectedCreation = link.creation_id; renderCreationList(); renderCreationDetail(); showTab('creations'); }));
+        if (link.evidence_path?.length) line.append(button('Evidence path', () => showEvidence(link.evidence_path[0])));
+        body.append(line);
+      });
+      if (!gap.links.length) body.append(node('p', 'mini', 'No target link could be established.'));
+      card.append(body); list.append(card);
+    });
+    if (grouped.length > gapLimit) list.append(button(`Show more (${grouped.length - gapLimit} remaining)`, () => { gapLimit += 100; renderGaps(); }, 'load'));
+  }
+  $('#gap-search').addEventListener('input', () => { gapLimit = 100; renderGaps(); });
+  $('#gap-filter').addEventListener('change', () => { gapLimit = 100; renderGaps(); });
+
+  let inventoryLimit = 100;
+  function renderInventory() {
+    const search = $('#inventory-search').value.trim().toLowerCase(); const filter = $('#inventory-filter').value;
+    const filtered = report.callsite_inventory.callsites.filter(site => (filter === 'all' || site.status === filter) && (!search || `${loc(site.location)} ${site.reason}`.toLowerCase().includes(search)));
+    $('#inventory-count').textContent = `${filtered.length} of ${report.callsite_inventory.callsites.length} · ${report.callsite_inventory.configured_files} configured files`;
+    const list = $('#inventory-list'); list.replaceChildren();
+    if (!filtered.length) { list.append(node('p', 'empty', 'No matching callsites.')); return; }
+    filtered.slice(0, inventoryLimit).forEach(site => { const row = node('div', 'inventory-row'); const content = node('div'); content.append(node('div', 'mono', loc(site.location)), node('div', 'aside', site.reason)); row.append(badge(site.status), content); list.append(row); });
+    if (filtered.length > inventoryLimit) list.append(button(`Show more (${filtered.length - inventoryLimit} remaining)`, () => { inventoryLimit += 100; renderInventory(); }, 'load'));
+  }
+  $('#inventory-search').addEventListener('input', () => { inventoryLimit = 100; renderInventory(); });
+  $('#inventory-filter').addEventListener('change', () => { inventoryLimit = 100; renderInventory(); });
+
+  let evidenceLimit = 100;
+  function renderEvidence() {
+    const search = $('#evidence-search').value.trim().toLowerCase();
+    const filtered = report.evidence.filter(item => !search || `E${item.id} ${item.rule} ${item.summary}`.toLowerCase().includes(search));
+    $('#evidence-count').textContent = `${filtered.length} of ${report.evidence.length}`;
+    const list = $('#evidence-list'); list.replaceChildren();
+    if (!filtered.length) { list.append(node('p', 'empty', 'No matching evidence.')); return; }
+    filtered.slice(0, evidenceLimit).forEach(item => list.append(evidenceNode(item)));
+    if (filtered.length > evidenceLimit) list.append(button(`Show more (${filtered.length - evidenceLimit} remaining)`, () => { evidenceLimit += 100; renderEvidence(); }, 'load'));
+  }
+  function evidenceNode(item) {
+    const element = node('div', 'evidence-node');
+    element.append(node('div', 'mono', `E${item.id} · ${item.relation} · ${item.rule}`), node('div', '', item.summary));
+    if (item.parents?.length) element.append(node('div', 'aside', `Parents: ${item.parents.map(id => `E${id}`).join(', ')}`));
+    return element;
+  }
+  function showEvidence(id) {
+    showTab('evidence');
+    $('#evidence-search').value = '';
+    const list = $('#evidence-list'); list.replaceChildren();
+    const heading = node('div'); heading.append(node('h2', '', `Evidence path from ${id}`), button('Show all evidence', () => renderEvidence())); list.append(heading);
+    let current = id; const visited = new Set();
+    while (current && !visited.has(current) && visited.size < 64) {
+      visited.add(current); const item = evidenceById.get(current);
+      if (!item) break;
+      list.append(evidenceNode(item));
+      current = item.parents?.length ? `E${item.parents[0]}` : null;
+    }
+    $('#evidence-count').textContent = `${visited.size} nodes on selected path`;
+  }
+  $('#evidence-search').addEventListener('input', () => { evidenceLimit = 100; renderEvidence(); });
+  renderCreationList(); renderCreationDetail(); renderGaps(); renderInventory(); renderEvidence();
+})();

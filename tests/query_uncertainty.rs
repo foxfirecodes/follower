@@ -1,6 +1,9 @@
 mod support;
 
-use code_flow::{queries::Conclusion, query::QueryValue};
+use code_flow::{
+    queries::Conclusion,
+    query::{QueryGapAssessment, QueryGapTarget, QueryValue},
+};
 use support::TestProject;
 
 #[test]
@@ -78,6 +81,95 @@ fn joined_data_becomes_an_explicit_unknown_projection_and_coverage_gap() {
     ));
     assert!(!report.coverage.complete);
     assert!(!report.creations[0].unresolved.is_empty());
+    let gap = report
+        .gaps
+        .iter()
+        .find(|gap| gap.kind == "uncertain_callback_factory_capture")
+        .expect("structured factory gap");
+    assert_eq!(gap.assessment, QueryGapAssessment::Direct);
+    assert_eq!(gap.location.as_ref().unwrap().path, "src/Host.tsx");
+    assert!(gap.links.iter().any(|link| {
+        link.target == QueryGapTarget::FactoryArgument
+            && link.label.as_deref() == Some("created")
+            && link.creation_id.as_deref() == Some(report.creations[0].creation_id.as_str())
+    }));
+    assert!(gap.links.iter().any(|link| !link.evidence_path.is_empty()));
+}
+
+#[test]
+fn hiding_unresolved_rows_does_not_remove_gap_provenance() {
+    let fixture = TestProject::new(&[(
+        "src/Host.tsx",
+        "import { makeCallback } from './factory'; export function Host() { const { callback } = makeCallback('known'); opaqueConsumer(callback); }",
+    )]);
+    let query = std::fs::read_to_string(fixture.root.join("query.toml")).unwrap();
+    fixture.write(
+        "query.toml",
+        &format!("{query}\n[report]\ninclude_unresolved_escapes = false\n"),
+    );
+    let report = fixture.report();
+    assert!(report.creations[0].unresolved.is_empty());
+    assert!(
+        report.gaps.iter().any(|gap| {
+            gap.assessment == QueryGapAssessment::Direct
+                && gap.links.iter().any(|link| {
+                    link.creation_id.as_deref() == Some(report.creations[0].creation_id.as_str())
+                })
+        }),
+        "{:#?}",
+        report.gaps
+    );
+}
+
+#[test]
+fn html_report_is_optional_and_survives_unresolved_exit() {
+    let fixture = TestProject::new(&[(
+        "src/Host.tsx",
+        "import { makeCallback } from './factory'; export function Host({ flag }) { let value = 'alpha'; if (flag) value = 'beta'; makeCallback(value).callback('clicked'); }",
+    )]);
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_follower"))
+            .arg("query")
+            .arg("--project")
+            .arg(fixture.root.join("flow.toml"))
+            .arg("--query")
+            .arg(fixture.root.join("query.toml"))
+            .args(["--format", "json"])
+            .args(args)
+            .output()
+            .expect("run CLI")
+    };
+    let plain = run(&[]);
+    assert!(plain.status.success());
+    assert!(!String::from_utf8_lossy(&plain.stderr).contains("HTML report:"));
+    let output = run(&["--html-report", "--fail-on-unresolved"]);
+    assert!(!output.status.success());
+    let report: code_flow::query::QueryReport = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!report.gaps.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let path = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("HTML report: "))
+        .expect("report path");
+    let html = std::fs::read_to_string(path).expect("report file");
+    assert!(html.contains("Coverage gaps"));
+    assert!(html.contains("uncertain_callback_factory_capture"));
+    std::fs::remove_file(path).unwrap();
+    fixture.write(
+        "query.toml",
+        &format!(
+            "{}\n[report]\nhtml = true\n",
+            std::fs::read_to_string(fixture.root.join("query.toml")).unwrap()
+        ),
+    );
+    let configured = run(&[]);
+    assert!(String::from_utf8_lossy(&configured.stderr).contains("HTML report:"));
+    let stderr = String::from_utf8_lossy(&configured.stderr);
+    let path = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("HTML report: "))
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

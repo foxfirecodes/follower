@@ -3,7 +3,7 @@ mod support;
 use code_flow::{
     Project,
     queries::Conclusion,
-    query::{QueryCallsiteStatus, QueryValue, load_query},
+    query::{QueryCallsiteStatus, QueryGapAssessment, QueryGapTarget, QueryValue, load_query},
 };
 use support::TestProject;
 
@@ -890,6 +890,30 @@ fn callsite_inventory_marks_analyzed_filtered_and_unresolved_candidates() {
             .iter()
             .any(|site| site.location.path == "src/Unrelated.ts"
                 && site.status == QueryCallsiteStatus::Unresolved)
+    );
+    let filtered_gap = report
+        .gaps
+        .iter()
+        .find(|gap| {
+            gap.kind == "filtered_callsite"
+                && gap
+                    .location
+                    .as_ref()
+                    .is_some_and(|location| location.path == "src/FilteredAlias.ts")
+        })
+        .expect("filtered callsite gap");
+    assert_eq!(filtered_gap.assessment, QueryGapAssessment::MayAffect);
+    assert!(filtered_gap.links.iter().any(|link| {
+        link.target == QueryGapTarget::Callsite
+            && link.callsite_index.is_some_and(|index| {
+                inventory.callsites[index].location.path == "src/FilteredAlias.ts"
+            })
+    }));
+    assert!(
+        !report
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == "unresolved_callsite")
     );
 }
 

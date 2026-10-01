@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -44,6 +48,7 @@ pub struct CapabilityQuery {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct QueryReportOptions {
     #[serde(default = "default_true")]
     pub include_non_invoked: bool,
@@ -51,6 +56,8 @@ pub struct QueryReportOptions {
     pub include_registrations: bool,
     #[serde(default = "default_true")]
     pub include_unresolved_escapes: bool,
+    #[serde(default)]
+    pub html: bool,
 }
 
 impl Default for QueryReportOptions {
@@ -59,6 +66,7 @@ impl Default for QueryReportOptions {
             include_non_invoked: true,
             include_registrations: true,
             include_unresolved_escapes: true,
+            html: false,
         }
     }
 }
@@ -189,6 +197,8 @@ pub struct QueryInvocation {
     pub callsite: SourceSpan,
     pub location: Option<QueryLocation>,
     pub arguments: BTreeMap<String, QueryValue>,
+    #[serde(default)]
+    pub argument_evidence: BTreeMap<String, Option<String>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -199,10 +209,14 @@ pub struct QueryCreation {
     pub reachability: Reachability,
     pub choice: String,
     pub factory_arguments: BTreeMap<String, QueryValue>,
+    #[serde(default)]
+    pub factory_argument_evidence: BTreeMap<String, Option<String>>,
     pub capability_path: Vec<String>,
     pub registrations: Vec<FindingRef>,
     pub invocations: Vec<QueryInvocation>,
     pub unresolved: Vec<FindingRef>,
+    #[serde(skip)]
+    pub(crate) all_unresolved_evidence_ids: Vec<String>,
     pub conclusion: Conclusion,
 }
 
@@ -231,6 +245,47 @@ pub struct QueryCallsiteInventory {
     pub callsites: Vec<QueryCallsite>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryGapAssessment {
+    Direct,
+    MayAffect,
+    UnknownRelevance,
+    Unlinked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryGapTarget {
+    Creation,
+    FactoryArgument,
+    InvocationArgument,
+    Callsite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryGapLink {
+    pub target: QueryGapTarget,
+    pub assessment: QueryGapAssessment,
+    pub creation_id: Option<String>,
+    pub label: Option<String>,
+    pub invocation_evidence_id: Option<String>,
+    pub callsite_index: Option<usize>,
+    pub evidence_path: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryGap {
+    pub gap_id: String,
+    pub kind: String,
+    pub summary: String,
+    pub span: Option<SourceSpan>,
+    pub location: Option<QueryLocation>,
+    pub choice: Option<String>,
+    pub assessment: QueryGapAssessment,
+    pub links: Vec<QueryGapLink>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryReport {
     pub schema_version: u32,
@@ -243,6 +298,250 @@ pub struct QueryReport {
     pub creations: Vec<QueryCreation>,
     pub callsite_inventory: QueryCallsiteInventory,
     pub evidence: Vec<Evidence>,
+    #[serde(default)]
+    pub gaps: Vec<QueryGap>,
     pub coverage: Coverage,
     pub diagnostics: Vec<String>,
+}
+
+impl QueryGap {
+    /// Create a gap with an ID stable for its source and context.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if serializing these owned scalar fields unexpectedly fails.
+    pub fn new(
+        kind: String,
+        summary: String,
+        span: Option<SourceSpan>,
+        location: Option<QueryLocation>,
+        choice: Option<String>,
+    ) -> Self {
+        let identity = serde_json::to_vec(&(&kind, &summary, &span, &location, &choice))
+            .expect("gap identity is serializable");
+        let hash = hex::encode(Sha256::digest(identity));
+        Self {
+            gap_id: format!("G{}", &hash[..16]),
+            kind,
+            summary,
+            span,
+            location,
+            choice,
+            assessment: QueryGapAssessment::UnknownRelevance,
+            links: Vec::new(),
+        }
+    }
+}
+
+impl QueryReport {
+    pub fn finish_gaps(&mut self) {
+        let mut seen_summaries = self
+            .gaps
+            .iter()
+            .map(|gap| gap.summary.clone())
+            .collect::<BTreeSet<_>>();
+        for summary in &self.coverage.gaps {
+            if seen_summaries.insert(summary.clone()) {
+                self.gaps.push(QueryGap::new(
+                    "analysis_gap".to_owned(),
+                    summary.clone(),
+                    None,
+                    None,
+                    None,
+                ));
+            }
+        }
+        for (index, callsite) in self.callsite_inventory.callsites.iter().enumerate() {
+            let kind = match callsite.status {
+                QueryCallsiteStatus::Analyzed | QueryCallsiteStatus::Unresolved => continue,
+                QueryCallsiteStatus::Filtered => "filtered_callsite",
+                QueryCallsiteStatus::Skipped => "skipped_callsite",
+            };
+            let mut gap = QueryGap::new(
+                kind.to_owned(),
+                callsite.reason.clone(),
+                None,
+                Some(callsite.location.clone()),
+                None,
+            );
+            let assessment = match callsite.status {
+                QueryCallsiteStatus::Filtered | QueryCallsiteStatus::Skipped => {
+                    QueryGapAssessment::MayAffect
+                }
+                QueryCallsiteStatus::Unresolved | QueryCallsiteStatus::Analyzed => unreachable!(),
+            };
+            gap.assessment = assessment;
+            gap.links.push(QueryGapLink {
+                target: QueryGapTarget::Callsite,
+                assessment,
+                creation_id: None,
+                label: None,
+                invocation_evidence_id: None,
+                callsite_index: Some(index),
+                evidence_path: Vec::new(),
+            });
+            self.gaps.push(gap);
+        }
+        let mut creations_by_span: BTreeMap<(u32, u32, u32), BTreeSet<usize>> = BTreeMap::new();
+        for (index, creation) in self.creations.iter().enumerate() {
+            creations_by_span
+                .entry(span_key(&creation.factory_callsite))
+                .or_default()
+                .insert(index);
+            for id in &creation.all_unresolved_evidence_ids {
+                if let Some(evidence) = evidence_for_id(&self.evidence, id) {
+                    creations_by_span
+                        .entry(span_key(&evidence.span))
+                        .or_default()
+                        .insert(index);
+                }
+            }
+            for invocation in &creation.invocations {
+                creations_by_span
+                    .entry(span_key(&invocation.callsite))
+                    .or_default()
+                    .insert(index);
+            }
+        }
+        for gap in &mut self.gaps {
+            if !gap.links.is_empty() {
+                continue;
+            }
+            let candidates = gap
+                .span
+                .as_ref()
+                .and_then(|span| creations_by_span.get(&span_key(span)));
+            for creation in candidates
+                .into_iter()
+                .flatten()
+                .map(|&index| &self.creations[index])
+            {
+                let matching = creation.all_unresolved_evidence_ids.iter().find(|id| {
+                    evidence_for_id(&self.evidence, id)
+                        .is_some_and(|evidence| gap.span.as_ref() == Some(&evidence.span))
+                });
+                if let Some(id) = matching {
+                    gap.links.push(QueryGapLink {
+                        target: QueryGapTarget::Creation,
+                        assessment: QueryGapAssessment::Direct,
+                        creation_id: Some(creation.creation_id.clone()),
+                        label: None,
+                        invocation_evidence_id: None,
+                        callsite_index: None,
+                        evidence_path: evidence_path(&self.evidence, id),
+                    });
+                } else if gap.kind == "factory_call_not_reached"
+                    && gap.span.as_ref() == Some(&creation.factory_callsite)
+                {
+                    gap.links.push(QueryGapLink {
+                        target: QueryGapTarget::Creation,
+                        assessment: QueryGapAssessment::Direct,
+                        creation_id: Some(creation.creation_id.clone()),
+                        label: None,
+                        invocation_evidence_id: None,
+                        callsite_index: None,
+                        evidence_path: Vec::new(),
+                    });
+                }
+                if gap.kind == "uncertain_callback_factory_capture"
+                    && gap.span.as_ref() == Some(&creation.factory_callsite)
+                {
+                    for (label, value) in &creation.factory_arguments {
+                        if query_value_uncertain(value) {
+                            gap.links.push(QueryGapLink {
+                                target: QueryGapTarget::FactoryArgument,
+                                assessment: QueryGapAssessment::Direct,
+                                creation_id: Some(creation.creation_id.clone()),
+                                label: Some(label.clone()),
+                                invocation_evidence_id: None,
+                                callsite_index: None,
+                                evidence_path: creation
+                                    .factory_argument_evidence
+                                    .get(label)
+                                    .and_then(|id| id.as_deref())
+                                    .map_or_else(Vec::new, |id| evidence_path(&self.evidence, id)),
+                            });
+                        }
+                    }
+                }
+                for invocation in &creation.invocations {
+                    if gap.span.as_ref() == Some(&invocation.callsite) && matching.is_none() {
+                        for (label, value) in &invocation.arguments {
+                            if query_value_uncertain(value) {
+                                gap.links.push(QueryGapLink {
+                                    target: QueryGapTarget::InvocationArgument,
+                                    assessment: QueryGapAssessment::MayAffect,
+                                    creation_id: Some(creation.creation_id.clone()),
+                                    label: Some(label.clone()),
+                                    invocation_evidence_id: Some(invocation.evidence_id.clone()),
+                                    callsite_index: None,
+                                    evidence_path: invocation
+                                        .argument_evidence
+                                        .get(label)
+                                        .and_then(|id| id.as_deref())
+                                        .map_or_else(Vec::new, |id| {
+                                            evidence_path(&self.evidence, id)
+                                        }),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            gap.assessment = if gap
+                .links
+                .iter()
+                .any(|link| link.assessment == QueryGapAssessment::Direct)
+            {
+                QueryGapAssessment::Direct
+            } else if !gap.links.is_empty() {
+                QueryGapAssessment::MayAffect
+            } else if gap.location.is_some() {
+                QueryGapAssessment::UnknownRelevance
+            } else {
+                QueryGapAssessment::Unlinked
+            };
+        }
+        self.gaps
+            .sort_by(|left, right| left.gap_id.cmp(&right.gap_id));
+        self.gaps
+            .dedup_by(|left, right| left.gap_id == right.gap_id);
+    }
+}
+
+fn query_value_uncertain(value: &QueryValue) -> bool {
+    match value {
+        QueryValue::Unknown { .. } => true,
+        QueryValue::Alternatives { values } => values.iter().any(query_value_uncertain),
+        QueryValue::Array { elements } => elements.iter().any(query_value_uncertain),
+        _ => false,
+    }
+}
+
+fn span_key(span: &SourceSpan) -> (u32, u32, u32) {
+    (span.file_id.0, span.start, span.end)
+}
+
+fn evidence_path(evidence: &[Evidence], id: &str) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut current = id
+        .strip_prefix('E')
+        .and_then(|digits| digits.parse::<usize>().ok());
+    while let Some(index) = current {
+        let Some(node) = evidence.get(index) else {
+            break;
+        };
+        path.push(format!("E{}", node.id.0));
+        if path.len() >= 64 {
+            break;
+        }
+        current = node.parents.first().map(|parent| parent.0 as usize);
+    }
+    path
+}
+
+fn evidence_for_id<'a>(evidence: &'a [Evidence], id: &str) -> Option<&'a Evidence> {
+    id.strip_prefix('E')
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .and_then(|index| evidence.get(index))
 }

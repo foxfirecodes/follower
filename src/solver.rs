@@ -1,6 +1,7 @@
 #![allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::Path,
@@ -24,8 +25,8 @@ use crate::{
     project::Project,
     queries::{AuditFinding, AuditReport, Conclusion, Coverage, FindingRef},
     query::{
-        QueryCallsiteInventory, QueryCreation, QueryInvocation, QueryLocation, QueryReport,
-        QueryScope, QuerySpec, QueryValue, Reachability,
+        QueryCallsiteInventory, QueryCreation, QueryGap, QueryInvocation, QueryLocation,
+        QueryReport, QueryScope, QuerySpec, QueryValue, Reachability,
     },
 };
 
@@ -33,6 +34,8 @@ const MAX_CALL_DEPTH: usize = 128;
 const MAX_REVERSE_IMPORTER_EVALUATIONS: usize = 5_000;
 const MAX_REVERSE_IMPORTER_SOURCE_BYTES: usize = 20_000;
 const MAX_HEAP_ALTERNATIVES: usize = 32;
+const TEXT_FILTER_GAP: &str =
+    "directory sources were text-filtered; files without a configured term were not analyzed";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FunctionKey {
@@ -127,6 +130,72 @@ struct CapabilityState {
 struct InvocationState {
     evidence: EvidenceId,
     arguments: Vec<TrackedValue>,
+}
+
+struct LocationSource {
+    text: String,
+    line_starts: Vec<usize>,
+}
+
+impl LocationSource {
+    fn new(text: String) -> Self {
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            text.bytes()
+                .enumerate()
+                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+        );
+        Self { text, line_starts }
+    }
+
+    fn line_column(&self, offset: u32) -> (u32, u32) {
+        let mut offset = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(self.text.len());
+        while !self.text.is_char_boundary(offset) {
+            offset = offset.saturating_sub(1);
+        }
+        let line_index = self
+            .line_starts
+            .partition_point(|start| *start <= offset)
+            .saturating_sub(1);
+        let column = self.text[self.line_starts[line_index]..offset]
+            .chars()
+            .count()
+            + 1;
+        (
+            u32::try_from(line_index + 1).unwrap_or(u32::MAX),
+            u32::try_from(column).unwrap_or(u32::MAX),
+        )
+    }
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::{LocationSource, gap_kind};
+
+    #[test]
+    fn cached_line_offsets_keep_one_based_unicode_columns() {
+        let source = LocationSource::new("α\n🙂x".to_owned());
+        assert_eq!(source.line_column(0), (1, 1));
+        assert_eq!(source.line_column(2), (1, 2));
+        assert_eq!(source.line_column(3), (2, 1));
+        assert_eq!(source.line_column(7), (2, 2));
+        assert_eq!(source.line_column(8), (2, 3));
+    }
+
+    #[test]
+    fn gap_kinds_do_not_include_dynamic_identifiers() {
+        assert_eq!(
+            gap_kind("call through unknown target: unresolved_local_identifier:consumer"),
+            "call_through_unknown_target"
+        );
+        assert_eq!(gap_kind("unknown property privateName"), "unknown_property");
+        assert_eq!(
+            gap_kind("array map receiver is unknown (privateReason)"),
+            "array_map_receiver_unknown"
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -278,6 +347,10 @@ struct Solver<'a> {
     capabilities: Vec<CapabilityState>,
     diagnostics: Vec<String>,
     coverage_gaps: Vec<String>,
+    coverage_gap_keys: BTreeSet<String>,
+    query_gaps: Vec<(String, String, SourceSpan, Option<String>)>,
+    query_gap_keys: BTreeSet<(String, Option<String>)>,
+    location_sources: RefCell<BTreeMap<FileId, LocationSource>>,
     requested_imports: BTreeSet<std::path::PathBuf>,
     capability_producer_files: BTreeSet<FileId>,
     caller_producer_files: BTreeSet<FileId>,
@@ -386,8 +459,16 @@ impl<'a> Solver<'a> {
             coverage_gaps: if project.config.source_contains_any.is_empty() {
                 Vec::new()
             } else {
-                vec!["directory sources were text-filtered; files without a configured term were not analyzed".to_owned()]
+                vec![TEXT_FILTER_GAP.to_owned()]
             },
+            coverage_gap_keys: if project.config.source_contains_any.is_empty() {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([TEXT_FILTER_GAP.to_owned()])
+            },
+            query_gaps: Vec::new(),
+            query_gap_keys: BTreeSet::new(),
+            location_sources: RefCell::new(BTreeMap::new()),
             requested_imports: BTreeSet::new(),
             capability_producer_files: BTreeSet::new(),
             caller_producer_files: BTreeSet::new(),
@@ -753,8 +834,19 @@ impl<'a> Solver<'a> {
             "{reason} at file {} bytes {}..{}",
             span.file_id.0, span.start, span.end
         );
-        if !self.coverage_gaps.contains(&gap) {
-            self.coverage_gaps.push(gap);
+        if self.coverage_gap_keys.insert(gap.clone()) {
+            self.coverage_gaps.push(gap.clone());
+        }
+        if self
+            .query_gap_keys
+            .insert((gap.clone(), self.current_choice.clone()))
+        {
+            self.query_gaps.push((
+                gap,
+                gap_kind(reason),
+                span.clone(),
+                self.current_choice.clone(),
+            ));
         }
     }
 
@@ -2154,10 +2246,10 @@ impl<'a> Solver<'a> {
                 affected.sort_unstable();
                 affected.dedup();
                 if !affected.is_empty() {
-                    self.coverage_gaps.push(format!(
-                        "array map receiver is unknown ({reason}) at file {} bytes {}..{}",
-                        span.file_id.0, span.start, span.end
-                    ));
+                    self.record_coverage_gap(
+                        &format!("array map receiver is unknown ({reason})"),
+                        span,
+                    );
                     for capability in affected {
                         let evidence = self.push_evidence(
                             RelationKind::UnresolvedEscape,
@@ -3382,8 +3474,19 @@ impl<'a> Solver<'a> {
             "factory call at file {} bytes {}..{} was not reached from configured roots",
             span.file_id.0, span.start, span.end
         );
-        if !self.coverage_gaps.contains(&gap) {
-            self.coverage_gaps.push(gap);
+        if self.coverage_gap_keys.insert(gap.clone()) {
+            self.coverage_gaps.push(gap.clone());
+        }
+        if self
+            .query_gap_keys
+            .insert((gap.clone(), self.current_choice.clone()))
+        {
+            self.query_gaps.push((
+                gap,
+                "factory_call_not_reached".to_owned(),
+                span.clone(),
+                self.current_choice.clone(),
+            ));
         }
     }
 
@@ -3528,99 +3631,131 @@ impl<'a> Solver<'a> {
 
     fn query_report(self, query: &QuerySpec, query_hash: &str) -> QueryReport {
         let snapshot_prefix = &self.snapshot.snapshot_id[..12.min(self.snapshot.snapshot_id.len())];
-        let creations = self
-            .capabilities
-            .iter()
-            .enumerate()
-            .filter_map(|(index, capability)| {
-                if !query.report.include_non_invoked && capability.invocations.is_empty() {
-                    return None;
-                }
-                let conclusion = if !capability.invocations.is_empty() {
-                    Conclusion::CandidateInvocation
-                } else if capability.unresolved.is_empty() {
-                    Conclusion::AbsentWithinModel
-                } else {
-                    Conclusion::Unresolved
-                };
-                let factory_arguments = query
-                    .factory_arguments
-                    .iter()
-                    .map(|projection| {
-                        (
-                            projection.label.clone(),
-                            capability
-                                .factory_arguments
-                                .get(projection.index)
-                                .map_or_else(
-                                    || QueryValue::Unknown {
-                                        reason: "missing_argument".to_owned(),
-                                    },
-                                    query_value,
-                                ),
-                        )
-                    })
-                    .collect();
-                let invocations = capability
-                    .invocations
-                    .iter()
-                    .map(|invocation| QueryInvocation {
-                        evidence_id: format!("E{}", invocation.evidence.0),
-                        callsite: self.evidence[invocation.evidence.0 as usize].span.clone(),
-                        location: self
-                            .query_location(&self.evidence[invocation.evidence.0 as usize].span),
-                        arguments: query
-                            .capability
-                            .invocation_arguments
-                            .iter()
-                            .map(|projection| {
-                                (
-                                    projection.label.clone(),
-                                    invocation.arguments.get(projection.index).map_or_else(
+        let creations =
+            self.capabilities
+                .iter()
+                .enumerate()
+                .filter_map(|(index, capability)| {
+                    if !query.report.include_non_invoked && capability.invocations.is_empty() {
+                        return None;
+                    }
+                    let conclusion = if !capability.invocations.is_empty() {
+                        Conclusion::CandidateInvocation
+                    } else if capability.unresolved.is_empty() {
+                        Conclusion::AbsentWithinModel
+                    } else {
+                        Conclusion::Unresolved
+                    };
+                    let factory_arguments = query
+                        .factory_arguments
+                        .iter()
+                        .map(|projection| {
+                            (
+                                projection.label.clone(),
+                                capability
+                                    .factory_arguments
+                                    .get(projection.index)
+                                    .map_or_else(
                                         || QueryValue::Unknown {
                                             reason: "missing_argument".to_owned(),
                                         },
                                         query_value,
                                     ),
-                                )
-                            })
-                            .collect(),
-                    })
-                    .collect();
-                Some(QueryCreation {
-                    creation_id: format!("{snapshot_prefix}-Q{index}"),
-                    factory_callsite: capability.callsite.clone(),
-                    factory_location: self.query_location(&capability.callsite),
-                    reachability: capability.reachability,
-                    choice: capability.choice.clone(),
-                    factory_arguments,
-                    capability_path: query.capability.returned_index.map_or_else(
-                        || query.capability.returned_property.clone(),
-                        |index| vec![format!("[{index}]")],
-                    ),
-                    registrations: if query.report.include_registrations {
-                        capability
-                            .registrations
-                            .iter()
-                            .map(|&evidence| self.finding_ref(evidence))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    },
-                    invocations,
-                    unresolved: if query.report.include_unresolved_escapes {
-                        capability
+                            )
+                        })
+                        .collect();
+                    let factory_argument_evidence = query
+                        .factory_arguments
+                        .iter()
+                        .map(|projection| {
+                            (
+                                projection.label.clone(),
+                                capability.factory_arguments.get(projection.index).and_then(
+                                    |value| value.evidence.map(|id| format!("E{}", id.0)),
+                                ),
+                            )
+                        })
+                        .collect();
+                    let invocations = capability
+                        .invocations
+                        .iter()
+                        .map(|invocation| QueryInvocation {
+                            evidence_id: format!("E{}", invocation.evidence.0),
+                            callsite: self.evidence[invocation.evidence.0 as usize].span.clone(),
+                            location: self.query_location(
+                                &self.evidence[invocation.evidence.0 as usize].span,
+                            ),
+                            arguments: query
+                                .capability
+                                .invocation_arguments
+                                .iter()
+                                .map(|projection| {
+                                    (
+                                        projection.label.clone(),
+                                        invocation.arguments.get(projection.index).map_or_else(
+                                            || QueryValue::Unknown {
+                                                reason: "missing_argument".to_owned(),
+                                            },
+                                            query_value,
+                                        ),
+                                    )
+                                })
+                                .collect(),
+                            argument_evidence: query
+                                .capability
+                                .invocation_arguments
+                                .iter()
+                                .map(|projection| {
+                                    (
+                                        projection.label.clone(),
+                                        invocation.arguments.get(projection.index).and_then(
+                                            |value| value.evidence.map(|id| format!("E{}", id.0)),
+                                        ),
+                                    )
+                                })
+                                .collect(),
+                        })
+                        .collect();
+                    Some(QueryCreation {
+                        creation_id: format!("{snapshot_prefix}-Q{index}"),
+                        factory_callsite: capability.callsite.clone(),
+                        factory_location: self.query_location(&capability.callsite),
+                        reachability: capability.reachability,
+                        choice: capability.choice.clone(),
+                        factory_arguments,
+                        factory_argument_evidence,
+                        capability_path: query.capability.returned_index.map_or_else(
+                            || query.capability.returned_property.clone(),
+                            |index| vec![format!("[{index}]")],
+                        ),
+                        registrations: if query.report.include_registrations {
+                            capability
+                                .registrations
+                                .iter()
+                                .map(|&evidence| self.finding_ref(evidence))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
+                        invocations,
+                        unresolved: if query.report.include_unresolved_escapes {
+                            capability
+                                .unresolved
+                                .iter()
+                                .map(|&evidence| self.finding_ref(evidence))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
+                        all_unresolved_evidence_ids: capability
                             .unresolved
                             .iter()
-                            .map(|&evidence| self.finding_ref(evidence))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    },
-                    conclusion,
+                            .map(|id| format!("E{}", id.0))
+                            .collect(),
+                        conclusion,
+                    })
                 })
-            })
-            .collect();
+                .collect();
         let roots = self
             .project
             .config
@@ -3628,8 +3763,21 @@ impl<'a> Solver<'a> {
             .iter()
             .map(|entry| format!("{}#{}", entry.module.display(), entry.export))
             .collect();
+        let gaps = self
+            .query_gaps
+            .iter()
+            .map(|(summary, kind, span, choice)| {
+                QueryGap::new(
+                    kind.clone(),
+                    summary.clone(),
+                    Some(span.clone()),
+                    self.query_location(span),
+                    choice.clone(),
+                )
+            })
+            .collect();
         QueryReport {
-            schema_version: 4,
+            schema_version: 5,
             snapshot_id: self.snapshot.snapshot_id.clone(),
             config_hash: self.snapshot.config_hash.clone(),
             query_hash: query_hash.to_owned(),
@@ -3645,6 +3793,7 @@ impl<'a> Solver<'a> {
                 callsites: Vec::new(),
             },
             evidence: self.evidence,
+            gaps,
             coverage: Coverage {
                 scope: match query.scope {
                     QueryScope::Reachable => {
@@ -3679,9 +3828,16 @@ impl<'a> Solver<'a> {
             .files
             .iter()
             .find(|file| file.file_id == span.file_id)?;
-        let source = fs::read_to_string(&file.path).ok()?;
-        let (start_line, start_column) = line_column(&source, span.start);
-        let (end_line, end_column) = line_column(&source, span.end);
+        if !self.location_sources.borrow().contains_key(&span.file_id) {
+            let source = LocationSource::new(fs::read_to_string(&file.path).ok()?);
+            self.location_sources
+                .borrow_mut()
+                .insert(span.file_id, source);
+        }
+        let sources = self.location_sources.borrow();
+        let source = sources.get(&span.file_id)?;
+        let (start_line, start_column) = source.line_column(span.start);
+        let (end_line, end_column) = source.line_column(span.end);
         Some(QueryLocation {
             path: display_path(&self.project.root, &file.path),
             start_line,
@@ -3690,6 +3846,31 @@ impl<'a> Solver<'a> {
             end_column,
         })
     }
+}
+
+fn gap_kind(reason: &str) -> String {
+    if reason.starts_with("array map receiver is unknown") {
+        return "array_map_receiver_unknown".to_owned();
+    }
+    if reason.starts_with("property read ") && reason.ends_with(" from non-record value") {
+        return "property_read_from_non_record".to_owned();
+    }
+    if reason.starts_with("unknown property ") {
+        return "unknown_property".to_owned();
+    }
+    let reason = reason.split_once(':').map_or(reason, |(prefix, _)| prefix);
+    let mut kind = String::new();
+    for word in reason.split_whitespace().take(7) {
+        if !kind.is_empty() {
+            kind.push('_');
+        }
+        kind.extend(
+            word.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_lowercase()),
+        );
+    }
+    kind.trim_matches('_').to_owned()
 }
 
 fn capability_ids(value: &TrackedValue) -> Vec<usize> {
@@ -4588,27 +4769,6 @@ fn display_path(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
-}
-
-fn line_column(source: &str, offset: u32) -> (u32, u32) {
-    let mut offset = usize::try_from(offset)
-        .unwrap_or(usize::MAX)
-        .min(source.len());
-    while !source.is_char_boundary(offset) {
-        offset = offset.saturating_sub(1);
-    }
-    let prefix = &source[..offset];
-    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let column = prefix
-        .rsplit_once('\n')
-        .map_or(prefix, |(_, current_line)| current_line)
-        .chars()
-        .count()
-        + 1;
-    (
-        u32::try_from(line).unwrap_or(u32::MAX),
-        u32::try_from(column).unwrap_or(u32::MAX),
-    )
 }
 
 fn fallback_span(file_id: FileId) -> SourceSpan {

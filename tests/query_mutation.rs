@@ -17,7 +17,7 @@ fn follows_callback_through_aliased_record_mutation() {
     let (query, hash) = load_query(&fixture_path("query.toml")).expect("load query");
     let report = analyzer.query(&query, &hash).expect("run query");
 
-    assert_eq!(report.schema_version, 4);
+    assert_eq!(report.schema_version, 5);
     assert_eq!(report.creations.len(), 1);
     assert!(report.coverage.complete, "{:?}", report.coverage.gaps);
 

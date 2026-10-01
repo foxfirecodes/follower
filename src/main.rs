@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use code_flow::{
     Analyzer, Project,
+    html_report::write_query_report_html,
     query::{QueryReport, QueryValue, load_query},
 };
 use serde::Serialize;
@@ -51,6 +52,9 @@ enum Command {
         format: OutputFormat,
         #[arg(long)]
         fail_on_unresolved: bool,
+        /// Write a self-contained, private HTML report to /tmp.
+        #[arg(long)]
+        html_report: bool,
     },
 }
 
@@ -96,7 +100,8 @@ fn main() -> Result<()> {
             query,
             format,
             fail_on_unresolved,
-        } => run_query(&project, &query, format, fail_on_unresolved),
+            html_report,
+        } => run_query(&project, &query, format, fail_on_unresolved, html_report),
     }
 }
 
@@ -105,10 +110,15 @@ fn run_query(
     query_path: &std::path::Path,
     format: OutputFormat,
     fail_on_unresolved: bool,
+    html_report: bool,
 ) -> Result<()> {
     let analyzer = Analyzer::new(Project::load(config_path)?);
     let (query, query_hash) = load_query(query_path)?;
     let report = analyzer.query(&query, &query_hash)?;
+    if html_report || query.report.html {
+        let path = write_query_report_html(&report)?;
+        eprintln!("HTML report: {}", path.display());
+    }
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
         OutputFormat::Text => print_query_report(&report),
