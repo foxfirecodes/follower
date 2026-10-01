@@ -399,8 +399,10 @@ impl SourceCatalog {
 }
 
 /// Budget for files that configured roots request after discovery stops.
-const ROOT_PHASE_FILES: usize = 128;
-const ROOT_PHASE_ROUNDS: usize = 6;
+const ROOT_PHASE_FILES: usize = 512;
+/// Budget for files the backward use walk parses, separate from import expansion.
+const BACKWARD_WALK_FILES: usize = 256;
+const ROOT_PHASE_ROUNDS: usize = 8;
 
 struct RootPhase {
     files: usize,
@@ -924,6 +926,7 @@ impl Analyzer {
             (snapshot, Some(catalog))
         };
         let mut followed = 0;
+        let mut walked = 0;
         let mut skipped = BTreeSet::new();
         let mut reverse_seed_paths = BTreeSet::new();
         let mut reverse_producer_paths = BTreeSet::new();
@@ -1004,10 +1007,8 @@ impl Analyzer {
                         skipped.insert(path.clone());
                     }
                 }
-                if additions.is_empty()
-                    || phase.rounds == ROOT_PHASE_ROUNDS
-                    || phase.files + additions.len() > ROOT_PHASE_FILES
-                {
+                let remaining = ROOT_PHASE_FILES - phase.files;
+                if additions.is_empty() || phase.rounds == ROOT_PHASE_ROUNDS || remaining == 0 {
                     report.coverage.gaps.extend(phase.discovery_stop.take());
                     if !additions.is_empty() {
                         report.coverage.gaps.push(format!(
@@ -1019,6 +1020,9 @@ impl Analyzer {
                     }
                     break report;
                 }
+                // Requests come in the order root paths met them, so a partial round keeps the
+                // files nearest the entry; the rest compete again in later rounds.
+                additions.truncate(remaining);
                 phase.files += additions.len();
                 phase.rounds += 1;
                 self.extend_snapshot(&linker, &mut snapshot, &additions)?;
@@ -1048,7 +1052,11 @@ impl Analyzer {
                     skipped.insert(path.clone());
                 }
             }
-            if additions.is_empty() && round < 8 && !self.project.config.entries.is_empty() {
+            // Walk back from factory callsites once discovery stops, whether it settled or ran out
+            // of budget; the walk has its own file budget.
+            let discovery_done =
+                additions.is_empty() || round >= 8 || followed + additions.len() > 256;
+            if discovery_done && !self.project.config.entries.is_empty() {
                 let callsites = report
                     .creations
                     .iter()
@@ -1101,7 +1109,7 @@ impl Analyzer {
                         catalog,
                         &entry_corridor,
                         &callsites,
-                        256_usize.saturating_sub(followed),
+                        BACKWARD_WALK_FILES.saturating_sub(walked),
                     );
                     backward_limit_hit |= walk.limit_hit;
                     backward_skipped_files += walk.skipped_files;
@@ -1118,7 +1126,7 @@ impl Analyzer {
                     }
                     if walk.reached_entry && walk.added_files > 0 {
                         use_chain.extend(walk.symbols);
-                        followed += walk.added_files;
+                        walked += walk.added_files;
                         continue;
                     }
                     // File IDs of rolled-back files will be reused, so keep only earlier symbols.
@@ -1132,7 +1140,7 @@ impl Analyzer {
                     snapshot.snapshot_id = original_snapshot_id;
                 }
             }
-            if additions.is_empty() || round == 8 || followed + additions.len() > 256 {
+            if discovery_done {
                 let discovery_stop = (!additions.is_empty()).then(|| {
                     format!(
                         "capability import expansion stopped after {followed} files and {round} rounds; {} requested files remain",

@@ -303,8 +303,9 @@ pub struct QueryPass {
     /// Unparsed files requested anywhere in the pass.
     pub requested_imports: BTreeSet<std::path::PathBuf>,
     /// Unparsed files requested while exploring configured roots: values the root paths read and
-    /// unknown components on the entry corridor.
-    pub root_requested_imports: BTreeSet<std::path::PathBuf>,
+    /// unknown components on the entry corridor. Listed in first-request order, so files met
+    /// nearer the entry come first.
+    pub root_requested_imports: Vec<std::path::PathBuf>,
     pub producer_paths: BTreeSet<std::path::PathBuf>,
     pub reachable_seed_callsites: Vec<SourceSpan>,
 }
@@ -489,7 +490,8 @@ struct Solver<'a> {
     query_gap_keys: BTreeSet<(String, Option<String>)>,
     location_sources: RefCell<BTreeMap<FileId, LocationSource>>,
     requested_imports: BTreeSet<std::path::PathBuf>,
-    root_requested_imports: BTreeSet<std::path::PathBuf>,
+    root_requested_imports: Vec<std::path::PathBuf>,
+    root_requested_paths: BTreeSet<std::path::PathBuf>,
     entry_corridor: BTreeSet<std::path::PathBuf>,
     /// Files on the entry corridor plus factory hosts. Empty when the corridor is unknown.
     corridor_files: BTreeSet<FileId>,
@@ -626,7 +628,8 @@ impl<'a> Solver<'a> {
             query_gap_keys: BTreeSet::new(),
             location_sources: RefCell::new(BTreeMap::new()),
             requested_imports: BTreeSet::new(),
-            root_requested_imports: BTreeSet::new(),
+            root_requested_imports: Vec::new(),
+            root_requested_paths: BTreeSet::new(),
             entry_corridor: BTreeSet::new(),
             corridor_files: BTreeSet::new(),
             use_chain: BTreeSet::new(),
@@ -945,50 +948,34 @@ impl<'a> Solver<'a> {
         }
     }
 
-    /// Returns the resolved file of a value import when that file is not in the snapshot.
-    fn unparsed_import_target(&self, file_id: FileId, local: &str) -> Option<std::path::PathBuf> {
-        let file = self.symbol_linker.file(file_id)?;
-        let import = file
-            .flow
-            .imports
-            .iter()
-            .find(|import| import.local == local && !import.type_only)?;
-        let path = self
-            .symbol_linker
-            .import_resolutions(&file.path)
-            .find(|resolution| {
-                resolution.specifier == import.module
-                    && resolution.status == crate::link::ResolutionStatus::Resolved
-            })
-            .and_then(|resolution| resolution.resolved_path.as_ref())?;
-        self.symbol_linker
-            .file_at(path)
-            .is_none()
-            .then(|| path.clone())
+    fn request_root_import(&mut self, path: &std::path::Path) {
+        if self.root_requested_paths.insert(path.to_path_buf()) {
+            self.root_requested_imports.push(path.to_path_buf());
+        }
     }
 
     fn request_import_for_local(&mut self, file_id: FileId, local: &str) {
-        if let Some(path) = self.unparsed_import_target(file_id, local) {
+        for path in self.symbol_linker.unparsed_link_targets(file_id, local) {
             if self.current_reachability != Reachability::Unknown {
-                self.root_requested_imports.insert(path.clone());
+                self.request_root_import(&path);
             }
             self.requested_imports.insert(path);
         }
     }
 
-    /// Requests the file of an unknown component. Off the entry corridor this only feeds the
-    /// general expansion when `general` is set; root paths follow corridor files, which can lead
-    /// toward factory hosts, and leave other components to the possible-render assumption.
+    /// Requests the files an unknown component's linkage needs. Off the entry corridor this only
+    /// feeds the general expansion when `general` is set; root paths follow corridor files, which
+    /// can lead toward factory hosts, and leave other components to the possible-render
+    /// assumption.
     fn request_component_import(&mut self, file_id: FileId, local: &str, general: bool) {
-        let Some(path) = self.unparsed_import_target(file_id, local) else {
-            return;
-        };
-        let on_corridor = self.entry_corridor.contains(&path);
-        if (on_corridor || general) && self.current_reachability != Reachability::Unknown {
-            self.root_requested_imports.insert(path.clone());
-        }
-        if general || on_corridor {
-            self.requested_imports.insert(path);
+        for path in self.symbol_linker.unparsed_link_targets(file_id, local) {
+            let on_corridor = self.entry_corridor.contains(&path);
+            if (on_corridor || general) && self.current_reachability != Reachability::Unknown {
+                self.request_root_import(&path);
+            }
+            if general || on_corridor {
+                self.requested_imports.insert(path);
+            }
         }
     }
 
@@ -1927,7 +1914,7 @@ impl<'a> Solver<'a> {
                             return self.linked_value(exported, &expression.span);
                         }
                         if self.current_reachability != Reachability::Unknown {
-                            self.root_requested_imports.insert(target.clone());
+                            self.request_root_import(&target);
                         }
                         self.requested_imports.insert(target);
                     } else {
@@ -2869,10 +2856,9 @@ impl<'a> Solver<'a> {
                 | FlowJsxTag::Member { object: name, .. } => Some(name.as_str()),
                 _ => None,
             };
-            let renders_content = matches!(tag, FlowJsxTag::Identifier { .. })
-                && (values.contains_key("children")
-                    || values.contains_key("render")
-                    || values.contains_key("component"));
+            let renders_content = values.contains_key("children")
+                || values.contains_key("render")
+                || values.contains_key("component");
             if let Some(local) = local {
                 if matches!(tag, FlowJsxTag::Identifier { .. })
                     && values

@@ -156,6 +156,14 @@ pub struct SymbolLinker<'a> {
     file_by_id: BTreeMap<FileId, usize>,
     file_by_path: HashMap<PathBuf, usize>,
     resolutions_by_importer: HashMap<PathBuf, Vec<usize>>,
+    /// Text of resolved modules outside the snapshot, read only to rule out exports.
+    unparsed_sources: RefCell<HashMap<PathBuf, Option<UnparsedSource>>>,
+}
+
+struct UnparsedSource {
+    text: String,
+    /// The module may export names that do not appear in its text.
+    forwards: bool,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -208,6 +216,7 @@ impl<'a> SymbolLinker<'a> {
             file_by_id,
             file_by_path,
             resolutions_by_importer,
+            unparsed_sources: RefCell::new(HashMap::new()),
         }
     }
 
@@ -321,7 +330,7 @@ impl<'a> SymbolLinker<'a> {
             .resolve_path(Path::new(&matcher.module))
             .canonicalize()
             .ok()?;
-        self.resolve_export(&path, &matcher.export, &mut BTreeSet::new())
+        self.resolve_export(&path, &matcher.export, &mut LinkWalk::default())
             .symbol()
     }
 
@@ -329,21 +338,36 @@ impl<'a> SymbolLinker<'a> {
         let Some(file) = self.file(file_id) else {
             return ValueResolution::Unresolved;
         };
-        self.resolve_local_binding(file, local, &mut BTreeSet::new())
+        self.resolve_local_binding(file, local, &mut LinkWalk::default())
+    }
+
+    /// Returns resolved modules outside the snapshot that linking `local` in `file_id` reached.
+    /// Parsing them is what an unresolved binding needs; the set is empty when the binding links
+    /// or fails for another reason.
+    pub fn unparsed_link_targets(&self, file_id: FileId, local: &str) -> BTreeSet<PathBuf> {
+        let Some(file) = self.file(file_id) else {
+            return BTreeSet::new();
+        };
+        let mut walk = LinkWalk::default();
+        if self.resolve_local_binding(file, local, &mut walk) == ValueResolution::Unresolved {
+            walk.unparsed
+        } else {
+            BTreeSet::new()
+        }
     }
 
     pub fn resolve_exported_value(&self, file_id: FileId, name: &str) -> ValueResolution {
         let Some(file) = self.file(file_id) else {
             return ValueResolution::Unresolved;
         };
-        self.resolve_export(&file.path, name, &mut BTreeSet::new())
+        self.resolve_export(&file.path, name, &mut LinkWalk::default())
     }
 
     fn resolve_local_binding(
         &self,
         file: &FileIr,
         local: &str,
-        visited: &mut BTreeSet<(PathBuf, String)>,
+        walk: &mut LinkWalk,
     ) -> ValueResolution {
         if let Some(import) = file
             .flow
@@ -355,9 +379,9 @@ impl<'a> SymbolLinker<'a> {
                 return ValueResolution::Missing;
             }
             if import.imported == "*" {
-                return self.resolve_namespace(file, &import.module);
+                return self.resolve_namespace(file, &import.module, walk);
             }
-            return self.resolve_re_export(file, &import.module, &import.imported, visited);
+            return self.resolve_re_export(file, &import.module, &import.imported, walk);
         }
         self.resolve_local_declaration(file.file_id, local)
             .map_or(ValueResolution::Missing, |symbol| {
@@ -365,30 +389,49 @@ impl<'a> SymbolLinker<'a> {
             })
     }
 
-    fn resolve_namespace(&self, file: &FileIr, module: &str) -> ValueResolution {
-        self.resolved_module(file, module)
-            .and_then(|path| self.file_at(path))
-            .map_or(ValueResolution::Unresolved, |file| {
-                ValueResolution::Resolved(LinkedValue::Namespace(file.file_id))
-            })
+    fn resolve_namespace(
+        &self,
+        file: &FileIr,
+        module: &str,
+        walk: &mut LinkWalk,
+    ) -> ValueResolution {
+        let Some(path) = self.resolved_module(file, module) else {
+            return ValueResolution::Unresolved;
+        };
+        self.file_at(path).map_or_else(
+            || {
+                walk.unparsed.insert(path.to_path_buf());
+                ValueResolution::Unresolved
+            },
+            |file| ValueResolution::Resolved(LinkedValue::Namespace(file.file_id)),
+        )
     }
 
     fn resolve_export(
         &self,
         module_path: &Path,
         export_name: &str,
-        visited: &mut BTreeSet<(PathBuf, String)>,
+        walk: &mut LinkWalk,
     ) -> ValueResolution {
-        if !visited.insert((module_path.to_path_buf(), export_name.to_owned())) {
+        if !walk
+            .visited
+            .insert((module_path.to_path_buf(), export_name.to_owned()))
+        {
             return ValueResolution::Missing;
         }
         let Some(file) = self.file_at(module_path) else {
-            visited.remove(&(module_path.to_path_buf(), export_name.to_owned()));
+            walk.visited
+                .remove(&(module_path.to_path_buf(), export_name.to_owned()));
+            if !self.may_export(module_path, export_name) {
+                return ValueResolution::Missing;
+            }
+            walk.unparsed.insert(module_path.to_path_buf());
             return ValueResolution::Unresolved;
         };
-        let result = self.resolve_export_paths(file, export_name, visited);
+        let result = self.resolve_export_paths(file, export_name, walk);
         // The recursion stack is path-local so diamond paths stay independent.
-        visited.remove(&(module_path.to_path_buf(), export_name.to_owned()));
+        walk.visited
+            .remove(&(module_path.to_path_buf(), export_name.to_owned()));
         result
     }
 
@@ -396,7 +439,7 @@ impl<'a> SymbolLinker<'a> {
         &self,
         file: &FileIr,
         export_name: &str,
-        visited: &mut BTreeSet<(PathBuf, String)>,
+        walk: &mut LinkWalk,
     ) -> ValueResolution {
         // Explicit exports take precedence regardless of their source order.
         let explicit = file
@@ -452,24 +495,24 @@ impl<'a> SymbolLinker<'a> {
                     type_only: false,
                     ..
                 } if exported == export_name => {
-                    self.resolve_re_export(file, module, imported, visited)
+                    self.resolve_re_export(file, module, imported, walk)
                 }
                 FlowExport::Local {
                     local,
                     exported,
                     type_only: false,
                     ..
-                } if exported == export_name => self.resolve_local_binding(file, local, visited),
+                } if exported == export_name => self.resolve_local_binding(file, local, walk),
                 FlowExport::Star {
                     module,
                     type_only: false,
                     ..
-                } => self.resolve_re_export(file, module, export_name, visited),
+                } => self.resolve_re_export(file, module, export_name, walk),
                 FlowExport::Namespace {
                     module,
                     type_only: false,
                     ..
-                } => self.resolve_namespace(file, module),
+                } => self.resolve_namespace(file, module, walk),
                 FlowExport::Local { .. }
                 | FlowExport::ReExport { .. }
                 | FlowExport::Star { .. }
@@ -501,20 +544,93 @@ impl<'a> SymbolLinker<'a> {
         importer: &FileIr,
         module: &str,
         export_name: &str,
-        visited: &mut BTreeSet<(PathBuf, String)>,
+        walk: &mut LinkWalk,
     ) -> ValueResolution {
         self.resolved_module(importer, module)
             .map_or(ValueResolution::Unresolved, |resolved| {
-                self.resolve_export(resolved, export_name, visited)
+                self.resolve_export(resolved, export_name, walk)
             })
     }
 
-    fn resolved_module(&self, importer: &FileIr, module: &str) -> Option<&'a Path> {
-        // The first record for a specifier wins, matching the snapshot's import order.
-        self.import_resolutions(&importer.path)
-            .find(|resolution| resolution.specifier == module)
-            .and_then(|resolution| resolution.resolved_path.as_deref())
+    /// Whether a module outside the snapshot may export `name`. An ES module can only export a
+    /// name its text spells out, unless it forwards another module's exports, so a module whose
+    /// text lacks the name and has no forwarding syntax cannot export it. Unreadable modules and
+    /// non-script files such as stylesheets, whose exports a bundler supplies, may export
+    /// anything.
+    fn may_export(&self, path: &Path, name: &str) -> bool {
+        if !crate::project::is_source_file(path) {
+            return true;
+        }
+        let mut sources = self.unparsed_sources.borrow_mut();
+        let source = sources.entry(path.to_path_buf()).or_insert_with(|| {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|text| UnparsedSource {
+                    forwards: forwards_exports(&text),
+                    text,
+                })
+        });
+        source
+            .as_ref()
+            .is_none_or(|source| source.forwards || contains_identifier(&source.text, name))
     }
+
+    fn resolved_module(&self, importer: &FileIr, module: &str) -> Option<&'a Path> {
+        // A type-only import of the same specifier records no path, so use the first value record.
+        self.import_resolutions(&importer.path)
+            .filter(|resolution| resolution.specifier == module)
+            .find_map(|resolution| resolution.resolved_path.as_deref())
+    }
+}
+
+/// Whether a module may export names its text does not spell out: through `export *` or TS
+/// `export =`, identifier escapes, or `CommonJS` `exports` used other than as `exports.name` or
+/// `Object.defineProperty(exports, "name", ...)`. Prose such as comments that mention exports is
+/// ignored when another word follows on the same line.
+fn forwards_exports(text: &str) -> bool {
+    let after =
+        |index: usize, word: &str| text[index + word.len()..].trim_start_matches([' ', '\t']);
+    identifier_positions(text, "export").any(|index| after(index, "export").starts_with(['*', '=']))
+        || text.contains("\\u")
+        || identifier_positions(text, "exports").any(|index| {
+            let rest = after(index, "exports");
+            let named = rest
+                .strip_prefix('.')
+                .is_some_and(|rest| rest.starts_with(is_identifier_start));
+            let defined = rest.strip_prefix(',').is_some_and(|rest| {
+                text[..index].trim_end().ends_with("defineProperty(")
+                    && rest.trim_start().starts_with(['"', '\''])
+            });
+            !(named || defined || rest.starts_with(is_identifier_start))
+        })
+}
+
+fn is_identifier_start(character: char) -> bool {
+    character.is_alphabetic() || matches!(character, '_' | '$')
+}
+
+fn identifier_positions<'t>(text: &'t str, name: &'t str) -> impl Iterator<Item = usize> + 't {
+    let is_part = |character: char| character.is_alphanumeric() || matches!(character, '_' | '$');
+    text.match_indices(name)
+        .map(|(index, _)| index)
+        .filter(move |index| {
+            !text[..*index].chars().next_back().is_some_and(is_part)
+                && !text[index + name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_part)
+        })
+}
+
+fn contains_identifier(text: &str, name: &str) -> bool {
+    identifier_positions(text, name).next().is_some()
+}
+
+/// State for one linkage walk: the recursion stack, plus resolved modules the snapshot lacks.
+#[derive(Default)]
+struct LinkWalk {
+    visited: BTreeSet<(PathBuf, String)>,
+    unparsed: BTreeSet<PathBuf>,
 }
 
 pub(crate) fn pattern_names(pattern: &FlowPattern) -> Vec<&str> {
@@ -529,5 +645,47 @@ pub(crate) fn pattern_names(pattern: &FlowPattern) -> Vec<&str> {
             elements.iter().flatten().flat_map(pattern_names).collect()
         }
         FlowPatternKind::Unsupported { .. } => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{contains_identifier, forwards_exports};
+
+    #[test]
+    fn forwarding_syntax_can_export_unnamed_bindings() {
+        for text in [
+            "export * from './a';",
+            "export*from'./a'",
+            "export = Thing;",
+            "__exportStar(require('./a'), exports);",
+            "module.exports = require('./a');",
+            "Object.keys(a).forEach(function (key) { exports[key] = a[key]; });",
+            "const \\u0061 = 1;",
+            "var e = exports\nfoo();",
+        ] {
+            assert!(forwards_exports(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn literal_exports_do_not_forward() {
+        for text in [
+            "export const a = 1; export { b as c } from './b';",
+            "var r = require('react'); exports.a = 1; module.exports.b = 2;",
+            "Object.defineProperty(exports, \"__esModule\", { value: true });",
+            "// This module exports helpers for the panel.",
+        ] {
+            assert!(!forwards_exports(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn identifiers_match_whole_words() {
+        assert!(contains_identifier("export { Panel };", "Panel"));
+        assert!(contains_identifier("exports.Panel=1", "Panel"));
+        assert!(!contains_identifier("export const PanelBody = 1;", "Panel"));
+        assert!(!contains_identifier("export const SidePanel = 1;", "Panel"));
+        assert!(!contains_identifier("export const $Panel = 1;", "Panel"));
     }
 }

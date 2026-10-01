@@ -129,6 +129,77 @@ fn backward_use_walk_finds_filtered_component_chain_to_entry() {
 }
 
 #[test]
+fn filtered_root_path_links_components_through_star_export_barrels() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf() { const [, apply] = useItemSelection(['alpha']); apply('close'); return null; }",
+        ),
+        (
+            "src/App.tsx",
+            "import Session from './session'; import { Frame, Panel } from './ui'; import { Leaf } from './Leaf'; export function App() { return <Session.Provider value={null}><Frame><Panel><Leaf /></Panel></Frame></Session.Provider>; }",
+        ),
+        (
+            "src/session.ts",
+            "import { createContext } from 'react'; export default createContext(null);",
+        ),
+        // The type-only import records no path for the same specifier as the value re-export.
+        (
+            "src/ui/index.ts",
+            "import type * as frame from './Frame'; export * from './Frame'; export * from './Panel'; export * from './Unrelated'; export * from 'helpers';",
+        ),
+        (
+            "src/ui/Frame.tsx",
+            "export function Frame({ children }: { children: unknown }) { return <section>{children}</section>; }",
+        ),
+        (
+            "src/ui/Panel.tsx",
+            "export function Panel({ children }: { children: unknown }) { return <div>{children}</div>; }",
+        ),
+        (
+            "src/ui/Unrelated.tsx",
+            "export function Unrelated() { return null; }",
+        ),
+        (
+            "node_modules/helpers/package.json",
+            "{\"name\": \"helpers\", \"main\": \"index.js\"}",
+        ),
+        (
+            "node_modules/helpers/index.js",
+            "var react = require('react'); exports.format = function () { return react; };",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1, "{:?}", report.coverage.gaps);
+    assert_eq!(
+        report.creations[0].reachability,
+        Reachability::Reachable,
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert_eq!(report.creations[0].invocations.len(), 1);
+    // The unrelated star target and the CommonJS package cannot export the names, so neither is
+    // parsed: the hook, leaf, entry, context, barrel, frame, and panel are.
+    assert_eq!(
+        report.coverage.processed_files, 7,
+        "{:?}",
+        report.coverage.gaps
+    );
+}
+
+#[test]
 fn all_creations_explores_configured_roots_when_expansion_budget_stops() {
     let mut files = vec![
         (

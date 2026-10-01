@@ -107,7 +107,8 @@ pull in the imported constants they depend on. A lightweight import scan also fi
 import exported wrappers returning the tracked callback or exported functions/components whose
 factory arguments are still unknown. It follows re-export barrels and evaluates direct imported
 calls and JSX uses in large importer files. The analysis expansion is bounded at 256 additional
-files and eight rounds, skips `node_modules`, and reuses parsed files within the run. Importer
+files and eight rounds, skips `node_modules`, and reuses parsed files within the run; the backward
+use walk below has its own 256-file budget. Importer
 functions below 20,000 bytes are evaluated with a 5,000-expression budget; larger files use direct
 callsites with unknown surrounding locals and a 64-callsite budget per function. These limits and
 the text filter leave coverage incomplete.
@@ -136,12 +137,26 @@ use walk follows the containing function or module binding through local referen
 re-exports, and imported references. It parses candidate importers on demand, prioritizing paths
 nearer the entry. The walk indexes resolved import targets as files are added, so repeated symbol
 checks do not rescan the growing resolution list. Root reachability is then evaluated forward
-through modeled calls and JSX in the expanded snapshot. For filtered `all_creations` queries, the
-roots run once discovery settles or reaches its budget; a discovery stop remains a coverage gap.
+through modeled calls and JSX in the expanded snapshot. The walk runs once discovery stops, whether
+it settled or reached its budget. For filtered `all_creations` queries, the roots run at the same
+point; a discovery stop remains a coverage gap.
 A root phase then parses only what those root paths need: imported values they read, unknown
-components whose files are on the import corridor toward factory hosts, and unknown components
-that receive children, `render`, or `component` props. It has its own budget of 128 files and six
-rounds, reported as a gap when reached. A parsed wrapper does not hide paths: JSX it drops after
+components whose files are on the import corridor toward factory hosts, and unknown components,
+including member tags such as `<Context.Provider>`, that receive children, `render`, or
+`component` props. It has its own budget of 512 files and eight rounds, reported as a gap when
+reached. A round that requests more files than remain takes them in the order root paths met
+them, nearest the entry first.
+
+Requests follow linkage rather than only the imported file: when an imported binding does not
+link, the files requested are the unparsed modules its import and re-export chain reached. A
+barrel's `export *` targets are often mostly unparsed. Such a target is ruled out without parsing
+when its text cannot export the name: an ES module exports only names it spells out, so a module
+that never mentions the name and has no forwarding syntax (`export *`, TS `export =`, identifier
+escapes, or CommonJS `exports` used other than as `exports.name` or
+`Object.defineProperty(exports, "name", ...)`) cannot provide it. Non-script files such as
+stylesheets may export anything. Only the remaining candidates are requested, and the binding links
+once they are parsed. A type-only import of a specifier does not hide a value re-export of the same
+specifier. A parsed wrapper does not hide paths: JSX it drops after
 reaching something the model cannot follow is still explored as possible, as described below. An
 import or symbol reference alone does not prove root reachability or
 runtime rendering. Unsupported dynamic loaders and registry wiring can still leave paths unknown;
