@@ -72,6 +72,16 @@ impl TrackedValue {
 
 type Environment = BTreeMap<String, TrackedValue>;
 
+/// What one heap write replaced, so an unknown branch can be rewound.
+struct HeapUndo {
+    id: u64,
+    value: Option<Rc<AbstractValue>>,
+    version: Option<u64>,
+}
+
+/// Heap entries one branch wrote, with their values at the end of the branch.
+type HeapBranch = BTreeMap<u64, (Option<Rc<AbstractValue>>, Option<u64>)>;
+
 #[derive(Clone)]
 enum AbstractValue {
     Null,
@@ -466,6 +476,9 @@ struct Solver<'a> {
     module_env_cache_misses: usize,
     heap: BTreeMap<u64, Rc<AbstractValue>>,
     heap_versions: BTreeMap<u64, u64>,
+    /// Values that heap writes replaced while an unknown branch is open, newest last.
+    heap_journal: Vec<HeapUndo>,
+    open_heap_branches: usize,
     next_heap_id: u64,
     evidence: Vec<Evidence>,
     capabilities: Vec<CapabilityState>,
@@ -593,6 +606,8 @@ impl<'a> Solver<'a> {
             module_env_cache_misses: 0,
             heap: BTreeMap::new(),
             heap_versions: BTreeMap::new(),
+            heap_journal: Vec::new(),
+            open_heap_branches: 0,
             next_heap_id: 0,
             evidence: Vec::new(),
             capabilities: Vec::new(),
@@ -1148,8 +1163,7 @@ impl<'a> Solver<'a> {
                             }
                         }
                         _ => {
-                            let initial_heap = self.heap.clone();
-                            let initial_versions = self.heap_versions.clone();
+                            let mark = self.open_heap_branch();
                             let mut consequent_environment = environment.clone();
                             let mut alternate_environment = environment.clone();
                             refine_environment_for_condition(
@@ -1167,19 +1181,11 @@ impl<'a> Solver<'a> {
                                 &mut consequent_environment,
                                 file_id,
                             );
-                            let left_heap = self.heap.clone();
-                            let left_versions = self.heap_versions.clone();
-                            self.heap = initial_heap.clone();
-                            self.heap_versions = initial_versions.clone();
+                            let left_heap = self.rewind_heap_branch(mark);
                             let right =
                                 self.execute_branch(alternate, &mut alternate_environment, file_id);
-                            self.join_heap_branches(
-                                &initial_heap,
-                                &initial_versions,
-                                &left_heap,
-                                &left_versions,
-                                span,
-                            );
+                            let right_heap = self.rewind_heap_branch(mark);
+                            self.join_heap_branches(left_heap, right_heap, span);
                             match (left, right) {
                                 (Some(left), Some(right)) => {
                                     return Some(TrackedValue::plain(AbstractValue::union(vec![
@@ -1314,8 +1320,7 @@ impl<'a> Solver<'a> {
             },
         );
         if let Some(id) = previous.heap_id {
-            self.heap.insert(id, Rc::new(value));
-            *self.heap_versions.entry(id).or_default() += 1;
+            self.bump_heap(id, value);
         }
         true
     }
@@ -1534,8 +1539,7 @@ impl<'a> Solver<'a> {
         Rc::make_mut(&mut fields).insert(property.to_owned(), value);
         let updated = AbstractValue::Record(fields);
         if let Some(id) = previous.heap_id {
-            self.heap.insert(id, Rc::new(updated.clone()));
-            *self.heap_versions.entry(id).or_default() += 1;
+            self.bump_heap(id, updated.clone());
         }
         environment.insert(
             name.clone(),
@@ -2156,8 +2160,7 @@ impl<'a> Solver<'a> {
         {
             let id = self.next_heap_id;
             self.next_heap_id += 1;
-            self.heap.insert(id, Rc::new(value.value.clone()));
-            self.heap_versions.insert(id, 0);
+            self.write_heap(id, Rc::new(value.value.clone()), 0);
             value.heap_id = Some(id);
         }
         value
@@ -2173,48 +2176,94 @@ impl<'a> Solver<'a> {
         result
     }
 
-    fn join_heap_branches(
-        &mut self,
-        initial: &BTreeMap<u64, Rc<AbstractValue>>,
-        initial_versions: &BTreeMap<u64, u64>,
-        left: &BTreeMap<u64, Rc<AbstractValue>>,
-        left_versions: &BTreeMap<u64, u64>,
-        span: &SourceSpan,
-    ) {
-        let right = self.heap.clone();
-        let right_versions = self.heap_versions.clone();
-        for id in initial
+    fn write_heap(&mut self, id: u64, value: Rc<AbstractValue>, version: u64) {
+        let value = self.heap.insert(id, value);
+        let version = self.heap_versions.insert(id, version);
+        if self.open_heap_branches > 0 {
+            self.heap_journal.push(HeapUndo { id, value, version });
+        }
+    }
+
+    fn bump_heap(&mut self, id: u64, value: AbstractValue) {
+        let version = self.heap_versions.get(&id).map_or(1, |version| version + 1);
+        self.write_heap(id, Rc::new(value), version);
+    }
+
+    fn clear_heap(&mut self) {
+        debug_assert_eq!(self.open_heap_branches, 0);
+        self.heap.clear();
+        self.heap_versions.clear();
+        self.heap_journal.clear();
+    }
+
+    fn open_heap_branch(&mut self) -> usize {
+        self.open_heap_branches += 1;
+        self.heap_journal.len()
+    }
+
+    /// Returns the entries one branch changed and restores the heap to where the branch began.
+    fn rewind_heap_branch(&mut self, mark: usize) -> HeapBranch {
+        let mut changed = BTreeMap::new();
+        for undo in &self.heap_journal[mark..] {
+            changed.entry(undo.id).or_insert_with(|| {
+                (
+                    self.heap.get(&undo.id).cloned(),
+                    self.heap_versions.get(&undo.id).copied(),
+                )
+            });
+        }
+        while self.heap_journal.len() > mark {
+            let undo = self.heap_journal.pop().expect("journal entry");
+            match undo.value {
+                Some(value) => self.heap.insert(undo.id, value),
+                None => self.heap.remove(&undo.id),
+            };
+            match undo.version {
+                Some(version) => self.heap_versions.insert(undo.id, version),
+                None => self.heap_versions.remove(&undo.id),
+            };
+        }
+        changed
+    }
+
+    /// Joins two branches that started from the current heap. Only entries a branch wrote can
+    /// differ from the start, so the join visits those alone.
+    fn join_heap_branches(&mut self, left: HeapBranch, right: HeapBranch, span: &SourceSpan) {
+        self.open_heap_branches -= 1;
+        let ids = left
             .keys()
-            .chain(left.keys())
             .chain(right.keys())
             .copied()
-            .collect::<BTreeSet<_>>()
-        {
-            let left_value = left.get(&id).or_else(|| initial.get(&id));
-            let right_value = right.get(&id).or_else(|| initial.get(&id));
-            let baseline = initial_versions.get(&id).copied().unwrap_or(0);
-            let left_version = left_versions.get(&id).copied().unwrap_or(baseline);
-            let right_version = right_versions.get(&id).copied().unwrap_or(baseline);
-            let joined = match (left_value, right_value) {
+            .collect::<BTreeSet<_>>();
+        for id in ids {
+            let initial = self.heap.get(&id).cloned();
+            let baseline = self.heap_versions.get(&id).copied().unwrap_or(0);
+            let side = |branch: &HeapBranch| match branch.get(&id) {
+                Some((value, version)) => (value.clone(), version.unwrap_or(baseline)),
+                None => (initial.clone(), baseline),
+            };
+            let (left_value, left_version) = side(&left);
+            let (right_value, right_version) = side(&right);
+            let joined = match (&left_value, &right_value) {
                 (Some(left), Some(right))
                     if left_version != baseline || right_version != baseline =>
                 {
                     let mut alternatives = Vec::new();
                     collect_heap_alternatives(left, &mut alternatives);
                     collect_heap_alternatives(right, &mut alternatives);
-                    if alternatives.len() > MAX_HEAP_ALTERNATIVES {
+                    Rc::new(if alternatives.len() > MAX_HEAP_ALTERNATIVES {
                         self.record_coverage_gap("heap alternative budget exhausted", span);
                         AbstractValue::Unknown("heap_alternative_budget_exhausted".to_owned())
                     } else {
                         AbstractValue::union(alternatives)
-                    }
+                    })
                 }
-                (Some(value), _) | (_, Some(value)) => (**value).clone(),
+                (Some(value), _) | (_, Some(value)) => value.clone(),
                 (None, None) => continue,
             };
-            self.heap.insert(id, Rc::new(joined));
-            self.heap_versions.insert(
+            self.write_heap(
                 id,
+                joined,
                 left_version.max(right_version)
                     + u64::from(left_version != baseline || right_version != baseline),
             );
@@ -3947,8 +3996,7 @@ impl<'a> Solver<'a> {
     fn seed_unreached_creations(&mut self) {
         for candidate in self.factory_candidates() {
             // Each unreached callsite is a separate hypothetical execution.
-            self.heap.clear();
-            self.heap_versions.clear();
+            self.clear_heap();
             if !self.expression_matches_model(candidate.file_id, &candidate.callee) {
                 if self.possible_unresolved_factory_call(&candidate) {
                     self.record_coverage_gap(
@@ -4210,8 +4258,7 @@ impl<'a> Solver<'a> {
                 continue;
             }
             for function in &file.flow.functions {
-                self.heap.clear();
-                self.heap_versions.clear();
+                self.clear_heap();
                 let mut references = ClosureReferences::default();
                 for statement in &function.body {
                     collect_statement_references(statement, &mut references);
@@ -4323,8 +4370,7 @@ impl<'a> Solver<'a> {
                 evaluation: QueryReverseImporterEvaluation::DirectImportUse,
                 span: expression.span.clone(),
             });
-            self.heap.clear();
-            self.heap_versions.clear();
+            self.clear_heap();
             let mut references = ClosureReferences::default();
             collect_expression_references(&expression, &mut references);
             let mut needed = references.names;

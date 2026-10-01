@@ -122,7 +122,9 @@ canonical-path caches, serves the whole query run, so files must not change whil
 each solver pass, module environments and resolved import links are reused; environments are
 invalidated when module globals initialize. Symbol linkage and the solver use per-snapshot file
 and import-resolution indexes instead of repeatedly scanning the snapshot. Solver values share closures, records, arrays, unions, and JSX elements and copy them only on
-write, so branch joins and calls do not deep-copy captured environments. Set
+write, so branch joins and calls do not deep-copy captured environments. While an unknown branch
+runs, heap writes record the value they replaced; the branch is rewound from that record, and the
+join visits only the heap entries either side wrote rather than the whole heap. Set
 `FOLLOWER_PROFILE_QUERY=1` to print generic phase timings and cache counts to stderr; use a release
 build when comparing timings.
 

@@ -43,6 +43,49 @@ fn callback_created_inside_a_branch_retains_its_identity_after_the_branch() {
 }
 
 #[test]
+fn nested_unknown_branches_rewind_record_writes_for_the_other_path() {
+    let fixture = TestProject::new(&[(
+        "src/Host.tsx",
+        "import { makeCallback } from './factory'; export function Host({ first, second }) { const labels = { value: 'start' }; const untouched = { value: 'steady' }; if (first) { labels.value = 'outer'; if (second) { labels.value = 'inner'; } else { const extra = { value: 'fresh' }; extra.value = 'changed'; } makeCallback(untouched.value).callback(labels.value); } else { makeCallback(labels.value).callback(untouched.value); } makeCallback('after').callback(untouched.value); }",
+    )]);
+    let report = fixture.report();
+    let rows = report
+        .creations
+        .iter()
+        .map(|creation| {
+            assert_eq!(creation.conclusion, Conclusion::CandidateInvocation);
+            assert_eq!(creation.invocations.len(), 1);
+            (
+                format!("{:?}", creation.factory_arguments["created"]),
+                format!("{:?}", creation.invocations[0].arguments["invoked"]),
+            )
+        })
+        .collect::<Vec<_>>();
+    let string = |value: &str| {
+        format!(
+            "{:?}",
+            QueryValue::String {
+                value: value.into()
+            }
+        )
+    };
+    let joined = format!(
+        "{:?}",
+        QueryValue::Unknown {
+            reason: "joined_alternatives".into()
+        }
+    );
+    assert_eq!(
+        rows,
+        [
+            (string("steady"), joined),
+            (string("start"), string("steady")),
+            (string("after"), string("steady")),
+        ]
+    );
+}
+
+#[test]
 fn partial_returns_preserve_callback_invocations_on_the_continuing_path() {
     for branch in [
         "if (flag) { return 'done'; }",
