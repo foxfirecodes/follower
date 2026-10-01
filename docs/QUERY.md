@@ -177,7 +177,7 @@ component_argument = 0
 [[lazy_component_factories]]
 module = "@sample/lazy"
 export = "loadComponent"
-promise_property = "loadModule"
+promise_property = "load"
 ```
 
 A consumer contract explores the named render callback, component prop, children, or a

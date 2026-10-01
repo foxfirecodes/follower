@@ -275,11 +275,11 @@ fn configured_lazy_factory_connects_literal_dynamic_import_without_widening_pars
         ),
         (
             "src/App.tsx",
-            "import { loadComponent } from './lazy'; const LazyPage = loadComponent({ loadModule: () => import('./Page') }); export function App() { return <LazyPage />; }",
+            "import { loadComponent } from './lazy'; const LazyPage = loadComponent({ load: () => import('./Page') }); export function App() { return <LazyPage />; }",
         ),
         ("src/Noise.tsx", "export function Noise() { return null; }"),
     ]);
-    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[lazy_component_factories]]\nmodule = './lazy'\nexport = 'loadComponent'\npromise_property = 'loadModule'\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[lazy_component_factories]]\nmodule = './lazy'\nexport = 'loadComponent'\npromise_property = 'load'\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
     fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
     let report = fixture.report();
     assert_eq!(report.creations.len(), 1);
