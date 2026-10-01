@@ -239,6 +239,7 @@ pub fn execute_query(
     QueryReport,
     BTreeSet<std::path::PathBuf>,
     BTreeSet<std::path::PathBuf>,
+    Vec<SourceSpan>,
 )> {
     let captures = query
         .factory_arguments
@@ -323,6 +324,18 @@ pub fn execute_query(
         .filter_map(|file_id| snapshot.files.iter().find(|file| file.file_id == *file_id))
         .map(|file| file.path.clone())
         .collect();
+    let reachable_seed_callsites = if query.scope == QueryScope::Reachable {
+        solver
+            .factory_candidates()
+            .into_iter()
+            .filter(|candidate| {
+                solver.expression_matches_model(candidate.file_id, &candidate.callee)
+            })
+            .map(|candidate| candidate.span)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let phase_start = Instant::now();
     let report = solver.query_report(query, query_hash);
     if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
@@ -331,7 +344,12 @@ pub fn execute_query(
             phase_start.elapsed().as_millis()
         );
     }
-    Ok((report, requested_imports, producer_paths))
+    Ok((
+        report,
+        requested_imports,
+        producer_paths,
+        reachable_seed_callsites,
+    ))
 }
 
 struct Solver<'a> {
@@ -2959,7 +2977,7 @@ impl<'a> Solver<'a> {
             == ValueResolution::Resolved(LinkedValue::Declaration(self.model_symbol.clone()))
     }
 
-    fn seed_unreached_creations(&mut self) {
+    fn factory_candidates(&self) -> Vec<FactoryCallCandidate> {
         let mut candidates = Vec::new();
         for file in &self.snapshot.files {
             for binding in &file.flow.globals {
@@ -2988,8 +3006,11 @@ impl<'a> Solver<'a> {
             )
         });
         candidates.dedup_by(|left, right| left.span == right.span);
+        candidates
+    }
 
-        for candidate in candidates {
+    fn seed_unreached_creations(&mut self) {
+        for candidate in self.factory_candidates() {
             // Each unreached callsite is a separate hypothetical execution.
             self.heap.clear();
             self.heap_versions.clear();
@@ -4214,6 +4235,20 @@ fn collect_statement_references(statement: &FlowStatement, references: &mut Clos
         FlowStatement::Unsupported(_) => references.has_unsupported = true,
         FlowStatement::Return { value: None, .. } => {}
     }
+}
+
+pub(crate) fn flow_statement_names(statements: &[FlowStatement]) -> BTreeSet<String> {
+    let mut references = ClosureReferences::default();
+    for statement in statements {
+        collect_statement_references(statement, &mut references);
+    }
+    references.names
+}
+
+pub(crate) fn flow_expression_names(expression: &FlowExpression) -> BTreeSet<String> {
+    let mut references = ClosureReferences::default();
+    collect_expression_references(expression, &mut references);
+    references.names
 }
 
 fn extend_binding_dependencies(statements: &[FlowStatement], names: &mut BTreeSet<String>) {

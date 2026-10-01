@@ -5,7 +5,7 @@ use code_flow::{
     queries::Conclusion,
     query::{
         QueryCallsiteStatus, QueryGapAssessment, QueryGapTarget, QueryReverseImporterEvaluation,
-        QueryScope, QueryValue, load_query,
+        QueryScope, QueryValue, Reachability, load_query,
     },
 };
 use support::TestProject;
@@ -80,6 +80,121 @@ fn configured_entry_is_indexed_without_matching_the_text_filter() {
     assert!(sources.iter().any(|path| path.ends_with("Host.tsx")));
     assert!(sources.iter().any(|path| path.ends_with("factory.ts")));
     assert!(!sources.iter().any(|path| path.ends_with("Unrelated.ts")));
+}
+
+#[test]
+fn backward_use_walk_finds_filtered_component_chain_to_entry() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; function useLocal() { const [, apply] = useItemSelection(['alpha']); apply('close'); } export function Leaf() { useLocal(); return null; }",
+        ),
+        (
+            "src/Middle.tsx",
+            "import { Leaf } from './Leaf'; export function Middle() { return <Leaf />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Middle } from './Middle'; export function App() { return <Middle />; }",
+        ),
+        ("src/Noise.tsx", "export function Noise() { return null; }"),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    assert_eq!(
+        report.coverage.processed_files, 4,
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert_eq!(report.creations.len(), 1);
+    assert_eq!(report.creations[0].reachability, Reachability::Reachable);
+    assert_eq!(report.creations[0].invocations.len(), 1);
+    assert_eq!(
+        report.creations[0].invocations[0].arguments["action"],
+        QueryValue::String {
+            value: "close".to_owned()
+        }
+    );
+}
+
+#[test]
+fn backward_import_without_use_does_not_claim_reachability() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf() { const [, apply] = useItemSelection(['alpha']); apply('close'); return null; }",
+        ),
+        (
+            "src/Middle.tsx",
+            "import { Leaf } from './Leaf'; export function Middle() { return <Leaf />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Middle } from './Middle'; export function App() { return null; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1);
+    assert_eq!(report.creations[0].reachability, Reachability::Unknown);
+    assert_eq!(report.coverage.processed_files, 3);
+}
+
+#[test]
+fn backward_use_walk_crosses_filtered_reexport() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf() { const [, apply] = useItemSelection(['alpha']); apply('close'); return null; }",
+        ),
+        ("src/barrel.ts", "export { Leaf as Feature } from './Leaf';"),
+        (
+            "src/App.tsx",
+            "import { Feature } from './barrel'; export function App() { return <Feature />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    assert_eq!(
+        report.coverage.processed_files, 4,
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert_eq!(report.creations.len(), 1);
+    assert_eq!(report.creations[0].reachability, Reachability::Reachable);
 }
 
 #[test]

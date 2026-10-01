@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
@@ -12,8 +12,8 @@ use crate::{
     cache::{FRONTEND_VERSION, SNAPSHOT_SCHEMA_VERSION, Snapshot},
     frontend::parse_and_lower,
     ids::FileId,
-    ir::{FlowExport, SourceSpan},
-    link::{LinkedValue, ModuleLinker, SymbolLinker, ValueResolution},
+    ir::{FileIr, FlowExport, SourceSpan},
+    link::{LinkedValue, ModuleLinker, SymbolLinker, ValueResolution, pattern_names},
     models::{Model, load_model_files},
     project::{Project, is_source_file},
     queries::AuditReport,
@@ -21,14 +21,132 @@ use crate::{
         QueryCallsite, QueryCallsiteInventory, QueryCallsiteStatus, QueryLocation, QueryReport,
         QuerySpec,
     },
+    solver::{flow_expression_names, flow_statement_names},
 };
 
 pub struct Analyzer {
     project: Project,
 }
 
+#[derive(Default)]
+struct FileUseIndex {
+    /// A reference to a local name can be owned by one or more functions or module bindings.
+    parents: BTreeMap<String, BTreeSet<String>>,
+    exports: BTreeMap<String, BTreeSet<String>>,
+    has_star_export: bool,
+}
+
+impl FileUseIndex {
+    fn new(file: &FileIr) -> Self {
+        let mut index = Self::default();
+        for function in &file.flow.functions {
+            for name in flow_statement_names(&function.body) {
+                index
+                    .parents
+                    .entry(name)
+                    .or_default()
+                    .insert(function.name.clone());
+            }
+        }
+        for binding in &file.flow.globals {
+            let owners = pattern_names(&binding.pattern)
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            for name in flow_expression_names(&binding.value) {
+                index
+                    .parents
+                    .entry(name)
+                    .or_default()
+                    .extend(owners.iter().cloned());
+            }
+        }
+        for export in &file.flow.exports {
+            match export {
+                FlowExport::Local {
+                    local,
+                    exported,
+                    type_only: false,
+                    ..
+                } => {
+                    index
+                        .exports
+                        .entry(local.clone())
+                        .or_default()
+                        .insert(exported.clone());
+                }
+                FlowExport::ReExport {
+                    exported,
+                    type_only: false,
+                    ..
+                }
+                | FlowExport::Namespace {
+                    exported,
+                    type_only: false,
+                    ..
+                } => {
+                    index
+                        .exports
+                        .entry(exported.clone())
+                        .or_default()
+                        .insert(exported.clone());
+                }
+                FlowExport::Star {
+                    type_only: false, ..
+                } => index.has_star_export = true,
+                _ => {}
+            }
+        }
+        index
+    }
+
+    fn exported_names(&self, local: &str) -> BTreeSet<String> {
+        let mut names = self.exports.get(local).cloned().unwrap_or_default();
+        if self.has_star_export && local != "default" {
+            names.insert(local.to_owned());
+        }
+        names
+    }
+}
+
+#[derive(Default)]
+struct BackwardUseWalk {
+    added_files: usize,
+    reached_entry: bool,
+    limit_hit: bool,
+    skipped_files: usize,
+}
+
+enum BackwardTask {
+    Symbol {
+        file_id: FileId,
+        symbol: String,
+        depth: usize,
+    },
+    Importer {
+        child: PathBuf,
+        exported: BTreeSet<String>,
+        path: PathBuf,
+        depth: usize,
+    },
+}
+
+fn enqueue_backward_task(
+    pending: &mut BTreeMap<(usize, usize, usize), BackwardTask>,
+    sequence: &mut usize,
+    corridor: &BTreeMap<PathBuf, usize>,
+    path: &Path,
+    depth: usize,
+    task: BackwardTask,
+) {
+    if let Some(distance) = corridor.get(path) {
+        pending.insert((*distance, depth, *sequence), task);
+        *sequence += 1;
+    }
+}
+
 struct SourceCatalog {
-    imports: Vec<(PathBuf, Vec<String>)>,
+    imports_by_stem: BTreeMap<String, Vec<(PathBuf, String)>>,
     configured_files: usize,
     candidate_paths: BTreeSet<PathBuf>,
     skipped_candidate_files: usize,
@@ -37,7 +155,7 @@ struct SourceCatalog {
 
 impl SourceCatalog {
     fn build(project: &Project, query: &QuerySpec) -> Result<Self> {
-        let mut imports = Vec::new();
+        let mut imports_by_stem: BTreeMap<String, Vec<(PathBuf, String)>> = BTreeMap::new();
         let mut configured_files = 0;
         let mut candidate_paths = BTreeSet::new();
         for path in project.discover_all_sources()? {
@@ -54,12 +172,20 @@ impl SourceCatalog {
                 candidate_paths.insert(path.clone());
             }
             let specifiers = module_specifiers(&source);
-            if !specifiers.is_empty() {
-                imports.push((path, specifiers));
+            for specifier in specifiers {
+                if let Some(stem) = Path::new(&specifier)
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                {
+                    imports_by_stem
+                        .entry(stem.to_owned())
+                        .or_default()
+                        .push((path.clone(), specifier));
+                }
             }
         }
         let mut catalog = Self {
-            imports,
+            imports_by_stem,
             configured_files,
             candidate_paths,
             skipped_candidate_files: 0,
@@ -165,15 +291,9 @@ impl SourceCatalog {
             .collect::<BTreeSet<_>>();
         let linker = ModuleLinker::new(project);
         let mut result = BTreeSet::new();
-        for (importer, specifiers) in &self.imports {
-            if targets.contains(importer) {
-                continue;
-            }
-            for specifier in specifiers {
-                let stem = Path::new(specifier)
-                    .file_stem()
-                    .and_then(|name| name.to_str());
-                if !stem.is_some_and(|stem| names.contains(stem)) {
+        for name in names {
+            for (importer, specifier) in self.imports_by_stem.get(&name).into_iter().flatten() {
+                if targets.contains(importer) {
                     continue;
                 }
                 let resolution = linker.resolve(
@@ -192,11 +312,82 @@ impl SourceCatalog {
                     .is_some_and(|path| targets.contains(path))
                 {
                     result.insert(importer.clone());
-                    break;
                 }
             }
         }
         result
+    }
+
+    /// Find the cheap import-graph corridor from creation files toward configured roots.
+    /// Semantic uses are checked only after this has discarded unrelated importers.
+    fn entry_corridor(
+        &self,
+        project: &Project,
+        seeds: &BTreeSet<PathBuf>,
+    ) -> (BTreeMap<PathBuf, usize>, bool) {
+        let entries = project
+            .config
+            .entries
+            .iter()
+            .filter_map(|entry| project.resolve_path(&entry.module).canonicalize().ok())
+            .collect::<BTreeSet<_>>();
+        let mut visited = seeds.clone();
+        let mut frontier = seeds.clone();
+        let mut children: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+        let mut hit_limit = false;
+        for _ in 0..32 {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next = BTreeSet::new();
+            for child in &frontier {
+                for importer in self.reverse_importers(project, &BTreeSet::from([child.clone()])) {
+                    children
+                        .entry(importer.clone())
+                        .or_default()
+                        .insert(child.clone());
+                    if !visited.contains(&importer) {
+                        if visited.len() >= 16_384 {
+                            hit_limit = true;
+                            break;
+                        }
+                        visited.insert(importer.clone());
+                        next.insert(importer);
+                    }
+                }
+                if hit_limit {
+                    break;
+                }
+            }
+            if hit_limit {
+                break;
+            }
+            frontier = next;
+        }
+        if !frontier.is_empty() {
+            hit_limit = true;
+        }
+        let mut corridor = BTreeMap::new();
+        let mut pending = entries
+            .intersection(&visited)
+            .cloned()
+            .map(|path| (path, 0_usize))
+            .collect::<VecDeque<_>>();
+        while let Some((path, distance)) = pending.pop_front() {
+            if corridor.contains_key(&path) {
+                continue;
+            }
+            corridor.insert(path.clone(), distance);
+            pending.extend(
+                children
+                    .get(&path)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .map(|child| (child, distance + 1)),
+            );
+        }
+        (corridor, hit_limit)
     }
 }
 
@@ -296,6 +487,258 @@ impl Analyzer {
         })
     }
 
+    fn walk_backward_uses(
+        &self,
+        snapshot: &mut Snapshot,
+        catalog: &SourceCatalog,
+        corridor: &BTreeMap<PathBuf, usize>,
+        callsites: &[SourceSpan],
+        file_budget: usize,
+    ) -> BackwardUseWalk {
+        let mut result = BackwardUseWalk::default();
+        let mut pending = BTreeMap::new();
+        let mut sequence = 0;
+        for callsite in callsites {
+            let Some(file) = snapshot
+                .files
+                .iter()
+                .find(|file| file.file_id == callsite.file_id)
+            else {
+                continue;
+            };
+            let owner = file
+                .flow
+                .functions
+                .iter()
+                .filter(|function| {
+                    function.span.start <= callsite.start && callsite.end <= function.span.end
+                })
+                .min_by_key(|function| function.span.end - function.span.start)
+                .map(|function| function.name.clone());
+            if let Some(owner) = owner {
+                enqueue_backward_task(
+                    &mut pending,
+                    &mut sequence,
+                    corridor,
+                    &file.path,
+                    0,
+                    BackwardTask::Symbol {
+                        file_id: file.file_id,
+                        symbol: owner,
+                        depth: 0,
+                    },
+                );
+            } else {
+                for binding in &file.flow.globals {
+                    if binding.value.span.start <= callsite.start
+                        && callsite.end <= binding.value.span.end
+                    {
+                        for owner in pattern_names(&binding.pattern) {
+                            enqueue_backward_task(
+                                &mut pending,
+                                &mut sequence,
+                                corridor,
+                                &file.path,
+                                0,
+                                BackwardTask::Symbol {
+                                    file_id: file.file_id,
+                                    symbol: owner.to_owned(),
+                                    depth: 0,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let entries = self
+            .project
+            .config
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                self.project
+                    .resolve_path(&entry.module)
+                    .canonicalize()
+                    .ok()
+                    .map(|path| (path, entry.export.clone()))
+            })
+            .collect::<BTreeSet<_>>();
+        let mut visited = BTreeSet::new();
+        let mut indexes: BTreeMap<FileId, FileUseIndex> = BTreeMap::new();
+        let mut reverse_cache: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+        while let Some((_, task)) = pending.pop_first() {
+            match task {
+                BackwardTask::Symbol {
+                    file_id,
+                    symbol,
+                    depth,
+                } => {
+                    if !visited.insert((file_id, symbol.clone())) {
+                        continue;
+                    }
+                    if visited.len() > 20_000 || depth > 32 {
+                        result.limit_hit = true;
+                        break;
+                    }
+                    let Some(file) = snapshot.files.iter().find(|file| file.file_id == file_id)
+                    else {
+                        continue;
+                    };
+                    let path = file.path.clone();
+                    let index = indexes
+                        .entry(file_id)
+                        .or_insert_with(|| FileUseIndex::new(file));
+                    let parents = index.parents.get(&symbol).cloned().unwrap_or_default();
+                    let exported = index.exported_names(&symbol);
+                    if entries.iter().any(|(entry_path, entry_export)| {
+                        *entry_path == path && exported.contains(entry_export)
+                    }) {
+                        result.reached_entry = true;
+                        continue;
+                    }
+                    for parent in parents {
+                        enqueue_backward_task(
+                            &mut pending,
+                            &mut sequence,
+                            corridor,
+                            &path,
+                            depth + 1,
+                            BackwardTask::Symbol {
+                                file_id,
+                                symbol: parent,
+                                depth: depth + 1,
+                            },
+                        );
+                    }
+                    if exported.is_empty() {
+                        continue;
+                    }
+                    let importers = reverse_cache
+                        .entry(path.clone())
+                        .or_insert_with(|| {
+                            catalog
+                                .reverse_importers(&self.project, &BTreeSet::from([path.clone()]))
+                        })
+                        .clone();
+                    for importer_path in importers {
+                        enqueue_backward_task(
+                            &mut pending,
+                            &mut sequence,
+                            corridor,
+                            &importer_path,
+                            depth + 1,
+                            BackwardTask::Importer {
+                                child: path.clone(),
+                                exported: exported.clone(),
+                                path: importer_path.clone(),
+                                depth: depth + 1,
+                            },
+                        );
+                    }
+                }
+                BackwardTask::Importer {
+                    child,
+                    exported,
+                    path,
+                    depth,
+                } => {
+                    if !snapshot.files.iter().any(|file| file.path == path) {
+                        if result.added_files >= file_budget {
+                            result.limit_hit = true;
+                            break;
+                        }
+                        if self
+                            .extend_snapshot(snapshot, std::slice::from_ref(&path))
+                            .is_err()
+                        {
+                            result.skipped_files += 1;
+                            continue;
+                        }
+                        result.added_files += 1;
+                    }
+                    let Some(importer) = snapshot.files.iter().find(|file| file.path == path)
+                    else {
+                        continue;
+                    };
+                    let importer_id = importer.file_id;
+                    let importer_index = indexes
+                        .entry(importer_id)
+                        .or_insert_with(|| FileUseIndex::new(importer));
+                    let matches_target = |module: &str| {
+                        snapshot.resolutions.iter().any(|resolution| {
+                            resolution.importer == path
+                                && resolution.specifier == module
+                                && resolution.resolved_path.as_ref() == Some(&child)
+                        })
+                    };
+                    for import in &importer.flow.imports {
+                        if import.type_only
+                            || !matches_target(&import.module)
+                            || (import.imported != "*" && !exported.contains(&import.imported))
+                        {
+                            continue;
+                        }
+                        if importer_index.parents.contains_key(&import.local)
+                            || !importer_index.exported_names(&import.local).is_empty()
+                        {
+                            enqueue_backward_task(
+                                &mut pending,
+                                &mut sequence,
+                                corridor,
+                                &path,
+                                depth,
+                                BackwardTask::Symbol {
+                                    file_id: importer_id,
+                                    symbol: import.local.clone(),
+                                    depth,
+                                },
+                            );
+                        }
+                    }
+                    for export in &importer.flow.exports {
+                        let forwarded = match export {
+                            FlowExport::ReExport {
+                                imported,
+                                exported: forwarded,
+                                module,
+                                type_only: false,
+                                ..
+                            } if matches_target(module) && exported.contains(imported) => {
+                                vec![forwarded.clone()]
+                            }
+                            FlowExport::Star {
+                                module,
+                                type_only: false,
+                                ..
+                            } if matches_target(module) => exported
+                                .iter()
+                                .filter(|name| *name != "default")
+                                .cloned()
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        for symbol in forwarded {
+                            enqueue_backward_task(
+                                &mut pending,
+                                &mut sequence,
+                                corridor,
+                                &path,
+                                depth,
+                                BackwardTask::Symbol {
+                                    file_id: importer_id,
+                                    symbol,
+                                    depth,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
     pub fn default_snapshot_path(&self) -> std::path::PathBuf {
         self.project.root.join(Path::new(".flow/snapshot.json"))
     }
@@ -325,15 +768,24 @@ impl Analyzer {
         let mut skipped = BTreeSet::new();
         let mut reverse_seed_paths = BTreeSet::new();
         let mut reverse_producer_paths = BTreeSet::new();
+        let mut walked_callsites = BTreeSet::new();
+        let mut backward_limit_hit = false;
+        let mut backward_skipped_files = 0;
+        let mut no_modeled_entry_use = false;
+        let mut corridor_limit_hit = false;
+        let mut entry_path_not_found = 0;
+        let mut corridor_seeds = BTreeSet::new();
+        let mut entry_corridor = BTreeMap::new();
         for round in 0..=8 {
-            let (mut report, requests, producers) = crate::solver::execute_query(
-                &self.project,
-                &snapshot,
-                query,
-                query_hash,
-                &reverse_seed_paths,
-                &reverse_producer_paths,
-            )?;
+            let (mut report, requests, producers, reachable_seed_callsites) =
+                crate::solver::execute_query(
+                    &self.project,
+                    &snapshot,
+                    query,
+                    query_hash,
+                    &reverse_seed_paths,
+                    &reverse_producer_paths,
+                )?;
             if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
                 eprintln!(
                     "query round {round}: indexed={} requested={} producers={} reverse_seeds={}",
@@ -348,10 +800,12 @@ impl Analyzer {
                 report.finish_gaps();
                 return Ok(report);
             }
+            let catalog = catalog
+                .as_ref()
+                .context("filtered query has no source catalog")?;
             reverse_producer_paths.extend(producers);
-            let reverse_requests = catalog.as_ref().map_or_else(BTreeSet::new, |catalog| {
-                catalog.reverse_importers(&self.project, &reverse_producer_paths)
-            });
+            let reverse_requests =
+                catalog.reverse_importers(&self.project, &reverse_producer_paths);
             if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
                 eprintln!(
                     "query round {round}: reverse_candidates={}",
@@ -379,6 +833,71 @@ impl Analyzer {
                     skipped.insert(path.clone());
                 }
             }
+            if additions.is_empty() && round < 8 && !self.project.config.entries.is_empty() {
+                let callsites = report
+                    .creations
+                    .iter()
+                    .map(|creation| creation.factory_callsite.clone())
+                    .chain(reachable_seed_callsites)
+                    .filter(|span| walked_callsites.insert((span.file_id, span.start, span.end)))
+                    .collect::<Vec<_>>();
+                if !callsites.is_empty() {
+                    let new_paths = callsites
+                        .iter()
+                        .filter_map(|span| {
+                            snapshot
+                                .files
+                                .iter()
+                                .find(|file| file.file_id == span.file_id)
+                                .map(|file| file.path.clone())
+                        })
+                        .filter(|path| corridor_seeds.insert(path.clone()))
+                        .collect::<BTreeSet<_>>();
+                    if !new_paths.is_empty() {
+                        let (paths, hit_limit) = catalog.entry_corridor(&self.project, &new_paths);
+                        entry_path_not_found += new_paths
+                            .iter()
+                            .filter(|path| !paths.contains_key(*path))
+                            .count();
+                        entry_corridor.extend(paths);
+                        corridor_limit_hit |= hit_limit;
+                        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+                            eprintln!(
+                                "query entry corridor: seeds={} paths={} limit_hit={}",
+                                new_paths.len(),
+                                entry_corridor.len(),
+                                hit_limit
+                            );
+                        }
+                    }
+                    let original_files = snapshot.files.len();
+                    let original_resolutions = snapshot.resolutions.len();
+                    let original_snapshot_id = snapshot.snapshot_id.clone();
+                    let walk = self.walk_backward_uses(
+                        &mut snapshot,
+                        catalog,
+                        &entry_corridor,
+                        &callsites,
+                        256_usize.saturating_sub(followed),
+                    );
+                    backward_limit_hit |= walk.limit_hit;
+                    backward_skipped_files += walk.skipped_files;
+                    no_modeled_entry_use |= !walk.reached_entry;
+                    if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+                        eprintln!(
+                            "query backward uses: parsed={} reached_entry={} limit_hit={}",
+                            walk.added_files, walk.reached_entry, walk.limit_hit
+                        );
+                    }
+                    if walk.reached_entry && walk.added_files > 0 {
+                        followed += walk.added_files;
+                        continue;
+                    }
+                    snapshot.files.truncate(original_files);
+                    snapshot.resolutions.truncate(original_resolutions);
+                    snapshot.snapshot_id = original_snapshot_id;
+                }
+            }
             if additions.is_empty() || round == 8 || followed + additions.len() > 256 {
                 if !additions.is_empty() {
                     report.coverage.gaps.push(format!(
@@ -392,10 +911,38 @@ impl Analyzer {
                         skipped.len()
                     ));
                 }
+                if backward_limit_hit {
+                    report.coverage.gaps.push(
+                        "backward component use walk stopped at its file, depth, or symbol budget"
+                            .to_owned(),
+                    );
+                }
+                if corridor_limit_hit {
+                    report.coverage.gaps.push(
+                        "backward import scan stopped at its graph or depth budget; entry paths may be missing"
+                            .to_owned(),
+                    );
+                }
+                if entry_path_not_found > 0 {
+                    report.coverage.gaps.push(format!(
+                        "backward import scan found no modeled path to an entry for {entry_path_not_found} factory-host files"
+                    ));
+                }
+                if backward_skipped_files > 0 {
+                    report.coverage.gaps.push(format!(
+                        "backward component use walk could not parse {backward_skipped_files} candidate files"
+                    ));
+                }
+                if no_modeled_entry_use {
+                    report.coverage.gaps.push(
+                        "backward component use walk found no modeled use chain to an entry; unmodeled loaders or registries may still connect them"
+                            .to_owned(),
+                    );
+                }
                 if !report.coverage.gaps.is_empty() {
                     report.coverage.complete = false;
                 }
-                self.attach_callsite_inventory(&mut report, &snapshot, query, catalog.as_ref())?;
+                self.attach_callsite_inventory(&mut report, &snapshot, query, Some(catalog))?;
                 report.finish_gaps();
                 return Ok(report);
             }

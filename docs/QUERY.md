@@ -119,10 +119,14 @@ links are reused; environments are invalidated when module globals initialize. S
 
 Configured `[[entries]]` modules are indexed even if the text prefilter does not match them. This
 does not index every source file: the initial parse still uses the filter, then import expansion
-adds files needed for modeled flow. Root reachability is evaluated forward through modeled calls
-and JSX. Reverse importer discovery walks from a known producer toward files that import it and
-evaluates relevant functions with unknown parameters; an import alone does not prove root
-reachability or runtime rendering. Each expansion round currently rebuilds the solver and
+adds files needed for modeled flow. After that expansion settles, queries with entries use the
+lightweight import graph to find candidate paths from factory callsites toward entries. A backward
+use walk follows the containing function or module binding through local references, exports,
+re-exports, and imported references. It parses candidate importers on demand, prioritizing paths
+nearer the entry. Root reachability is then evaluated forward through modeled calls and JSX in
+the expanded snapshot. An import or symbol reference alone does not prove root reachability or
+runtime rendering. Unsupported dynamic loaders and registry wiring can still leave paths unknown;
+budget limits are reported as coverage gaps. Each expansion round currently rebuilds the solver and
 re-evaluates previously discovered reverse importer seeds. Query report schema version 6 records
 the seed's function or module binding, source location, matched import names, and evaluation mode
 in each creation's optional `reverse_importer` field. The HTML detail and creation list show it.
