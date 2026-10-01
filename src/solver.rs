@@ -33,6 +33,7 @@ use crate::{
 
 const MAX_CALL_DEPTH: usize = 128;
 const MAX_REVERSE_IMPORTER_EVALUATIONS: usize = 5_000;
+const MAX_UNREACHED_RENDER_EVALUATIONS: usize = 5_000;
 const MAX_REVERSE_IMPORTER_SOURCE_BYTES: usize = 20_000;
 const MAX_HEAP_ALTERNATIVES: usize = 32;
 const MAX_RENDER_VISITS_PER_SITE: usize = 16;
@@ -405,6 +406,10 @@ struct Solver<'a> {
     reverse_evaluations: usize,
     reverse_budget_active: bool,
     reverse_budget_reported: bool,
+    unreached_render_evaluations: usize,
+    unreached_render_budget_active: bool,
+    unreached_render_budget_reported: bool,
+    unreached_render_seed_span: Option<SourceSpan>,
     render_visits: BTreeMap<(Option<String>, FileId, u32, String), usize>,
     trace: Vec<TraceStep>,
 }
@@ -526,6 +531,10 @@ impl<'a> Solver<'a> {
             reverse_evaluations: 0,
             reverse_budget_active: false,
             reverse_budget_reported: false,
+            unreached_render_evaluations: 0,
+            unreached_render_budget_active: false,
+            unreached_render_budget_reported: false,
+            unreached_render_seed_span: None,
             render_visits: BTreeMap::new(),
             trace: Vec::new(),
         })
@@ -1525,6 +1534,24 @@ impl<'a> Solver<'a> {
         environment: &Environment,
         file_id: FileId,
     ) -> TrackedValue {
+        if self.unreached_render_budget_active {
+            self.unreached_render_evaluations += 1;
+            if self.unreached_render_evaluations > MAX_UNREACHED_RENDER_EVALUATIONS {
+                if !self.unreached_render_budget_reported {
+                    self.mark_values_unresolved(
+                        environment.values(),
+                        "unreached component render budget exhausted",
+                        expression.span.clone(),
+                    );
+                    self.record_coverage_gap(
+                        "unreached component render budget exhausted",
+                        &expression.span,
+                    );
+                    self.unreached_render_budget_reported = true;
+                }
+                return TrackedValue::unknown("unreached_render_budget_exhausted");
+            }
+        }
         if self.reverse_budget_active {
             self.reverse_evaluations += 1;
             if self.reverse_evaluations > MAX_REVERSE_IMPORTER_EVALUATIONS {
@@ -2677,6 +2704,26 @@ impl<'a> Solver<'a> {
     }
 
     fn render(&mut self, value: TrackedValue) {
+        if self.unreached_render_budget_active {
+            self.unreached_render_evaluations += 1;
+            if self.unreached_render_evaluations > MAX_UNREACHED_RENDER_EVALUATIONS {
+                if !self.unreached_render_budget_reported {
+                    let span = self
+                        .unreached_render_seed_span
+                        .as_ref()
+                        .expect("active unreached render has a seed span")
+                        .clone();
+                    self.mark_value_unresolved(
+                        &value,
+                        "unreached component render budget exhausted",
+                        span.clone(),
+                    );
+                    self.record_coverage_gap("unreached component render budget exhausted", &span);
+                    self.unreached_render_budget_reported = true;
+                }
+                return;
+            }
+        }
         let element = match value.value {
             AbstractValue::Element(element) => element,
             AbstractValue::Array(values) | AbstractValue::Union(values) => {
@@ -3392,7 +3439,7 @@ impl<'a> Solver<'a> {
                     .map(|_| TrackedValue::unknown("unreached_function_parameter"))
                     .collect();
                 let returned = self.call_function(key, arguments);
-                self.render(returned);
+                self.render_unreached(returned, &candidate.span);
             } else if let Some(binding) = self
                 .snapshot
                 .files
@@ -3426,7 +3473,7 @@ impl<'a> Solver<'a> {
                     if exported && returns_capability_data(&returned) {
                         self.capability_producer_files.insert(candidate.file_id);
                     }
-                    self.render(returned);
+                    self.render_unreached(returned, &candidate.span);
                 }
             }
             if !self
@@ -3480,6 +3527,16 @@ impl<'a> Solver<'a> {
         }
         self.current_choice = None;
         self.current_reachability = Reachability::Reachable;
+    }
+
+    fn render_unreached(&mut self, value: TrackedValue, span: &SourceSpan) {
+        self.unreached_render_evaluations = 0;
+        self.unreached_render_budget_reported = false;
+        self.unreached_render_seed_span = Some(span.clone());
+        self.unreached_render_budget_active = true;
+        self.render(value);
+        self.unreached_render_budget_active = false;
+        self.unreached_render_seed_span = None;
     }
 
     fn request_factory_argument_imports(&mut self, candidate: &FactoryCallCandidate) {

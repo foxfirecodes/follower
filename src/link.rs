@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -138,6 +138,9 @@ impl ModuleLinker {
 pub struct SymbolLinker<'a> {
     project: &'a Project,
     snapshot: &'a Snapshot,
+    file_by_id: BTreeMap<FileId, usize>,
+    file_by_path: BTreeMap<PathBuf, usize>,
+    resolution_by_importer: BTreeMap<PathBuf, BTreeMap<String, Option<PathBuf>>>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -170,8 +173,28 @@ impl ValueResolution {
 }
 
 impl<'a> SymbolLinker<'a> {
-    pub const fn new(project: &'a Project, snapshot: &'a Snapshot) -> Self {
-        Self { project, snapshot }
+    pub fn new(project: &'a Project, snapshot: &'a Snapshot) -> Self {
+        let mut file_by_id = BTreeMap::new();
+        let mut file_by_path = BTreeMap::new();
+        for (index, file) in snapshot.files.iter().enumerate() {
+            file_by_id.entry(file.file_id).or_insert(index);
+            file_by_path.entry(file.path.clone()).or_insert(index);
+        }
+        let mut resolution_by_importer = BTreeMap::new();
+        for resolution in &snapshot.resolutions {
+            resolution_by_importer
+                .entry(resolution.importer.clone())
+                .or_insert_with(BTreeMap::new)
+                .entry(resolution.specifier.clone())
+                .or_insert_with(|| resolution.resolved_path.clone());
+        }
+        Self {
+            project,
+            snapshot,
+            file_by_id,
+            file_by_path,
+            resolution_by_importer,
+        }
     }
 
     pub fn imported_binding_matches(
@@ -301,7 +324,8 @@ impl<'a> SymbolLinker<'a> {
 
     fn resolve_namespace(&self, file: &FileIr, module: &str) -> ValueResolution {
         self.resolved_module(file, module)
-            .and_then(|path| self.snapshot.files.iter().find(|file| file.path == path))
+            .and_then(|path| self.file_by_path.get(path))
+            .and_then(|index| self.snapshot.files.get(*index))
             .map_or(ValueResolution::Unresolved, |file| {
                 ValueResolution::Resolved(LinkedValue::Namespace(file.file_id))
             })
@@ -317,10 +341,9 @@ impl<'a> SymbolLinker<'a> {
             return ValueResolution::Missing;
         }
         let Some(file) = self
-            .snapshot
-            .files
-            .iter()
-            .find(|file| file.path == module_path)
+            .file_by_path
+            .get(module_path)
+            .and_then(|index| self.snapshot.files.get(*index))
         else {
             visited.remove(&(module_path.to_path_buf(), export_name.to_owned()));
             return ValueResolution::Unresolved;
@@ -449,20 +472,16 @@ impl<'a> SymbolLinker<'a> {
     }
 
     fn resolved_module<'b>(&'b self, importer: &FileIr, module: &str) -> Option<&'b Path> {
-        self.snapshot
-            .resolutions
-            .iter()
-            .find(|resolution| {
-                resolution.importer == importer.path && resolution.specifier == module
-            })
-            .and_then(|resolution| resolution.resolved_path.as_deref())
+        self.resolution_by_importer
+            .get(&importer.path)
+            .and_then(|resolutions| resolutions.get(module))
+            .and_then(|path| path.as_deref())
     }
 
     fn file(&self, file_id: FileId) -> Option<&FileIr> {
-        self.snapshot
-            .files
-            .iter()
-            .find(|file| file.file_id == file_id)
+        self.file_by_id
+            .get(&file_id)
+            .and_then(|index| self.snapshot.files.get(*index))
     }
 }
 

@@ -661,6 +661,34 @@ fn filtered_query_keeps_candidate_calls_inside_callbacks_passed_to_known_consume
 }
 
 #[test]
+fn unreached_host_renders_child_that_receives_its_capability() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection() { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Host.tsx",
+            "import { useItemSelection } from './hook'; function Child({apply}: {apply: (action: string) => void}) { apply('close'); return null; } export function Host() { const [, apply] = useItemSelection(); return <Child apply={apply} />; }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n");
+    fixture.write("query.toml", "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n");
+    let report = fixture.report();
+    assert!(
+        report
+            .creations
+            .iter()
+            .any(|creation| creation.invocations.iter().any(
+                |invocation| invocation.arguments["action"]
+                    == QueryValue::String {
+                        value: "close".to_owned()
+                    }
+            ))
+    );
+}
+
+#[test]
 fn resolves_project_aliases_and_correlates_tuple_callback_with_branch_built_numeric_enums() {
     let fixture = TestProject::new(&[
         (

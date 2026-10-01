@@ -111,10 +111,14 @@ files and eight rounds, skips `node_modules`, and reuses parsed files within the
 functions below 20,000 bytes are evaluated with a 5,000-expression budget; larger files use direct
 callsites with unknown surrounding locals and a 64-callsite budget per function. These limits and
 the text filter leave coverage incomplete.
+Hypothetical renders from an unreached factory host have a separate 5,000-step budget covering
+expression evaluation and component visits. Exhaustion stops that render, marks carried callback
+values unresolved, and appears as a coverage gap; other factory callsites are still examined.
 Include enum and constant definitions as explicit file roots. Leave the prefilter unset when a
 complete parse of the configured roots matters more than query latency. Parsed files are not yet
 cached across separate CLI runs. During each solver pass, module environments and resolved import
-links are reused; environments are invalidated when module globals initialize. Set
+links are reused; environments are invalidated when module globals initialize. Symbol linkage uses
+per-snapshot file and import-resolution indexes instead of repeatedly scanning the snapshot. Set
 `FOLLOWER_PROFILE_QUERY=1` to print generic phase timings and cache counts to stderr.
 
 Configured `[[entries]]` modules are indexed even if the text prefilter does not match them. This
