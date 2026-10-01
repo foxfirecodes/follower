@@ -123,6 +123,32 @@ impl AbstractValue {
     }
 }
 
+/// Why a path below a configured root is only possible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Assumption {
+    /// An unmodeled component renders what it is given.
+    UnmodeledComponent,
+    /// JSX handed to an unmodeled call or unsupported expression is rendered.
+    EscapedJsx,
+    /// A component whose body is not fully modeled renders JSX it received but did not render
+    /// in the model.
+    UnrenderedJsx,
+}
+
+/// Something a render can reach: a JSX element or closure site, or a function component.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RenderMark {
+    Site(u32, u32),
+    Function(FunctionKey),
+}
+
+/// JSX a component received, checked after its body runs.
+struct RenderTracking {
+    log_start: usize,
+    uncertainty: usize,
+    targets: Vec<(RenderMark, TrackedValue)>,
+}
+
 #[derive(Clone)]
 struct ClosureValue {
     body: FlowArrowBody,
@@ -460,13 +486,17 @@ struct Solver<'a> {
     assumed_component_renders: BTreeSet<(Option<String>, String, u64)>,
     /// Counts budget stops that may have cut a render short.
     render_truncations: usize,
+    /// Elements, closures, and function components rendered so far in this pass.
+    render_log: Vec<RenderMark>,
+    /// Counts operations the model could not follow.
+    uncertainty_events: usize,
     assumed_evaluations: usize,
     assumed_budget_reported: bool,
     capability_producer_files: BTreeSet<FileId>,
     caller_producer_files: BTreeSet<FileId>,
     current_choice: Option<String>,
     current_reachability: Reachability,
-    assumed_renders: Vec<SourceSpan>,
+    assumed_renders: Vec<(SourceSpan, Assumption)>,
     current_reverse_importer: Option<ReverseImporterSeed>,
     call_depth: usize,
     active_captures: Vec<BTreeSet<String>>,
@@ -587,6 +617,8 @@ impl<'a> Solver<'a> {
             use_chain: BTreeSet::new(),
             assumed_component_renders: BTreeSet::new(),
             render_truncations: 0,
+            render_log: Vec::new(),
+            uncertainty_events: 0,
             assumed_evaluations: 0,
             assumed_budget_reported: false,
             capability_producer_files: BTreeSet::new(),
@@ -937,7 +969,7 @@ impl<'a> Solver<'a> {
             return;
         };
         let on_corridor = self.entry_corridor.contains(&path);
-        if on_corridor && self.current_reachability != Reachability::Unknown {
+        if (on_corridor || general) && self.current_reachability != Reachability::Unknown {
             self.root_requested_imports.insert(path.clone());
         }
         if general || on_corridor {
@@ -963,6 +995,7 @@ impl<'a> Solver<'a> {
     }
 
     fn record_coverage_gap(&mut self, reason: &str, span: &SourceSpan) {
+        self.uncertainty_events += 1;
         let gap = format!(
             "{reason} at file {} bytes {}..{}",
             span.file_id.0, span.start, span.end
@@ -2104,6 +2137,10 @@ impl<'a> Solver<'a> {
                     &format!("unsupported expression: {syntax}"),
                     expression.span.clone(),
                 );
+                self.render_escaped_jsx(
+                    references.iter().filter_map(|name| environment.get(name)),
+                    &expression.span,
+                );
                 TrackedValue::unknown(syntax.clone())
             }
         };
@@ -2340,6 +2377,7 @@ impl<'a> Solver<'a> {
                     &format!("call through unknown target: {reason}"),
                     span.clone(),
                 );
+                self.render_escaped_jsx(arguments.iter(), &span);
                 if self.model.scan_callback_bodies {
                     for argument in &arguments {
                         self.scan_callback_bodies(argument, &span, 0);
@@ -2365,6 +2403,7 @@ impl<'a> Solver<'a> {
                     "value passed to unsupported call target",
                     span.clone(),
                 );
+                self.render_escaped_jsx(arguments.iter(), &span);
                 if self.model.scan_callback_bodies {
                     for argument in &arguments {
                         self.scan_callback_bodies(argument, &span, 0);
@@ -2836,6 +2875,11 @@ impl<'a> Solver<'a> {
             }
             _ => return,
         };
+        self.render_log
+            .push(RenderMark::Site(element.span.file_id.0, element.span.start));
+        if let AbstractValue::Function(key) = &element.component.value {
+            self.render_log.push(RenderMark::Function(key.clone()));
+        }
         if self.current_reachability == Reachability::Possible {
             if self.assumed_budget_exhausted() {
                 return;
@@ -2976,6 +3020,7 @@ impl<'a> Solver<'a> {
         match &element.component.value {
             AbstractValue::Function(key) => {
                 let props = element.props.clone();
+                let tracking = self.begin_render_tracking(&props);
                 let argument = TrackedValue {
                     value: AbstractValue::record(element.props),
                     evidence: element.component.evidence,
@@ -2984,6 +3029,7 @@ impl<'a> Solver<'a> {
                 };
                 let returned = self.call_function(key, vec![argument]);
                 self.render(returned);
+                self.finish_render_tracking(tracking, &element.span);
                 if self.model.scan_callback_bodies {
                     for prop in props.values() {
                         self.scan_callback_bodies(prop, &element.span, 0);
@@ -2992,6 +3038,7 @@ impl<'a> Solver<'a> {
             }
             AbstractValue::Closure(closure) => {
                 let props = element.props.clone();
+                let tracking = self.begin_render_tracking(&props);
                 let argument = TrackedValue::plain(AbstractValue::record(element.props));
                 let returned = self.invoke_value(
                     TrackedValue::plain(AbstractValue::Closure(closure.clone())),
@@ -2999,6 +3046,7 @@ impl<'a> Solver<'a> {
                     element.span.clone(),
                 );
                 self.render(returned);
+                self.finish_render_tracking(tracking, &element.span);
                 if self.model.scan_callback_bodies {
                     for prop in props.values() {
                         self.scan_callback_bodies(prop, &element.span, 0);
@@ -3130,7 +3178,8 @@ impl<'a> Solver<'a> {
     ) {
         let previous = self.current_reachability;
         self.current_reachability = Reachability::Possible;
-        self.assumed_renders.push(element.span.clone());
+        self.assumed_renders
+            .push((element.span.clone(), Assumption::UnmodeledComponent));
         for component in wrapped {
             self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
                 component: Box::new(component.clone()),
@@ -3142,6 +3191,131 @@ impl<'a> Solver<'a> {
         for value in element.props.values() {
             self.render_assumed_prop(value, &element.span);
         }
+        self.assumed_renders.pop();
+        self.current_reachability = previous;
+    }
+
+    /// Starts watching which received JSX a component renders. Only paths from configured roots
+    /// are watched.
+    fn begin_render_tracking(
+        &self,
+        props: &BTreeMap<String, TrackedValue>,
+    ) -> Option<RenderTracking> {
+        if self.current_reachability == Reachability::Unknown {
+            return None;
+        }
+        let mut targets = Vec::new();
+        for value in props.values() {
+            self.collect_render_targets(value, &mut targets, 0);
+        }
+        (!targets.is_empty()).then_some(RenderTracking {
+            log_start: self.render_log.len(),
+            uncertainty: self.uncertainty_events,
+            targets,
+        })
+    }
+
+    fn collect_render_targets(
+        &self,
+        value: &TrackedValue,
+        targets: &mut Vec<(RenderMark, TrackedValue)>,
+        depth: usize,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        match &value.value {
+            AbstractValue::Element(element) => targets.push((
+                RenderMark::Site(element.span.file_id.0, element.span.start),
+                value.clone(),
+            )),
+            AbstractValue::Closure(closure) if arrow_body_renders_jsx(&closure.body) => targets
+                .push((
+                    RenderMark::Site(closure.span.file_id.0, closure.span.start),
+                    value.clone(),
+                )),
+            AbstractValue::Function(key) if self.is_component_like(value) => {
+                targets.push((RenderMark::Function(key.clone()), value.clone()));
+            }
+            AbstractValue::Array(values) | AbstractValue::Union(values) => {
+                for value in values.iter() {
+                    self.collect_render_targets(value, targets, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// After a component's body runs, renders received JSX it did not render if the body hit
+    /// anything the model could not follow. A fully modeled body that drops JSX stays exact.
+    fn finish_render_tracking(&mut self, tracking: Option<RenderTracking>, span: &SourceSpan) {
+        let Some(tracking) = tracking else {
+            return;
+        };
+        if self.uncertainty_events == tracking.uncertainty {
+            return;
+        }
+        let rendered = self.render_log[tracking.log_start..]
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let unrendered = tracking
+            .targets
+            .into_iter()
+            .filter(|(mark, _)| !rendered.contains(mark))
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        if unrendered.is_empty() {
+            return;
+        }
+        let previous = self.current_reachability;
+        self.current_reachability = Reachability::Possible;
+        self.assumed_renders
+            .push((span.clone(), Assumption::UnrenderedJsx));
+        let trace_len = self.trace.len();
+        self.trace.push(TraceStep {
+            kind: QueryCallPathKind::AssumedRender,
+            span: span.clone(),
+        });
+        for value in &unrendered {
+            self.render_assumed_prop(value, span);
+        }
+        self.trace.truncate(trace_len);
+        self.assumed_renders.pop();
+        self.current_reachability = previous;
+    }
+
+    /// Renders JSX elements that leave the model at `span`, such as children handed to an unknown
+    /// call. Only possible paths are explored from them. Components passed to such calls are left
+    /// to the assumed-wrapper value the call returns.
+    fn render_escaped_jsx<'b>(
+        &mut self,
+        values: impl Iterator<Item = &'b TrackedValue>,
+        span: &SourceSpan,
+    ) {
+        if self.current_reachability == Reachability::Unknown {
+            return;
+        }
+        let elements = values
+            .filter(|value| contains_element(value, 0))
+            .cloned()
+            .collect::<Vec<_>>();
+        if elements.is_empty() {
+            return;
+        }
+        let previous = self.current_reachability;
+        self.current_reachability = Reachability::Possible;
+        self.assumed_renders
+            .push((span.clone(), Assumption::EscapedJsx));
+        let trace_len = self.trace.len();
+        self.trace.push(TraceStep {
+            kind: QueryCallPathKind::AssumedRender,
+            span: span.clone(),
+        });
+        for value in elements {
+            self.render(value);
+        }
+        self.trace.truncate(trace_len);
         self.assumed_renders.pop();
         self.current_reachability = previous;
     }
@@ -3198,7 +3372,7 @@ impl<'a> Solver<'a> {
         self.render_truncations += 1;
         if !self.assumed_budget_reported {
             self.assumed_budget_reported = true;
-            if let Some(span) = self.assumed_renders.first().cloned() {
+            if let Some((span, _)) = self.assumed_renders.first().cloned() {
                 self.record_coverage_gap("assumed render budget exhausted", &span);
             }
         }
@@ -3313,6 +3487,8 @@ impl<'a> Solver<'a> {
         closure: &ClosureValue,
         arguments: Vec<TrackedValue>,
     ) -> TrackedValue {
+        self.render_log
+            .push(RenderMark::Site(closure.span.file_id.0, closure.span.start));
         let trace_len = self.trace.len();
         if self
             .trace
@@ -3428,22 +3604,39 @@ impl<'a> Solver<'a> {
             self.record_coverage_gap("uncertain callback factory capture", &span);
         }
         if self.current_reachability == Reachability::Possible {
-            let mut assumed = Vec::<SourceSpan>::new();
-            for span in &self.assumed_renders {
-                if !assumed.contains(span) {
-                    assumed.push(span.clone());
+            let mut assumed = Vec::<(SourceSpan, Assumption)>::new();
+            for assumption in &self.assumed_renders {
+                if !assumed.contains(assumption) {
+                    assumed.push(assumption.clone());
                 }
             }
-            for span in assumed {
+            for (span, assumption) in assumed {
+                let (rule, summary, gap) = match assumption {
+                    Assumption::UnmodeledComponent => (
+                        "factory_callsite_reached_through_unmodeled_component",
+                        "factory callsite is reached only if an unmodeled component renders it",
+                        "render assumed through unmodeled component",
+                    ),
+                    Assumption::EscapedJsx => (
+                        "factory_callsite_reached_through_escaped_jsx",
+                        "factory callsite is reached only if JSX handed to an unmodeled operation is rendered",
+                        "JSX passed to an unmodeled call",
+                    ),
+                    Assumption::UnrenderedJsx => (
+                        "factory_callsite_reached_through_unrendered_jsx",
+                        "factory callsite is reached only if a component whose body is not fully modeled renders JSX it received",
+                        "JSX dropped by a partially modeled component",
+                    ),
+                };
                 unresolved.push(self.push_evidence(
                     RelationKind::UnresolvedEscape,
-                    "factory_callsite_reached_through_unmodeled_component",
+                    rule,
                     span.clone(),
                     vec![origin],
                     Some(self.model.id.clone()),
-                    "factory callsite is reached only if an unmodeled component renders it",
+                    summary,
                 ));
-                self.record_coverage_gap("render assumed through unmodeled component", &span);
+                self.record_coverage_gap(gap, &span);
             }
         }
         if self.current_reachability == Reachability::Unknown {
@@ -4293,6 +4486,7 @@ impl<'a> Solver<'a> {
         reason: &str,
         span: SourceSpan,
     ) {
+        self.uncertainty_events += 1;
         let mut ids = values
             .flat_map(|value| self.value_capability_ids(value))
             .collect::<Vec<_>>();
@@ -4802,6 +4996,19 @@ fn collect_render_content_sites(value: &TrackedValue, sites: &mut Vec<(u32, u32)
             }
         }
         _ => {}
+    }
+}
+
+fn contains_element(value: &TrackedValue, depth: usize) -> bool {
+    match &value.value {
+        AbstractValue::Element(_) => true,
+        AbstractValue::Array(values) | AbstractValue::Union(values) => {
+            depth < 8
+                && values
+                    .iter()
+                    .any(|value| contains_element(value, depth + 1))
+        }
+        _ => false,
     }
 }
 

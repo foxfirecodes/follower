@@ -408,22 +408,13 @@ fn configured_route_render_prop_and_wrapper_connect_a_class_route_table() {
     );
     assert_eq!(report.coverage.processed_files, 5);
     fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[component_wrappers]]\nmodule = './wrap'\nexport = 'protect'\ncomponent_argument = 0\n[[component_consumers]]\nmodule = './other-router'\nexport = 'Route'\nrender_props = ['render']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
-    // Without a contract, the route file is off the path to the factory and is not parsed, so
-    // the route is assumed to render its render prop. The result is only possible and names the
-    // assumed component as a gap.
+    // Without a contract the route file is parsed. Its body is fully modeled and returns null,
+    // so the route renders nothing and the leaf is not reached from the root.
     let unmodeled_route = fixture.report();
     assert_eq!(
         unmodeled_route.creations[0].reachability,
-        Reachability::Possible
+        Reachability::Unknown
     );
-    assert!(unmodeled_route.gaps.iter().any(|gap| {
-        gap.kind == "render_assumed_through_unmodeled_component"
-            && gap.assessment == QueryGapAssessment::Direct
-            && gap
-                .location
-                .as_ref()
-                .is_some_and(|location| location.path.ends_with("View.tsx"))
-    }));
     fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[component_wrappers]]\nmodule = './wrap'\nexport = 'protect'\ncomponent_argument = 0\n[[component_consumers]]\nmodule = './router'\nexport = 'Route'\nrender_props = ['render']\nrender_callback_names = ['Elsewhere']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
     let filtered_route = fixture.report();
     assert_eq!(
@@ -593,6 +584,65 @@ fn unmodeled_higher_order_component_renders_wrapped_component_as_possible() {
         |gap| gap.kind == "render_assumed_through_unmodeled_component"
             && gap.assessment == QueryGapAssessment::Direct
     ));
+}
+
+#[test]
+fn parsed_wrapper_that_hands_children_to_an_unknown_call_keeps_a_possible_path() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf({ action }: { action: string }) { const [, apply] = useItemSelection(['alpha']); apply(action); return null; }",
+        ),
+        (
+            "src/Layer.tsx",
+            "import { createPortal } from 'external-dom'; export function Layer({ children }: { children: unknown }) { return createPortal(children, null); } export function Empty(_props: { children: unknown }) { return null; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Layer, Empty } from './Layer'; import { Leaf } from './Leaf'; export function App() { return <div><Layer><Leaf action='portal' /></Layer><Empty><Leaf action='dropped' /></Empty></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let actions = report
+        .creations
+        .iter()
+        .flat_map(|creation| {
+            creation.invocations.iter().map(move |invocation| {
+                (
+                    format!("{:?}", invocation.arguments["action"]),
+                    creation.reachability,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    // The portal's children leave the model through an unknown call, so they are possible.
+    // A wrapper that returns null is fully modeled, so its children are not rendered at all.
+    assert_eq!(
+        actions,
+        [(
+            format!(
+                "{:?}",
+                QueryValue::String {
+                    value: "portal".to_owned()
+                }
+            ),
+            Reachability::Possible
+        )],
+        "{:?}",
+        report.coverage.gaps
+    );
 }
 
 #[test]
