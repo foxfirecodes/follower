@@ -155,78 +155,61 @@ struct SourceCatalog {
 }
 
 impl SourceCatalog {
-    fn build(project: &Project, query: &QuerySpec) -> Result<Self> {
-        let phase_start = Instant::now();
-        let mut imports_by_stem: BTreeMap<String, Vec<(PathBuf, String)>> = BTreeMap::new();
-        let mut configured_files = 0;
-        let mut candidate_paths = BTreeSet::new();
-        for path in project.discover_all_sources()? {
-            if path
-                .components()
-                .any(|part| part.as_os_str() == OsStr::new("node_modules"))
-            {
-                continue;
-            }
-            configured_files += 1;
-            let source = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            if source.contains(&query.factory.export) {
-                candidate_paths.insert(path.clone());
-            }
-            let may_use_configured_lazy_factory = project
-                .config
-                .lazy_component_factories
-                .iter()
-                .any(|factory| {
-                    source.contains(&factory.module) && source.contains(&factory.export)
-                });
-            let specifiers = module_specifiers(&source, may_use_configured_lazy_factory);
-            for specifier in specifiers {
-                if let Some(stem) = Path::new(&specifier)
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                {
-                    imports_by_stem
-                        .entry(stem.to_owned())
-                        .or_default()
-                        .push((path.clone(), specifier));
-                }
-            }
-        }
-        let mut catalog = Self {
-            imports_by_stem,
-            configured_files,
-            candidate_paths,
+    const fn new() -> Self {
+        Self {
+            imports_by_stem: BTreeMap::new(),
+            configured_files: 0,
+            candidate_paths: BTreeSet::new(),
             skipped_candidate_files: 0,
             inventory_round_limit_hit: false,
-        };
-        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
-            eprintln!(
-                "query source catalog scan: {} ms",
-                phase_start.elapsed().as_millis()
-            );
         }
-        let phase_start = Instant::now();
-        catalog.follow_factory_reexports(project, query)?;
-        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
-            eprintln!(
-                "query source catalog reexports: {} ms",
-                phase_start.elapsed().as_millis()
-            );
-        }
-        Ok(catalog)
     }
 
-    fn follow_factory_reexports(&mut self, project: &Project, query: &QuerySpec) -> Result<()> {
+    /// Records one configured source; files under `node_modules` are not catalogued.
+    fn add_source(&mut self, project: &Project, query: &QuerySpec, path: &Path, source: &str) {
+        if path
+            .components()
+            .any(|part| part.as_os_str() == OsStr::new("node_modules"))
+        {
+            return;
+        }
+        self.configured_files += 1;
+        if source.contains(&query.factory.export) {
+            self.candidate_paths.insert(path.to_path_buf());
+        }
+        let may_use_configured_lazy_factory = project
+            .config
+            .lazy_component_factories
+            .iter()
+            .any(|factory| source.contains(&factory.module) && source.contains(&factory.export));
+        let specifiers = module_specifiers(source, may_use_configured_lazy_factory);
+        for specifier in specifiers {
+            if let Some(stem) = Path::new(&specifier)
+                .file_stem()
+                .and_then(|name| name.to_str())
+            {
+                self.imports_by_stem
+                    .entry(stem.to_owned())
+                    .or_default()
+                    .push((path.to_path_buf(), specifier));
+            }
+        }
+    }
+
+    fn follow_factory_reexports(
+        &mut self,
+        project: &Project,
+        query: &QuerySpec,
+        linker: &ModuleLinker,
+    ) -> Result<()> {
         let factory_path = project
             .resolve_path(Path::new(&query.factory.module))
             .canonicalize()?;
         let mut targets = BTreeSet::from([factory_path]);
         let mut visited = BTreeSet::new();
         let mut skipped = BTreeSet::new();
-        let linker = ModuleLinker::new(project);
         for round in 0..8 {
-            let importers = self.reverse_importers(project, &targets);
+            let importers = self.reverse_importers(linker, &targets);
             skipped.extend(importers.difference(&visited).skip(256).cloned());
             let mut next = BTreeSet::new();
             let pending = importers
@@ -289,7 +272,7 @@ impl SourceCatalog {
 
     fn reverse_importers(
         &self,
-        project: &Project,
+        linker: &ModuleLinker,
         targets: &BTreeSet<PathBuf>,
     ) -> BTreeSet<PathBuf> {
         let names = targets
@@ -311,7 +294,6 @@ impl SourceCatalog {
                 names
             })
             .collect::<BTreeSet<_>>();
-        let linker = ModuleLinker::new(project);
         let mut result = BTreeSet::new();
         for name in names {
             for (importer, specifier) in self.imports_by_stem.get(&name).into_iter().flatten() {
@@ -345,6 +327,7 @@ impl SourceCatalog {
     fn entry_corridor(
         &self,
         project: &Project,
+        linker: &ModuleLinker,
         seeds: &BTreeSet<PathBuf>,
     ) -> (BTreeMap<PathBuf, usize>, bool) {
         let entries = project
@@ -363,7 +346,7 @@ impl SourceCatalog {
             }
             let mut next = BTreeSet::new();
             for child in &frontier {
-                for importer in self.reverse_importers(project, &BTreeSet::from([child.clone()])) {
+                for importer in self.reverse_importers(linker, &BTreeSet::from([child.clone()])) {
                     children
                         .entry(importer.clone())
                         .or_default()
@@ -475,19 +458,78 @@ impl Analyzer {
     }
 
     pub fn index(&self) -> Result<Snapshot> {
+        self.index_with(&ModuleLinker::new(&self.project))
+    }
+
+    fn index_with(&self, linker: &ModuleLinker) -> Result<Snapshot> {
         let source_paths = self.project.discover_sources()?;
-        let mut files = Vec::with_capacity(source_paths.len());
-        for (index, path) in source_paths.iter().enumerate() {
-            let source = fs::read_to_string(path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
+        self.snapshot_from_sources(
+            linker,
+            source_paths.into_iter().map(|path| {
+                let source = fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                Ok((path, source))
+            }),
+        )
+    }
+
+    /// Indexes the text-filtered sources and catalogs every configured source in one read pass.
+    fn index_with_catalog(
+        &self,
+        linker: &ModuleLinker,
+        query: &QuerySpec,
+    ) -> Result<(Snapshot, SourceCatalog)> {
+        let phase_start = Instant::now();
+        let mut catalog = SourceCatalog::new();
+        let mut indexed = Vec::new();
+        for candidate in self.project.discover_source_candidates()? {
+            let source = fs::read_to_string(&candidate.path)
+                .with_context(|| format!("failed to read {}", candidate.path.display()))?;
+            catalog.add_source(&self.project, query, &candidate.path, &source);
+            if !candidate.text_filtered || self.project.matches_source_filter(&source) {
+                indexed.push((candidate.path, source));
+            }
+        }
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!(
+                "query source scan: {} ms",
+                phase_start.elapsed().as_millis()
+            );
+        }
+        let phase_start = Instant::now();
+        let snapshot = self.snapshot_from_sources(linker, indexed.into_iter().map(Ok))?;
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!(
+                "query initial index: {} ms",
+                phase_start.elapsed().as_millis()
+            );
+        }
+        let phase_start = Instant::now();
+        catalog.follow_factory_reexports(&self.project, query, linker)?;
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!(
+                "query source catalog reexports: {} ms",
+                phase_start.elapsed().as_millis()
+            );
+        }
+        Ok((snapshot, catalog))
+    }
+
+    fn snapshot_from_sources(
+        &self,
+        linker: &ModuleLinker,
+        sources: impl Iterator<Item = Result<(PathBuf, String)>>,
+    ) -> Result<Snapshot> {
+        let mut files = Vec::new();
+        for (index, source) in sources.enumerate() {
+            let (path, source) = source?;
             files.push(parse_and_lower(
                 FileId(u32::try_from(index).unwrap_or(u32::MAX)),
-                path,
+                &path,
                 &source,
             )?);
         }
 
-        let linker = ModuleLinker::new(&self.project);
         let mut resolutions = Vec::new();
         for file in &files {
             for import in &file.imports {
@@ -515,6 +557,7 @@ impl Analyzer {
 
     fn walk_backward_uses(
         &self,
+        linker: &ModuleLinker,
         snapshot: &mut Snapshot,
         catalog: &SourceCatalog,
         corridor: &BTreeMap<PathBuf, usize>,
@@ -658,8 +701,7 @@ impl Analyzer {
                     let importers = reverse_cache
                         .entry(path.clone())
                         .or_insert_with(|| {
-                            catalog
-                                .reverse_importers(&self.project, &BTreeSet::from([path.clone()]))
+                            catalog.reverse_importers(linker, &BTreeSet::from([path.clone()]))
                         })
                         .clone();
                     for importer_path in importers {
@@ -691,7 +733,7 @@ impl Analyzer {
                         }
                         let old_resolutions = snapshot.resolutions.len();
                         if self
-                            .extend_snapshot(snapshot, std::slice::from_ref(&path))
+                            .extend_snapshot(linker, snapshot, std::slice::from_ref(&path))
                             .is_err()
                         {
                             result.skipped_files += 1;
@@ -845,26 +887,21 @@ impl Analyzer {
 
     pub fn query(&self, query: &QuerySpec, query_hash: &str) -> Result<QueryReport> {
         query.validate()?;
-        let phase_start = Instant::now();
-        let mut snapshot = self.index()?;
-        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
-            eprintln!(
-                "query initial index: {} ms",
-                phase_start.elapsed().as_millis()
-            );
-        }
-        let phase_start = Instant::now();
-        let catalog = if self.project.config.source_contains_any.is_empty() {
-            None
+        let linker = ModuleLinker::new(&self.project);
+        let (mut snapshot, catalog) = if self.project.config.source_contains_any.is_empty() {
+            let phase_start = Instant::now();
+            let snapshot = self.index_with(&linker)?;
+            if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+                eprintln!(
+                    "query initial index: {} ms",
+                    phase_start.elapsed().as_millis()
+                );
+            }
+            (snapshot, None)
         } else {
-            Some(SourceCatalog::build(&self.project, query)?)
+            let (snapshot, catalog) = self.index_with_catalog(&linker, query)?;
+            (snapshot, Some(catalog))
         };
-        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
-            eprintln!(
-                "query source catalog: {} ms",
-                phase_start.elapsed().as_millis()
-            );
-        }
         let mut followed = 0;
         let mut skipped = BTreeSet::new();
         let mut reverse_seed_paths = BTreeSet::new();
@@ -901,7 +938,7 @@ impl Analyzer {
                 );
             }
             if self.project.config.source_contains_any.is_empty() {
-                self.attach_callsite_inventory(&mut report, &snapshot, query, None)?;
+                self.attach_callsite_inventory(&linker, &mut report, &snapshot, query, None)?;
                 report.finish_gaps();
                 return Ok(report);
             }
@@ -909,8 +946,7 @@ impl Analyzer {
                 .as_ref()
                 .context("filtered query has no source catalog")?;
             reverse_producer_paths.extend(producers);
-            let reverse_requests =
-                catalog.reverse_importers(&self.project, &reverse_producer_paths);
+            let reverse_requests = catalog.reverse_importers(&linker, &reverse_producer_paths);
             if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
                 eprintln!(
                     "query round {round}: reverse_candidates={}",
@@ -960,7 +996,8 @@ impl Analyzer {
                         .collect::<BTreeSet<_>>();
                     if !new_paths.is_empty() {
                         let phase_start = Instant::now();
-                        let (paths, hit_limit) = catalog.entry_corridor(&self.project, &new_paths);
+                        let (paths, hit_limit) =
+                            catalog.entry_corridor(&self.project, &linker, &new_paths);
                         entry_path_not_found += new_paths
                             .iter()
                             .filter(|path| !paths.contains_key(*path))
@@ -985,6 +1022,7 @@ impl Analyzer {
                     let original_snapshot_id = snapshot.snapshot_id.clone();
                     let phase_start = Instant::now();
                     let walk = self.walk_backward_uses(
+                        &linker,
                         &mut snapshot,
                         catalog,
                         &entry_corridor,
@@ -1062,7 +1100,13 @@ impl Analyzer {
                     report.coverage.complete = false;
                 }
                 let phase_start = Instant::now();
-                self.attach_callsite_inventory(&mut report, &snapshot, query, Some(catalog))?;
+                self.attach_callsite_inventory(
+                    &linker,
+                    &mut report,
+                    &snapshot,
+                    query,
+                    Some(catalog),
+                )?;
                 if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
                     eprintln!(
                         "query callsite inventory: {} ms",
@@ -1080,7 +1124,7 @@ impl Analyzer {
                     .cloned(),
             );
             let phase_start = Instant::now();
-            self.extend_snapshot(&mut snapshot, &additions)?;
+            self.extend_snapshot(&linker, &mut snapshot, &additions)?;
             if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
                 eprintln!(
                     "query snapshot expansion: files={} elapsed={} ms",
@@ -1128,6 +1172,7 @@ impl Analyzer {
 
     fn attach_callsite_inventory(
         &self,
+        linker: &ModuleLinker,
         report: &mut QueryReport,
         snapshot: &Snapshot,
         query: &QuerySpec,
@@ -1148,7 +1193,6 @@ impl Analyzer {
             .collect::<Vec<_>>();
         let mut callsites = Vec::new();
         let mut inventory_snapshot = snapshot.clone();
-        let linker = ModuleLinker::new(&self.project);
         for path in &candidate_paths {
             if indexed.contains(path) {
                 continue;
@@ -1288,8 +1332,12 @@ impl Analyzer {
         Ok(())
     }
 
-    fn extend_snapshot(&self, snapshot: &mut Snapshot, paths: &[PathBuf]) -> Result<()> {
-        let linker = ModuleLinker::new(&self.project);
+    fn extend_snapshot(
+        &self,
+        linker: &ModuleLinker,
+        snapshot: &mut Snapshot,
+        paths: &[PathBuf],
+    ) -> Result<()> {
         for path in paths {
             let source = fs::read_to_string(path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
@@ -1358,5 +1406,62 @@ fn inventory_location(root: &Path, path: &Path, source: &str, span: &SourceSpan)
         start_column,
         end_line,
         end_column,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::Analyzer;
+    use crate::{link::ModuleLinker, project::Project, query::load_query};
+
+    #[test]
+    fn single_read_pass_indexes_the_same_sources_as_index() {
+        let root = std::env::temp_dir().join(format!("flow-one-pass-{}", std::process::id()));
+        let files = [
+            (
+                "flow.toml",
+                "schema_version = 1\nname = 'sample'\nsource_roots = ['src', 'src/Root.ts']\nsource_contains_any = ['makeCallback']\n[[entries]]\nmodule = 'src/Host.tsx'\nexport = 'Host'\n",
+            ),
+            (
+                "query.toml",
+                "schema_version = 1\nid = 'sample'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'sample'\nmodule = 'src/factory.ts'\nexport = 'makeCallback'\n[[factory_arguments]]\nindex = 0\nlabel = 'created'\n[capability]\nreturned_property = ['callback']\n",
+            ),
+            (
+                "src/factory.ts",
+                "export function makeCallback(_value: string) { return { callback() {} }; }",
+            ),
+            (
+                "src/Uses.ts",
+                "import { makeCallback } from './factory'; export const used = makeCallback('alpha');",
+            ),
+            ("src/Host.tsx", "export function Host() { return null; }"),
+            ("src/Root.ts", "export const root = true;"),
+            ("src/Unrelated.ts", "export const unrelated = true;"),
+        ];
+        for (path, source) in files {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().expect("parent")).expect("create fixture");
+            fs::write(path, source).expect("write fixture");
+        }
+        let analyzer = Analyzer::new(Project::load(root.join("flow.toml")).expect("load project"));
+        let (query, _) = load_query(&root.join("query.toml")).expect("load query");
+        let linker = ModuleLinker::new(analyzer.project());
+        let (snapshot, catalog) = analyzer
+            .index_with_catalog(&linker, &query)
+            .expect("index with catalog");
+        let indexed = analyzer.index().expect("index");
+        fs::remove_dir_all(&root).expect("remove fixture");
+
+        assert_eq!(snapshot, indexed);
+        let names = snapshot
+            .files
+            .iter()
+            .filter_map(|file| file.path.file_name()?.to_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Host.tsx", "Root.ts", "Uses.ts", "factory.ts"]);
+        assert_eq!(catalog.configured_files, 5);
+        assert_eq!(catalog.candidate_paths.len(), 2);
     }
 }

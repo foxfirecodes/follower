@@ -115,11 +115,13 @@ Hypothetical renders from an unreached factory host have a separate 5,000-step b
 expression evaluation and component visits. Exhaustion stops that render, marks carried callback
 values unresolved, and appears as a coverage gap; other factory callsites are still examined.
 Include enum and constant definitions as explicit file roots. Leave the prefilter unset when a
-complete parse of the configured roots matters more than query latency. Parsed files are not yet
-cached across separate CLI runs. During each solver pass, module environments and resolved import
-links are reused; environments are invalidated when module globals initialize. Symbol linkage uses
-per-snapshot file and import-resolution indexes instead of repeatedly scanning the snapshot.
-Solver values share closures, records, arrays, unions, and JSX elements and copy them only on
+complete parse of the configured roots matters more than query latency. A filtered query reads
+each configured source once to build both the initial index and the import catalog. Parsed files
+are not yet cached across separate CLI runs. One module resolver, with its filesystem and
+canonical-path caches, serves the whole query run, so files must not change while it runs. During
+each solver pass, module environments and resolved import links are reused; environments are
+invalidated when module globals initialize. Symbol linkage and the solver use per-snapshot file
+and import-resolution indexes instead of repeatedly scanning the snapshot. Solver values share closures, records, arrays, unions, and JSX elements and copy them only on
 write, so branch joins and calls do not deep-copy captured environments. Set
 `FOLLOWER_PROFILE_QUERY=1` to print generic phase timings and cache counts to stderr; use a release
 build when comparing timings.

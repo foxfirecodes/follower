@@ -558,14 +558,9 @@ impl<'a> Solver<'a> {
                 .with_context(|| {
                     format!("failed to locate entry module {}", entry.module.display())
                 })?;
-            let entry_file = self
-                .snapshot
-                .files
-                .iter()
-                .find(|file| file.path == entry_path)
-                .with_context(|| {
-                    format!("entry module was not indexed: {}", entry_path.display())
-                })?;
+            let entry_file = self.symbol_linker.file_at(&entry_path).with_context(|| {
+                format!("entry module was not indexed: {}", entry_path.display())
+            })?;
             let ValueResolution::Resolved(LinkedValue::Declaration(symbol)) = self
                 .symbol_linker
                 .resolve_exported_value(entry_file.file_id, &entry.export)
@@ -697,20 +692,14 @@ impl<'a> Solver<'a> {
         if !visited.insert(module) {
             return;
         }
-        let Some(file) = self
-            .snapshot
-            .files
-            .iter()
-            .find(|file| file.file_id == module)
-        else {
+        let Some(file) = self.symbol_linker.file(module) else {
             return;
         };
-        for resolution in &self.snapshot.resolutions {
-            if resolution.importer == file.path
-                && let Some(dependency) = resolution
-                    .resolved_path
-                    .as_ref()
-                    .and_then(|path| self.snapshot.files.iter().find(|file| file.path == *path))
+        for resolution in self.symbol_linker.import_resolutions(&file.path) {
+            if let Some(dependency) = resolution
+                .resolved_path
+                .as_ref()
+                .and_then(|path| self.symbol_linker.file_at(path))
             {
                 self.module_initialization_order(dependency.file_id, visited, modules);
             }
@@ -732,10 +721,8 @@ impl<'a> Solver<'a> {
             .collect::<Environment>();
         if !self.module_import_links.contains_key(&file_id) {
             let links = self
-                .snapshot
-                .files
-                .iter()
-                .find(|file| file.file_id == file_id)
+                .symbol_linker
+                .file(file_id)
                 .map(|file| {
                     file.flow
                         .imports
@@ -846,12 +833,7 @@ impl<'a> Solver<'a> {
     }
 
     fn request_import_for_local(&mut self, file_id: FileId, local: &str) {
-        let Some(file) = self
-            .snapshot
-            .files
-            .iter()
-            .find(|file| file.file_id == file_id)
-        else {
+        let Some(file) = self.symbol_linker.file(file_id) else {
             return;
         };
         let Some(import) = file
@@ -863,19 +845,17 @@ impl<'a> Solver<'a> {
             return;
         };
         let Some(path) = self
-            .snapshot
-            .resolutions
-            .iter()
+            .symbol_linker
+            .import_resolutions(&file.path)
             .find(|resolution| {
-                resolution.importer == file.path
-                    && resolution.specifier == import.module
+                resolution.specifier == import.module
                     && resolution.status == crate::link::ResolutionStatus::Resolved
             })
             .and_then(|resolution| resolution.resolved_path.as_ref())
         else {
             return;
         };
-        if !self.snapshot.files.iter().any(|file| file.path == *path) {
+        if self.symbol_linker.file_at(path).is_none() {
             self.requested_imports.insert(path.clone());
         }
     }
@@ -964,9 +944,8 @@ impl<'a> Solver<'a> {
         self.call_depth -= 1;
         self.trace.truncate(trace_len);
         let returned = returned.unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined));
-        if returns_capability_data(&returned) && self.snapshot.files.iter().any(|file| {
-            file.file_id == key.file_id
-                && file.flow.exports.iter().any(|export| matches!(export, crate::ir::FlowExport::Local { local, type_only: false, .. } if local == &key.name))
+        if returns_capability_data(&returned) && self.symbol_linker.file(key.file_id).is_some_and(|file| {
+            file.flow.exports.iter().any(|export| matches!(export, crate::ir::FlowExport::Local { local, type_only: false, .. } if local == &key.name))
         }) {
             self.capability_producer_files.insert(key.file_id);
         }
@@ -1625,14 +1604,9 @@ impl<'a> Solver<'a> {
                 }
                 let resolution = self.symbol_linker.resolve_binding(file_id, name);
                 if resolution == ValueResolution::Missing
-                    && self
-                        .snapshot
-                        .files
-                        .iter()
-                        .find(|file| file.file_id == file_id)
-                        .is_some_and(|file| {
-                            file.flow.imports.iter().any(|import| import.local == *name)
-                        })
+                    && self.symbol_linker.file(file_id).is_some_and(|file| {
+                        file.flow.imports.iter().any(|import| import.local == *name)
+                    })
                 {
                     self.record_coverage_gap("missing imported value", &expression.span);
                 }
@@ -1780,10 +1754,8 @@ impl<'a> Solver<'a> {
             }
             FlowExpressionKind::Call { callee, arguments } => {
                 if let Some(wrapper) = self
-                    .snapshot
-                    .files
-                    .iter()
-                    .find(|file| file.file_id == file_id)
+                    .symbol_linker
+                    .file(file_id)
                     .and_then(|file| self.project.config.component_wrapper(&file.flow, callee))
                     .cloned()
                 {
@@ -1806,33 +1778,23 @@ impl<'a> Solver<'a> {
                     component.evidence = Some(evidence);
                     return component;
                 }
-                if let Some(property) = self
-                    .snapshot
-                    .files
-                    .iter()
-                    .find(|file| file.file_id == file_id)
-                    .and_then(|file| {
-                        self.project
-                            .config
-                            .lazy_factory_property(&file.flow, callee)
-                    })
-                    && let Some(module) = lazy_component_import(expression, property)
+                if let Some(property) = self.symbol_linker.file(file_id).and_then(|file| {
+                    self.project
+                        .config
+                        .lazy_factory_property(&file.flow, callee)
+                }) && let Some(module) = lazy_component_import(expression, property)
                 {
                     let target = self
-                        .snapshot
-                        .files
-                        .iter()
-                        .find(|file| file.file_id == file_id)
+                        .symbol_linker
+                        .file(file_id)
                         .and_then(|file| {
-                            self.snapshot.resolutions.iter().find(|resolution| {
-                                resolution.importer == file.path && resolution.specifier == module
-                            })
+                            self.symbol_linker
+                                .import_resolutions(&file.path)
+                                .find(|resolution| resolution.specifier == module)
                         })
                         .and_then(|resolution| resolution.resolved_path.clone());
                     if let Some(target) = target {
-                        if let Some(file) =
-                            self.snapshot.files.iter().find(|file| file.path == target)
-                        {
+                        if let Some(file) = self.symbol_linker.file_at(&target) {
                             let exported = self
                                 .symbol_linker
                                 .resolve_exported_value(file.file_id, "default");
@@ -2110,11 +2072,7 @@ impl<'a> Solver<'a> {
     }
 
     fn known_hook_call(&self, file_id: FileId, callee: &FlowExpression) -> Option<&'static str> {
-        let file = self
-            .snapshot
-            .files
-            .iter()
-            .find(|file| file.file_id == file_id)?;
+        let file = self.symbol_linker.file(file_id)?;
         match &callee.kind {
             FlowExpressionKind::StaticMember { object, property } => {
                 let FlowExpressionKind::Identifier { name, .. } = &object.kind else {
@@ -2158,11 +2116,7 @@ impl<'a> Solver<'a> {
         file_id: FileId,
         callee: &FlowExpression,
     ) -> Option<usize> {
-        let file = self
-            .snapshot
-            .files
-            .iter()
-            .find(|file| file.file_id == file_id)?;
+        let file = self.symbol_linker.file(file_id)?;
         let (local, export) = match &callee.kind {
             FlowExpressionKind::Identifier { name, .. } => (name.as_str(), None),
             FlowExpressionKind::StaticMember { object, property } => {
@@ -2573,10 +2527,8 @@ impl<'a> Solver<'a> {
                 ..
             }
             | FlowJsxTag::Member { object: name, .. } => self
-                .snapshot
-                .files
-                .iter()
-                .find(|file| file.file_id == file_id)
+                .symbol_linker
+                .file(file_id)
                 .and_then(|file| {
                     let object = FlowExpression {
                         kind: FlowExpressionKind::Identifier {
@@ -3443,10 +3395,8 @@ impl<'a> Solver<'a> {
                 let returned = self.call_function(key, arguments);
                 self.render_unreached(returned, &candidate.span);
             } else if let Some(binding) = self
-                .snapshot
-                .files
-                .iter()
-                .find(|file| file.file_id == candidate.file_id)
+                .symbol_linker
+                .file(candidate.file_id)
                 .and_then(|file| {
                     file.flow.globals.iter().find(|binding| {
                         binding.value.span.start <= candidate.span.start
@@ -3461,9 +3411,8 @@ impl<'a> Solver<'a> {
                     let exported = matches!(
                         &binding.pattern.kind,
                         FlowPatternKind::Identifier { name }
-                            if self.snapshot.files.iter().any(|file| {
-                                file.file_id == candidate.file_id
-                                    && file.flow.exports.iter().any(|export| {
+                            if self.symbol_linker.file(candidate.file_id).is_some_and(|file| {
+                                file.flow.exports.iter().any(|export| {
                                         matches!(export, crate::ir::FlowExport::Local { local, type_only: false, .. } if local == name)
                                     })
                             })
@@ -3496,31 +3445,33 @@ impl<'a> Solver<'a> {
                     && capability.factory_arguments.iter().any(value_is_uncertain)
             }) {
                 self.request_factory_argument_imports(&candidate);
-                let exported_host = self.snapshot.files.iter().any(|file| {
-                    file.file_id == candidate.file_id
-                        && file.flow.exports.iter().any(|export| {
-                            let crate::ir::FlowExport::Local {
-                                local,
-                                type_only: false,
-                                ..
-                            } = export
-                            else {
-                                return false;
-                            };
-                            if candidate
-                                .enclosing_function
-                                .as_ref()
-                                .is_some_and(|key| key.name == *local)
-                            {
-                                return true;
-                            }
-                            file.flow.globals.iter().any(|binding| {
-                                pattern_names(&binding.pattern).contains(&local.as_str())
-                                    && binding.value.span.start <= candidate.span.start
-                                    && candidate.span.end <= binding.value.span.end
+                let exported_host =
+                    self.symbol_linker
+                        .file(candidate.file_id)
+                        .is_some_and(|file| {
+                            file.flow.exports.iter().any(|export| {
+                                let crate::ir::FlowExport::Local {
+                                    local,
+                                    type_only: false,
+                                    ..
+                                } = export
+                                else {
+                                    return false;
+                                };
+                                if candidate
+                                    .enclosing_function
+                                    .as_ref()
+                                    .is_some_and(|key| key.name == *local)
+                                {
+                                    return true;
+                                }
+                                file.flow.globals.iter().any(|binding| {
+                                    pattern_names(&binding.pattern).contains(&local.as_str())
+                                        && binding.value.span.start <= candidate.span.start
+                                        && candidate.span.end <= binding.value.span.end
+                                })
                             })
-                        })
-                });
+                        });
                 if exported_host {
                     self.caller_producer_files.insert(candidate.file_id);
                 }
@@ -3554,11 +3505,9 @@ impl<'a> Solver<'a> {
             .and_then(|key| self.functions.get(key).copied())
             .map(|function| function.body.as_slice())
             .unwrap_or_default();
-        let snapshot = self.snapshot;
-        let globals = snapshot
-            .files
-            .iter()
-            .find(|file| file.file_id == candidate.file_id)
+        let globals = self
+            .symbol_linker
+            .file(candidate.file_id)
             .map(|file| file.flow.globals.as_slice())
             .unwrap_or_default();
         for _ in 0..8 {
@@ -3596,10 +3545,8 @@ impl<'a> Solver<'a> {
             }
             self.request_import_for_local(file_id, &name);
             let target = self
-                .snapshot
-                .files
-                .iter()
-                .find(|file| file.file_id == file_id)
+                .symbol_linker
+                .file(file_id)
                 .and_then(|file| {
                     file.flow
                         .imports
@@ -3608,22 +3555,20 @@ impl<'a> Solver<'a> {
                         .map(|import| (file, import))
                 })
                 .and_then(|(file, import)| {
-                    self.snapshot
-                        .resolutions
-                        .iter()
-                        .find(|resolution| {
-                            resolution.importer == file.path
-                                && resolution.specifier == import.module
-                        })
+                    self.symbol_linker
+                        .import_resolutions(&file.path)
+                        .find(|resolution| resolution.specifier == import.module)
                         .and_then(|resolution| resolution.resolved_path.as_ref())
                         .map(|path| (path, import.imported.as_str()))
                 })
                 .and_then(|(path, imported)| {
-                    self.snapshot
-                        .files
-                        .iter()
-                        .find(|file| file.path == *path)
-                        .map(|file| (file.file_id, file.flow.globals.clone(), imported.to_owned()))
+                    self.symbol_linker.file_at(path).map(|file| {
+                        (
+                            file.file_id,
+                            file.flow.globals.as_slice(),
+                            imported.to_owned(),
+                        )
+                    })
                 });
             if let Some((target_id, globals, imported)) = target {
                 for binding in globals {
@@ -3649,7 +3594,7 @@ impl<'a> Solver<'a> {
         self.current_reachability = Reachability::Unknown;
         let mut seeded = 0_usize;
         for path in seed_paths {
-            let Some(file) = self.snapshot.files.iter().find(|file| &file.path == path) else {
+            let Some(file) = self.symbol_linker.file_at(path) else {
                 continue;
             };
             let file_id = file.file_id;
@@ -3660,23 +3605,22 @@ impl<'a> Solver<'a> {
                 .iter()
                 .filter(|import| !import.type_only)
                 .filter(|import| {
-                    self.snapshot.resolutions.iter().any(|resolution| {
-                        resolution.importer == file.path
-                            && resolution.specifier == import.module
-                            && resolution
-                                .resolved_path
-                                .as_ref()
-                                .is_some_and(|path| producer_paths.contains(path))
-                    })
+                    self.symbol_linker
+                        .import_resolutions(&file.path)
+                        .any(|resolution| {
+                            resolution.specifier == import.module
+                                && resolution
+                                    .resolved_path
+                                    .as_ref()
+                                    .is_some_and(|path| producer_paths.contains(path))
+                        })
                 })
                 .map(|import| import.local.clone())
                 .collect::<BTreeSet<_>>();
             if imported_names.is_empty() {
                 continue;
             }
-            let functions = file.flow.functions.clone();
-            let globals = file.flow.globals.clone();
-            for function in functions {
+            for function in &file.flow.functions {
                 self.heap.clear();
                 self.heap_versions.clear();
                 let mut references = ClosureReferences::default();
@@ -3738,7 +3682,7 @@ impl<'a> Solver<'a> {
                 self.current_reverse_importer = None;
                 self.reverse_budget_active = false;
             }
-            for binding in globals {
+            for binding in &file.flow.globals {
                 let mut references = ClosureReferences::default();
                 collect_expression_references(&binding.value, &mut references);
                 if references.names.is_disjoint(&imported_names) {
@@ -3915,12 +3859,7 @@ impl<'a> Solver<'a> {
             }
             _ => return false,
         };
-        let Some(file) = self
-            .snapshot
-            .files
-            .iter()
-            .find(|file| file.file_id == candidate.file_id)
-        else {
+        let Some(file) = self.symbol_linker.file(candidate.file_id) else {
             return false;
         };
         file.flow.imports.iter().any(|import| {
@@ -4306,11 +4245,7 @@ impl<'a> Solver<'a> {
     }
 
     fn query_location(&self, span: &SourceSpan) -> Option<QueryLocation> {
-        let file = self
-            .snapshot
-            .files
-            .iter()
-            .find(|file| file.file_id == span.file_id)?;
+        let file = self.symbol_linker.file(span.file_id)?;
         if !self.location_sources.borrow().contains_key(&span.file_id) {
             let source = LocationSource::new(fs::read_to_string(&file.path).ok()?);
             self.location_sources

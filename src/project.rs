@@ -303,14 +303,38 @@ impl Project {
     }
 
     pub fn discover_sources(&self) -> Result<Vec<PathBuf>> {
-        self.discover_sources_with_filter(true)
+        let mut files = Vec::new();
+        for candidate in self.discover_source_candidates()? {
+            if candidate.text_filtered && !self.config.source_contains_any.is_empty() {
+                let source = fs::read_to_string(&candidate.path)
+                    .with_context(|| format!("failed to read {}", candidate.path.display()))?;
+                if !self.matches_source_filter(&source) {
+                    continue;
+                }
+            }
+            files.push(candidate.path);
+        }
+        Ok(files)
     }
 
     pub fn discover_all_sources(&self) -> Result<Vec<PathBuf>> {
-        self.discover_sources_with_filter(false)
+        Ok(self
+            .discover_source_candidates()?
+            .into_iter()
+            .map(|candidate| candidate.path)
+            .collect())
     }
 
-    fn discover_sources_with_filter(&self, use_text_filter: bool) -> Result<Vec<PathBuf>> {
+    /// Returns whether source text contains a configured `source_contains_any` term.
+    pub(crate) fn matches_source_filter(&self, source: &str) -> bool {
+        self.config
+            .source_contains_any
+            .iter()
+            .any(|term| source.contains(term))
+    }
+
+    /// Lists configured sources in path order without reading them.
+    pub(crate) fn discover_source_candidates(&self) -> Result<Vec<SourceCandidate>> {
         let mut files = Vec::new();
         for configured_root in &self.config.source_roots {
             let root = self.resolve_path(configured_root);
@@ -327,27 +351,20 @@ impl Project {
                         root.display()
                     );
                 }
-                files.push(root);
+                files.push(SourceCandidate {
+                    path: root,
+                    text_filtered: false,
+                });
                 continue;
             }
             for entry in WalkDir::new(&root).follow_links(false) {
                 let entry =
                     entry.with_context(|| format!("failed while walking {}", root.display()))?;
                 if entry.file_type().is_file() && is_source_file(entry.path()) {
-                    if use_text_filter && !self.config.source_contains_any.is_empty() {
-                        let source = fs::read_to_string(entry.path()).with_context(|| {
-                            format!("failed to read {}", entry.path().display())
-                        })?;
-                        if !self
-                            .config
-                            .source_contains_any
-                            .iter()
-                            .any(|term| source.contains(term))
-                        {
-                            continue;
-                        }
-                    }
-                    files.push(entry.path().to_path_buf());
+                    files.push(SourceCandidate {
+                        path: entry.path().to_path_buf(),
+                        text_filtered: true,
+                    });
                 }
             }
         }
@@ -359,15 +376,28 @@ impl Project {
                     path.display()
                 );
             }
-            files
-                .push(path.canonicalize().with_context(|| {
-                    format!("failed to locate entry module {}", path.display())
-                })?);
+            files.push(SourceCandidate {
+                path: path
+                    .canonicalize()
+                    .with_context(|| format!("failed to locate entry module {}", path.display()))?,
+                text_filtered: false,
+            });
         }
-        files.sort();
-        files.dedup();
+        // A file listed as a root or entry is kept even when a directory walk also finds it.
+        files.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.text_filtered.cmp(&right.text_filtered))
+        });
+        files.dedup_by(|later, earlier| later.path == earlier.path);
         Ok(files)
     }
+}
+
+/// A discovered source file. Directory-walk files are subject to the text prefilter.
+pub(crate) struct SourceCandidate {
+    pub path: PathBuf,
+    pub text_filtered: bool,
 }
 
 pub(crate) fn is_source_file(path: &Path) -> bool {

@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -32,10 +33,15 @@ pub struct ImportResolution {
     pub diagnostic: Option<String>,
 }
 
+/// Resolves import specifiers for one analysis run.
+///
+/// The resolver and canonical-path caches assume source files do not change while the linker is
+/// alive, so create a new linker for each run.
 pub struct ModuleLinker {
     resolver: Resolver,
     project_root: PathBuf,
     import_aliases: std::collections::BTreeMap<String, String>,
+    canonical_paths: RefCell<HashMap<PathBuf, PathBuf>>,
 }
 
 impl ModuleLinker {
@@ -59,7 +65,19 @@ impl ModuleLinker {
             resolver: Resolver::new(options),
             project_root: project.root.clone(),
             import_aliases: project.config.import_aliases.clone(),
+            canonical_paths: RefCell::new(HashMap::new()),
         }
+    }
+
+    fn canonical_path(&self, path: PathBuf) -> PathBuf {
+        if let Some(canonical) = self.canonical_paths.borrow().get(&path) {
+            return canonical.clone();
+        }
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        self.canonical_paths
+            .borrow_mut()
+            .insert(path, canonical.clone());
+        canonical
     }
 
     fn aliased_specifier(&self, specifier: &str) -> Option<String> {
@@ -113,10 +131,7 @@ impl ModuleLinker {
                 specifier: specifier.to_owned(),
                 span,
                 status: ResolutionStatus::Resolved,
-                resolved_path: Some({
-                    let path = resolution.into_path_buf();
-                    path.canonicalize().unwrap_or(path)
-                }),
+                resolved_path: Some(self.canonical_path(resolution.into_path_buf())),
                 diagnostic: None,
             },
             Err(error) => ImportResolution {
@@ -139,8 +154,8 @@ pub struct SymbolLinker<'a> {
     project: &'a Project,
     snapshot: &'a Snapshot,
     file_by_id: BTreeMap<FileId, usize>,
-    file_by_path: BTreeMap<PathBuf, usize>,
-    resolution_by_importer: BTreeMap<PathBuf, BTreeMap<String, Option<PathBuf>>>,
+    file_by_path: HashMap<PathBuf, usize>,
+    resolutions_by_importer: HashMap<PathBuf, Vec<usize>>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -175,26 +190,54 @@ impl ValueResolution {
 impl<'a> SymbolLinker<'a> {
     pub fn new(project: &'a Project, snapshot: &'a Snapshot) -> Self {
         let mut file_by_id = BTreeMap::new();
-        let mut file_by_path = BTreeMap::new();
+        let mut file_by_path = HashMap::new();
         for (index, file) in snapshot.files.iter().enumerate() {
             file_by_id.entry(file.file_id).or_insert(index);
             file_by_path.entry(file.path.clone()).or_insert(index);
         }
-        let mut resolution_by_importer = BTreeMap::new();
-        for resolution in &snapshot.resolutions {
-            resolution_by_importer
+        let mut resolutions_by_importer = HashMap::<PathBuf, Vec<usize>>::new();
+        for (index, resolution) in snapshot.resolutions.iter().enumerate() {
+            resolutions_by_importer
                 .entry(resolution.importer.clone())
-                .or_insert_with(BTreeMap::new)
-                .entry(resolution.specifier.clone())
-                .or_insert_with(|| resolution.resolved_path.clone());
+                .or_default()
+                .push(index);
         }
         Self {
             project,
             snapshot,
             file_by_id,
             file_by_path,
-            resolution_by_importer,
+            resolutions_by_importer,
         }
+    }
+
+    /// Returns the first indexed file with this ID.
+    pub fn file(&self, file_id: FileId) -> Option<&'a FileIr> {
+        let snapshot = self.snapshot;
+        self.file_by_id
+            .get(&file_id)
+            .and_then(|index| snapshot.files.get(*index))
+    }
+
+    /// Returns the first indexed file at this path.
+    pub fn file_at(&self, path: &Path) -> Option<&'a FileIr> {
+        let snapshot = self.snapshot;
+        self.file_by_path
+            .get(path)
+            .and_then(|index| snapshot.files.get(*index))
+    }
+
+    /// Returns every import resolution recorded for `importer`, in snapshot order.
+    pub fn import_resolutions(
+        &self,
+        importer: &Path,
+    ) -> impl Iterator<Item = &'a ImportResolution> + '_ {
+        let snapshot = self.snapshot;
+        self.resolutions_by_importer
+            .get(importer)
+            .into_iter()
+            .flatten()
+            .filter_map(move |index| snapshot.resolutions.get(*index))
     }
 
     pub fn imported_binding_matches(
@@ -324,8 +367,7 @@ impl<'a> SymbolLinker<'a> {
 
     fn resolve_namespace(&self, file: &FileIr, module: &str) -> ValueResolution {
         self.resolved_module(file, module)
-            .and_then(|path| self.file_by_path.get(path))
-            .and_then(|index| self.snapshot.files.get(*index))
+            .and_then(|path| self.file_at(path))
             .map_or(ValueResolution::Unresolved, |file| {
                 ValueResolution::Resolved(LinkedValue::Namespace(file.file_id))
             })
@@ -340,11 +382,7 @@ impl<'a> SymbolLinker<'a> {
         if !visited.insert((module_path.to_path_buf(), export_name.to_owned())) {
             return ValueResolution::Missing;
         }
-        let Some(file) = self
-            .file_by_path
-            .get(module_path)
-            .and_then(|index| self.snapshot.files.get(*index))
-        else {
+        let Some(file) = self.file_at(module_path) else {
             visited.remove(&(module_path.to_path_buf(), export_name.to_owned()));
             return ValueResolution::Unresolved;
         };
@@ -471,17 +509,11 @@ impl<'a> SymbolLinker<'a> {
             })
     }
 
-    fn resolved_module<'b>(&'b self, importer: &FileIr, module: &str) -> Option<&'b Path> {
-        self.resolution_by_importer
-            .get(&importer.path)
-            .and_then(|resolutions| resolutions.get(module))
-            .and_then(|path| path.as_deref())
-    }
-
-    fn file(&self, file_id: FileId) -> Option<&FileIr> {
-        self.file_by_id
-            .get(&file_id)
-            .and_then(|index| self.snapshot.files.get(*index))
+    fn resolved_module(&self, importer: &FileIr, module: &str) -> Option<&'a Path> {
+        // The first record for a specifier wins, matching the snapshot's import order.
+        self.import_resolutions(&importer.path)
+            .find(|resolution| resolution.specifier == module)
+            .and_then(|resolution| resolution.resolved_path.as_deref())
     }
 }
 
