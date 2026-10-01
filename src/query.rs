@@ -196,9 +196,28 @@ pub struct QueryInvocation {
     pub evidence_id: String,
     pub callsite: SourceSpan,
     pub location: Option<QueryLocation>,
+    #[serde(default)]
+    pub call_path: Vec<QueryCallPathStep>,
     pub arguments: BTreeMap<String, QueryValue>,
     #[serde(default)]
     pub argument_evidence: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryCallPathKind {
+    Entry,
+    Call,
+    Render,
+    ModeledRender,
+    Factory,
+    Invocation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryCallPathStep {
+    pub kind: QueryCallPathKind,
+    pub location: QueryLocation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

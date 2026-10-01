@@ -27,6 +27,15 @@
   };
   const badge = (label, type=label) => node('span', `chip ${type}`, label.replaceAll('_', ' '));
   const loc = location => location ? `${location.path}:${location.start_line}:${location.start_column}` : 'location unavailable';
+  const pathLine = (location, prefix='') => location ? `${location.path.startsWith(prefix) ? location.path.slice(prefix.length) : location.path}:${location.start_line}` : 'location unavailable';
+  const sharedDirectory = locations => {
+    let prefix = locations[0]?.path.slice(0, locations[0].path.lastIndexOf('/') + 1) || '';
+    while (prefix && locations.some(location => !location.path.startsWith(prefix))) {
+      const previous = prefix.slice(0, -1);
+      prefix = previous.slice(0, previous.lastIndexOf('/') + 1);
+    }
+    return prefix;
+  };
   const status = creation => creation.conclusion === 'candidate_invocation' ? 'candidate invocation' : creation.conclusion === 'absent_within_model' ? 'no invocation' : 'unresolved';
   const valueText = value => {
     if (!value) return '—';
@@ -121,6 +130,36 @@
   function relatedGaps(creation) {
     return report.gaps.filter(gap => gap.links.some(link => link.creation_id === creation.creation_id));
   }
+  function callPath(invocation, reachability) {
+    const section = node('div', 'call-path');
+    section.append(node('h4', '', reachability === 'reachable' ? 'Path to this invocation' : 'Local path to this invocation'));
+    const full = invocation.call_path || [];
+    if (!full.length) {
+      section.append(node('p', 'muted', 'No path was recorded. Rerun the query with the current engine.'));
+      return section;
+    }
+    const prefix = sharedDirectory(full.map(step => step.location));
+    if (prefix) section.append(node('p', 'call-root mono muted', `Relative to ${prefix}`));
+    const compact = full.filter((step, index) => index === 0 || index === full.length - 1 || step.location.path !== full[index + 1].location.path || step.kind === 'factory' || step.kind === 'invocation');
+    const chain = node('ol', 'call-chain');
+    let expanded = false;
+    const toggle = button('', () => { expanded = !expanded; renderSteps(); });
+    function renderSteps() {
+      const steps = expanded ? full : compact;
+      chain.replaceChildren();
+      steps.forEach(step => {
+        const item = node('li', 'call-step');
+        item.append(node('span', 'call-kind', step.kind.replaceAll('_', ' ')), node('span', 'mono call-location', pathLine(step.location, prefix)));
+        chain.append(item);
+      });
+      toggle.textContent = expanded ? 'Show file transitions' : `Show all ${full.length} steps`;
+    }
+    renderSteps();
+    section.append(chain);
+    if (compact.length < full.length) section.append(toggle);
+    section.append(node('p', 'aside', `${reachability === 'reachable' ? 'A possible path from a configured entry.' : 'Entry reachability is unknown; this path starts at a locally explored call.'} The compact view shows cross-file handoffs plus creation and invocation; the full view includes same-file calls and renders. Factory creation and callback invocation may occur at different times.`));
+    return section;
+  }
   function renderCreationDetail() {
     const detail = $('#creation-detail');
     detail.replaceChildren();
@@ -150,7 +189,7 @@
     creation.invocations.forEach(invocation => {
       const card = node('div', 'invocation'); const top = node('div', 'invocation-head');
       top.append(node('span', 'mono', loc(invocation.location)), button(invocation.evidence_id, () => showEvidence(invocation.evidence_id)));
-      card.append(top, valueRows(invocation.arguments, invocation.argument_evidence)); invocations.append(card);
+      card.append(top, valueRows(invocation.arguments, invocation.argument_evidence), callPath(invocation, creation.reachability)); invocations.append(card);
     });
     if (!creation.invocations.length) invocations.append(node('p', 'muted', 'No invocation found within the explored model.'));
     detail.append(invocations);

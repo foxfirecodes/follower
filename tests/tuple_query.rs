@@ -4,8 +4,8 @@ use code_flow::{
     Project,
     queries::Conclusion,
     query::{
-        QueryCallsiteStatus, QueryGapAssessment, QueryGapTarget, QueryReverseImporterEvaluation,
-        QueryScope, QueryValue, Reachability, load_query,
+        QueryCallPathKind, QueryCallsiteStatus, QueryGapAssessment, QueryGapTarget,
+        QueryReverseImporterEvaluation, QueryScope, QueryValue, Reachability, load_query,
     },
 };
 use support::TestProject;
@@ -228,6 +228,30 @@ fn backward_use_walk_crosses_class_render_and_helper_method() {
         report.coverage.gaps
     );
     assert_eq!(report.coverage.processed_files, 4);
+    let path = &report.creations[0].invocations[0].call_path;
+    assert_eq!(path.first().unwrap().kind, QueryCallPathKind::Entry);
+    assert_eq!(path.last().unwrap().kind, QueryCallPathKind::Invocation);
+    assert!(
+        path.iter()
+            .any(|step| step.kind == QueryCallPathKind::Factory)
+    );
+    let files = path
+        .iter()
+        .map(|step| step.location.path.as_str())
+        .collect::<Vec<_>>();
+    let app = files
+        .iter()
+        .position(|path| path.ends_with("src/App.tsx"))
+        .unwrap();
+    let panel = files
+        .iter()
+        .position(|path| path.ends_with("src/Panel.tsx"))
+        .unwrap();
+    let leaf = files
+        .iter()
+        .position(|path| path.ends_with("src/Leaf.tsx"))
+        .unwrap();
+    assert!(app < panel && panel < leaf, "{files:?}");
 }
 
 #[test]

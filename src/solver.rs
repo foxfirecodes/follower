@@ -25,9 +25,9 @@ use crate::{
     project::{ComponentConsumer, Project},
     queries::{AuditFinding, AuditReport, Conclusion, Coverage, FindingRef},
     query::{
-        QueryCallsiteInventory, QueryCreation, QueryGap, QueryInvocation, QueryLocation,
-        QueryReport, QueryReverseImporter, QueryReverseImporterEvaluation, QueryScope, QuerySpec,
-        QueryValue, Reachability,
+        QueryCallPathKind, QueryCallPathStep, QueryCallsiteInventory, QueryCreation, QueryGap,
+        QueryInvocation, QueryLocation, QueryReport, QueryReverseImporter,
+        QueryReverseImporterEvaluation, QueryScope, QuerySpec, QueryValue, Reachability,
     },
 };
 
@@ -108,6 +108,7 @@ struct ClosureValue {
     params: Vec<FlowPattern>,
     environment: Environment,
     file_id: FileId,
+    span: SourceSpan,
 }
 
 #[derive(Clone)]
@@ -115,6 +116,7 @@ struct ElementValue {
     component: Box<TrackedValue>,
     props: BTreeMap<String, TrackedValue>,
     span: SourceSpan,
+    trace: Vec<TraceStep>,
 }
 
 struct CapabilityState {
@@ -122,6 +124,7 @@ struct CapabilityState {
     choice: String,
     callsite: SourceSpan,
     origin: EvidenceId,
+    origin_trace: Vec<TraceStep>,
     factory_arguments: Vec<TrackedValue>,
     reachability: Reachability,
     reverse_importer: Option<ReverseImporterSeed>,
@@ -142,6 +145,13 @@ struct ReverseImporterSeed {
 struct InvocationState {
     evidence: EvidenceId,
     arguments: Vec<TrackedValue>,
+    call_path: Vec<TraceStep>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TraceStep {
+    kind: QueryCallPathKind,
+    span: SourceSpan,
 }
 
 struct LocationSource {
@@ -396,6 +406,7 @@ struct Solver<'a> {
     reverse_budget_active: bool,
     reverse_budget_reported: bool,
     render_visits: BTreeMap<(Option<String>, FileId, u32, String), usize>,
+    trace: Vec<TraceStep>,
 }
 
 impl<'a> Solver<'a> {
@@ -516,6 +527,7 @@ impl<'a> Solver<'a> {
             reverse_budget_active: false,
             reverse_budget_reported: false,
             render_visits: BTreeMap::new(),
+            trace: Vec::new(),
         })
     }
 
@@ -566,6 +578,7 @@ impl<'a> Solver<'a> {
                 .function
                 .params
                 .len();
+            let entry_span = self.functions[&entry_key].function.span.clone();
 
             for props in self.entry_input_combinations(&entry.export)? {
                 let choice = choice_label(&props);
@@ -598,8 +611,13 @@ impl<'a> Solver<'a> {
                             .map(|_| TrackedValue::unknown("unconfigured_entry_argument")),
                     );
                 }
+                self.trace = vec![TraceStep {
+                    kind: QueryCallPathKind::Entry,
+                    span: entry_span.clone(),
+                }];
                 let returned = self.call_function(&entry_key, arguments);
                 self.render(returned);
+                self.trace.clear();
             }
         }
         self.current_choice = None;
@@ -902,6 +920,17 @@ impl<'a> Solver<'a> {
         let Some(definition) = self.functions.get(key).cloned() else {
             return TrackedValue::unknown(format!("missing_function:{}", key.name));
         };
+        let trace_len = self.trace.len();
+        if self
+            .trace
+            .last()
+            .is_none_or(|step| step.span != definition.function.span)
+        {
+            self.trace.push(TraceStep {
+                kind: QueryCallPathKind::Call,
+                span: definition.function.span.clone(),
+            });
+        }
         self.call_depth += 1;
         let mut environment = self.module_environment(key.file_id);
         for (index, pattern) in definition.function.params.iter().enumerate() {
@@ -924,6 +953,7 @@ impl<'a> Solver<'a> {
         );
         self.active_captures.pop();
         self.call_depth -= 1;
+        self.trace.truncate(trace_len);
         let returned = returned.unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined));
         if returns_capability_data(&returned) && self.snapshot.files.iter().any(|file| {
             file.file_id == key.file_id
@@ -1947,6 +1977,7 @@ impl<'a> Solver<'a> {
                         params: params.clone(),
                         environment: captured,
                         file_id,
+                        span: expression.span.clone(),
                     }),
                     evidence,
                     choice: self.current_choice.clone(),
@@ -2139,13 +2170,20 @@ impl<'a> Solver<'a> {
         arguments: Vec<TrackedValue>,
         span: SourceSpan,
     ) -> TrackedValue {
-        match callee.value {
+        let trace_len = self.trace.len();
+        self.trace.push(TraceStep {
+            kind: QueryCallPathKind::Call,
+            span: span.clone(),
+        });
+        let result = match callee.value {
             AbstractValue::ModelFunction => self.call_model(&arguments, span),
             AbstractValue::Capability(capability) => {
                 let projected_arguments = arguments.iter().map(query_value).collect::<Vec<_>>();
+                let call_path = self.trace_at(QueryCallPathKind::Invocation, &span);
                 if self.capabilities.get(capability).is_some_and(|state| {
                     state.invocations.iter().any(|invocation| {
                         self.evidence[invocation.evidence.0 as usize].span == span
+                            && invocation.call_path == call_path
                             && invocation
                                 .arguments
                                 .iter()
@@ -2154,6 +2192,7 @@ impl<'a> Solver<'a> {
                                 == projected_arguments
                     })
                 }) {
+                    self.trace.truncate(trace_len);
                     return TrackedValue::plain(AbstractValue::Undefined);
                 }
                 let evidence = self.push_evidence(
@@ -2168,6 +2207,7 @@ impl<'a> Solver<'a> {
                     state.invocations.push(InvocationState {
                         evidence,
                         arguments: arguments.clone(),
+                        call_path,
                     });
                 }
                 self.emit_modeled_effects(capability, evidence, span);
@@ -2217,7 +2257,9 @@ impl<'a> Solver<'a> {
                 }
                 TrackedValue::unknown("unsupported_call_target")
             }
-        }
+        };
+        self.trace.truncate(trace_len);
+        result
     }
 
     fn scan_callback_bodies(&mut self, value: &TrackedValue, span: &SourceSpan, depth: usize) {
@@ -2630,6 +2672,7 @@ impl<'a> Solver<'a> {
             component: Box::new(component),
             props: values,
             span: expression.span.clone(),
+            trace: self.trace.clone(),
         }))
     }
 
@@ -2644,6 +2687,19 @@ impl<'a> Solver<'a> {
             }
             _ => return,
         };
+        let previous_trace = std::mem::take(&mut self.trace);
+        self.trace = merge_trace(&previous_trace, &element.trace);
+        self.trace.push(TraceStep {
+            kind: if matches!(
+                element.component.value,
+                AbstractValue::ConfiguredComponent(_)
+            ) {
+                QueryCallPathKind::ModeledRender
+            } else {
+                QueryCallPathKind::Render
+            },
+            span: element.span.clone(),
+        });
         let identity = match &element.component.value {
             AbstractValue::Function(key) => format!("function:{}:{}", key.file_id.0, key.name),
             AbstractValue::ConfiguredComponent(model) => {
@@ -2680,6 +2736,7 @@ impl<'a> Solver<'a> {
                 "render visit budget exhausted",
                 element.span,
             );
+            self.trace = previous_trace;
             return;
         }
         match &element.component.value {
@@ -2750,6 +2807,7 @@ impl<'a> Solver<'a> {
                             component: Box::new(component.clone()),
                             props: BTreeMap::new(),
                             span: element.span.clone(),
+                            trace: self.trace.clone(),
                         })));
                     }
                 }
@@ -2782,6 +2840,7 @@ impl<'a> Solver<'a> {
                         component: Box::new(component),
                         props: element.props.clone(),
                         span: element.span.clone(),
+                        trace: self.trace.clone(),
                     })));
                 }
             }
@@ -2798,6 +2857,7 @@ impl<'a> Solver<'a> {
                 }
             }
         }
+        self.trace = previous_trace;
     }
 
     fn render_child_callback(&mut self, child: TrackedValue, span: &SourceSpan) {
@@ -2845,6 +2905,7 @@ impl<'a> Solver<'a> {
                 self.call_closure(closure, Vec::new());
             }
             AbstractValue::Capability(capability) => {
+                let call_path = self.trace_at(QueryCallPathKind::Invocation, element_span);
                 let evidence = self.push_evidence(
                     RelationKind::Invocation,
                     "react_event_dispatch",
@@ -2857,6 +2918,7 @@ impl<'a> Solver<'a> {
                     state.invocations.push(InvocationState {
                         evidence,
                         arguments: Vec::new(),
+                        call_path,
                     });
                 }
                 self.emit_modeled_effects(*capability, evidence, element_span.clone());
@@ -2874,6 +2936,17 @@ impl<'a> Solver<'a> {
         closure: &ClosureValue,
         arguments: Vec<TrackedValue>,
     ) -> TrackedValue {
+        let trace_len = self.trace.len();
+        if self
+            .trace
+            .last()
+            .is_none_or(|step| step.span != closure.span)
+        {
+            self.trace.push(TraceStep {
+                kind: QueryCallPathKind::Call,
+                span: closure.span.clone(),
+            });
+        }
         let mut environment = closure.environment.clone();
         let mut references = ClosureReferences::default();
         collect_body_references(&closure.body, &mut references);
@@ -2904,6 +2977,7 @@ impl<'a> Solver<'a> {
                 .unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined)),
         };
         self.active_captures.pop();
+        self.trace.truncate(trace_len);
         returned
     }
 
@@ -2944,6 +3018,7 @@ impl<'a> Solver<'a> {
             Some(self.model.id.clone()),
             &format!("{} creates callback capturing key {key}", self.model.id),
         );
+        let origin_trace = self.trace_at(QueryCallPathKind::Factory, &span);
         let capability_id = self.capabilities.len();
         let mut assumptions = vec![
             self.model.evidence.reason.clone(),
@@ -3020,6 +3095,7 @@ impl<'a> Solver<'a> {
                     "factory model invokes the returned capability during creation",
                 ),
                 arguments: Vec::new(),
+                call_path: self.trace_at(QueryCallPathKind::Invocation, &span),
             }),
             None => unresolved.push(self.push_evidence(
                 RelationKind::UnresolvedEscape,
@@ -3035,6 +3111,7 @@ impl<'a> Solver<'a> {
             choice: choice.clone(),
             callsite: span.clone(),
             origin,
+            origin_trace,
             factory_arguments: arguments.to_vec(),
             reachability: self.current_reachability,
             reverse_importer: self.current_reverse_importer.clone(),
@@ -4011,6 +4088,17 @@ impl<'a> Solver<'a> {
                             location: self.query_location(
                                 &self.evidence[invocation.evidence.0 as usize].span,
                             ),
+                            call_path: merge_trace(&capability.origin_trace, &invocation.call_path)
+                                .iter()
+                                .filter_map(|step| {
+                                    self.query_location(&step.span).map(|location| {
+                                        QueryCallPathStep {
+                                            kind: step.kind,
+                                            location,
+                                        }
+                                    })
+                                })
+                                .collect(),
                             arguments: query
                                 .capability
                                 .invocation_arguments
@@ -4113,7 +4201,7 @@ impl<'a> Solver<'a> {
             })
             .collect();
         QueryReport {
-            schema_version: 6,
+            schema_version: 7,
             snapshot_id: self.snapshot.snapshot_id.clone(),
             config_hash: self.snapshot.config_hash.clone(),
             query_hash: query_hash.to_owned(),
@@ -4182,6 +4270,32 @@ impl<'a> Solver<'a> {
             end_column,
         })
     }
+
+    fn trace_at(&self, kind: QueryCallPathKind, span: &SourceSpan) -> Vec<TraceStep> {
+        let mut trace = self.trace.clone();
+        if let Some(last) = trace.last_mut()
+            && last.span == *span
+        {
+            last.kind = kind;
+        } else {
+            trace.push(TraceStep {
+                kind,
+                span: span.clone(),
+            });
+        }
+        trace
+    }
+}
+
+fn merge_trace(prefix: &[TraceStep], continuation: &[TraceStep]) -> Vec<TraceStep> {
+    let common = prefix
+        .iter()
+        .zip(continuation)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut result = prefix.to_vec();
+    result.extend_from_slice(&continuation[common..]);
+    result
 }
 
 fn gap_kind(reason: &str) -> String {

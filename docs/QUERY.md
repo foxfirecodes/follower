@@ -127,7 +127,7 @@ nearer the entry. Root reachability is then evaluated forward through modeled ca
 the expanded snapshot. An import or symbol reference alone does not prove root reachability or
 runtime rendering. Unsupported dynamic loaders and registry wiring can still leave paths unknown;
 budget limits are reported as coverage gaps. Each expansion round currently rebuilds the solver and
-re-evaluates previously discovered reverse importer seeds. Query report schema version 6 records
+re-evaluates previously discovered reverse importer seeds. Query report schema version 7 records
 the seed's function or module binding, source location, matched import names, and evaluation mode
 in each creation's optional `reverse_importer` field. The HTML detail and creation list show it.
 `unresolved_count` remains available even when `include_unresolved_escapes = false` hides the
@@ -209,8 +209,12 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   unresolved escapes. This includes `candidate_invocation` rows with gaps and ambiguous-linkage
   reports with no creation rows. The JSON report is still printed before the unsuccessful exit.
 
-Query report schema version 6 includes both stable source byte spans and repository-relative,
-one-based line/column locations for factory calls and invocations. JSON also includes
+Query report schema version 7 includes both stable source byte spans and file paths with one-based
+line/column locations for factory calls and invocations. Each invocation now includes
+`call_path`: ordered entry, call, render, modeled render, factory, and invocation locations from
+the explored path. The HTML view shows file transitions by default and can expand every same-file
+step. The path is a modeled possibility; a factory call and later callback invocation need not
+occur in one runtime stack. JSON also includes
 `callsite_inventory`: syntactic calls found in parsed candidate files, labeled `analyzed`,
 `filtered`, `unresolved`, or `skipped`. Inventory discovery scans every configured source for the
 factory export name, then follows imports through re-export barrels to find renamed uses. This is
