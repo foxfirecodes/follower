@@ -396,6 +396,16 @@ impl SourceCatalog {
     }
 }
 
+/// Budget for files that configured roots request after discovery stops.
+const ROOT_PHASE_FILES: usize = 128;
+const ROOT_PHASE_ROUNDS: usize = 6;
+
+struct RootPhase {
+    files: usize,
+    rounds: usize,
+    discovery_stop: Option<String>,
+}
+
 fn is_expandable_source(path: &Path) -> bool {
     path.is_file()
         && is_source_file(path)
@@ -925,34 +935,89 @@ impl Analyzer {
         let mut run_roots = query.scope != crate::query::QueryScope::AllCreations
             || self.project.config.entries.is_empty()
             || self.project.config.source_contains_any.is_empty();
-        for round in 0..=8 {
-            let (mut report, requests, producers, reachable_seed_callsites) =
-                crate::solver::execute_query(
-                    &self.project,
-                    &snapshot,
-                    query,
-                    query_hash,
-                    &reverse_seed_paths,
-                    &reverse_producer_paths,
-                    run_roots,
-                )?;
+        if self.project.config.source_contains_any.is_empty() {
+            let mut report = crate::solver::execute_query(
+                &self.project,
+                &snapshot,
+                query,
+                query_hash,
+                &reverse_seed_paths,
+                &reverse_producer_paths,
+                &entry_corridor,
+                run_roots,
+            )?
+            .report;
+            self.attach_callsite_inventory(&linker, &mut report, &snapshot, query, None)?;
+            report.finish_gaps();
+            return Ok(report);
+        }
+        let catalog = catalog
+            .as_ref()
+            .context("filtered query has no source catalog")?;
+        let mut root_phase: Option<RootPhase> = None;
+        let mut next_round = 0;
+        let mut report = loop {
+            let round = next_round;
+            next_round += 1;
+            let crate::solver::QueryPass {
+                mut report,
+                requested_imports: requests,
+                root_requested_imports,
+                producer_paths: producers,
+                reachable_seed_callsites,
+            } = crate::solver::execute_query(
+                &self.project,
+                &snapshot,
+                query,
+                query_hash,
+                &reverse_seed_paths,
+                &reverse_producer_paths,
+                &entry_corridor,
+                run_roots,
+            )?;
             if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
                 eprintln!(
-                    "query round {round}: indexed={} requested={} producers={} reverse_seeds={}",
+                    "query round {round}: indexed={} requested={} root_requested={} producers={} reverse_seeds={}",
                     snapshot.files.len(),
                     requests.len(),
+                    root_requested_imports.len(),
                     producers.len(),
                     reverse_seed_paths.len()
                 );
             }
-            if self.project.config.source_contains_any.is_empty() {
-                self.attach_callsite_inventory(&linker, &mut report, &snapshot, query, None)?;
-                report.finish_gaps();
-                return Ok(report);
+            if let Some(phase) = &mut root_phase {
+                // Follow only what root paths read, plus components on the entry corridor.
+                let mut additions = Vec::new();
+                for path in &root_requested_imports {
+                    if snapshot.files.iter().any(|file| &file.path == path) {
+                        continue;
+                    }
+                    if is_expandable_source(path) {
+                        additions.push(path.clone());
+                    } else {
+                        skipped.insert(path.clone());
+                    }
+                }
+                if additions.is_empty()
+                    || phase.rounds == ROOT_PHASE_ROUNDS
+                    || phase.files + additions.len() > ROOT_PHASE_FILES
+                {
+                    report.coverage.gaps.extend(phase.discovery_stop.take());
+                    if !additions.is_empty() {
+                        report.coverage.gaps.push(format!(
+                            "root path expansion stopped after {} files and {} rounds; {} requested files remain",
+                            phase.files,
+                            phase.rounds,
+                            additions.len()
+                        ));
+                    }
+                    break report;
+                }
+                phase.files += additions.len();
+                phase.rounds += 1;
+                self.extend_snapshot(&linker, &mut snapshot, &additions)?;
+                continue;
             }
-            let catalog = catalog
-                .as_ref()
-                .context("filtered query has no source catalog")?;
             reverse_producer_paths.extend(producers);
             let reverse_requests = catalog.reverse_importers(&linker, &reverse_producer_paths);
             if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
@@ -1055,93 +1120,45 @@ impl Analyzer {
                 }
             }
             if additions.is_empty() || round == 8 || followed + additions.len() > 256 {
-                if additions.is_empty() && !run_roots && round < 8 {
-                    run_roots = true;
-                    continue;
-                }
-                if !run_roots {
-                    // Expansion stopped before the roots pass. Explore the configured roots on the
-                    // final snapshot so unreached creations are not reported without trying them.
-                    let (roots_report, roots_requests, _, _) = crate::solver::execute_query(
-                        &self.project,
-                        &snapshot,
-                        query,
-                        query_hash,
-                        &reverse_seed_paths,
-                        &reverse_producer_paths,
-                        true,
-                    )?;
-                    report = roots_report;
-                    for path in roots_requests
-                        .iter()
-                        .filter(|path| !indexed.contains(*path))
-                    {
-                        if !is_expandable_source(path) {
-                            skipped.insert(path.clone());
-                        } else if !additions.contains(path) {
-                            additions.push(path.clone());
-                        }
-                    }
-                }
-                if !additions.is_empty() {
-                    report.coverage.gaps.push(format!(
+                let discovery_stop = (!additions.is_empty()).then(|| {
+                    format!(
                         "capability import expansion stopped after {followed} files and {round} rounds; {} requested files remain",
                         additions.len()
-                    ));
+                    )
+                });
+                if run_roots {
+                    report.coverage.gaps.extend(discovery_stop);
+                    break report;
                 }
-                if !skipped.is_empty() {
-                    report.coverage.gaps.push(format!(
-                        "{} capability imports were outside supported source files or node_modules",
-                        skipped.len()
-                    ));
+                // Discovery has settled or reached its budget. Explore the configured roots on
+                // this snapshot, then follow what those paths need under a separate budget.
+                run_roots = true;
+                if entry_corridor.is_empty() && !self.project.config.entries.is_empty() {
+                    let seeds = report
+                        .creations
+                        .iter()
+                        .filter_map(|creation| {
+                            snapshot
+                                .files
+                                .iter()
+                                .find(|file| file.file_id == creation.factory_callsite.file_id)
+                                .map(|file| file.path.clone())
+                        })
+                        .collect::<BTreeSet<_>>();
+                    let (paths, hit_limit) = catalog.entry_corridor(&self.project, &linker, &seeds);
+                    entry_path_not_found += seeds
+                        .iter()
+                        .filter(|path| !paths.contains_key(*path))
+                        .count();
+                    entry_corridor.extend(paths);
+                    corridor_limit_hit |= hit_limit;
                 }
-                if backward_limit_hit {
-                    report.coverage.gaps.push(
-                        "backward component use walk stopped at its file, depth, or symbol budget"
-                            .to_owned(),
-                    );
-                }
-                if corridor_limit_hit {
-                    report.coverage.gaps.push(
-                        "backward import scan stopped at its graph or depth budget; entry paths may be missing"
-                            .to_owned(),
-                    );
-                }
-                if entry_path_not_found > 0 {
-                    report.coverage.gaps.push(format!(
-                        "backward import scan found no modeled path to an entry for {entry_path_not_found} factory-host files"
-                    ));
-                }
-                if backward_skipped_files > 0 {
-                    report.coverage.gaps.push(format!(
-                        "backward component use walk could not parse {backward_skipped_files} candidate files"
-                    ));
-                }
-                if no_modeled_entry_use {
-                    report.coverage.gaps.push(
-                        "backward component use walk found no modeled use chain to an entry; unmodeled loaders or registries may still connect them"
-                            .to_owned(),
-                    );
-                }
-                if !report.coverage.gaps.is_empty() {
-                    report.coverage.complete = false;
-                }
-                let phase_start = Instant::now();
-                self.attach_callsite_inventory(
-                    &linker,
-                    &mut report,
-                    &snapshot,
-                    query,
-                    Some(catalog),
-                )?;
-                if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
-                    eprintln!(
-                        "query callsite inventory: {} ms",
-                        phase_start.elapsed().as_millis()
-                    );
-                }
-                report.finish_gaps();
-                return Ok(report);
+                root_phase = Some(RootPhase {
+                    files: 0,
+                    rounds: 0,
+                    discovery_stop,
+                });
+                continue;
             }
             followed += additions.len();
             reverse_seed_paths.extend(
@@ -1193,8 +1210,54 @@ impl Analyzer {
                     reverse_producer_paths.insert(path.clone());
                 }
             }
+        };
+        if !skipped.is_empty() {
+            report.coverage.gaps.push(format!(
+                "{} capability imports were outside supported source files or node_modules",
+                skipped.len()
+            ));
         }
-        unreachable!("bounded import expansion always returns")
+        if backward_limit_hit {
+            report.coverage.gaps.push(
+                "backward component use walk stopped at its file, depth, or symbol budget"
+                    .to_owned(),
+            );
+        }
+        if corridor_limit_hit {
+            report.coverage.gaps.push(
+                "backward import scan stopped at its graph or depth budget; entry paths may be missing"
+                    .to_owned(),
+            );
+        }
+        if entry_path_not_found > 0 {
+            report.coverage.gaps.push(format!(
+                "backward import scan found no modeled path to an entry for {entry_path_not_found} factory-host files"
+            ));
+        }
+        if backward_skipped_files > 0 {
+            report.coverage.gaps.push(format!(
+                "backward component use walk could not parse {backward_skipped_files} candidate files"
+            ));
+        }
+        if no_modeled_entry_use {
+            report.coverage.gaps.push(
+                "backward component use walk found no modeled use chain to an entry; unmodeled loaders or registries may still connect them"
+                    .to_owned(),
+            );
+        }
+        if !report.coverage.gaps.is_empty() {
+            report.coverage.complete = false;
+        }
+        let phase_start = Instant::now();
+        self.attach_callsite_inventory(&linker, &mut report, &snapshot, query, Some(catalog))?;
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!(
+                "query callsite inventory: {} ms",
+                phase_start.elapsed().as_millis()
+            );
+        }
+        report.finish_gaps();
+        Ok(report)
     }
 
     fn attach_callsite_inventory(

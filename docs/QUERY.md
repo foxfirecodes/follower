@@ -134,9 +134,14 @@ use walk follows the containing function or module binding through local referen
 re-exports, and imported references. It parses candidate importers on demand, prioritizing paths
 nearer the entry. The walk indexes resolved import targets as files are added, so repeated symbol
 checks do not rescan the growing resolution list. Root reachability is then evaluated forward
-through modeled calls and JSX in the expanded snapshot. If an expansion budget stops the query
-first, the roots are still evaluated once on the final snapshot before the report is written, and
-the stop remains a coverage gap. An import or symbol reference alone does not prove root reachability or
+through modeled calls and JSX in the expanded snapshot. For filtered `all_creations` queries, the
+roots run once discovery settles or reaches its budget; a discovery stop remains a coverage gap.
+A root phase then parses only what those root paths need: imported values they read, and unknown
+components whose files are on the import corridor toward factory hosts. It has its own budget of
+128 files and six rounds, reported as a gap when reached. Other unparsed wrappers are not parsed in
+this phase; they are left to the possible-render assumption below, because a parsed wrapper whose
+body is not fully modeled can hide paths that the assumption keeps. An import or symbol reference
+alone does not prove root reachability or
 runtime rendering. Unsupported dynamic loaders and registry wiring can still leave paths unknown;
 budget limits are reported as coverage gaps. Each expansion round currently rebuilds the solver and
 re-evaluates previously discovered reverse importer seeds. Since query report schema version 7, the
@@ -215,7 +220,11 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   `render_assumed_through_unmodeled_component` gap. Invocation paths mark the step as
   `assumed_render`. Callbacks passed to the component are not called by this assumption. A
   possible row is never upgraded to reachable; modeling or parsing the component can remove the
-  assumption.
+  assumption. Function children are called like render functions. A call to an unknown function
+  that receives a component, such as an unmodeled higher-order component, returns a value that may
+  render that component with the element's props. Under an assumption, components from files off
+  the entry corridor are skipped unless they receive JSX or callbacks, and assumed rendering has a
+  20,000-step budget per entry input; exhausting it is a coverage gap.
 - `all_creations` additionally scans the owned IR for every resolved factory callsite. It explores
   an otherwise-unreached enclosing function once with unknown parameters. Such rows have
   `reachability = "unknown"`, an unresolved reference, and an incomplete-coverage gap; they are

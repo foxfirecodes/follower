@@ -408,11 +408,22 @@ fn configured_route_render_prop_and_wrapper_connect_a_class_route_table() {
     );
     assert_eq!(report.coverage.processed_files, 5);
     fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[component_wrappers]]\nmodule = './wrap'\nexport = 'protect'\ncomponent_argument = 0\n[[component_consumers]]\nmodule = './other-router'\nexport = 'Route'\nrender_props = ['render']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
+    // Without a contract, the route file is off the path to the factory and is not parsed, so
+    // the route is assumed to render its render prop. The result is only possible and names the
+    // assumed component as a gap.
     let unmodeled_route = fixture.report();
     assert_eq!(
         unmodeled_route.creations[0].reachability,
-        Reachability::Unknown
+        Reachability::Possible
     );
+    assert!(unmodeled_route.gaps.iter().any(|gap| {
+        gap.kind == "render_assumed_through_unmodeled_component"
+            && gap.assessment == QueryGapAssessment::Direct
+            && gap
+                .location
+                .as_ref()
+                .is_some_and(|location| location.path.ends_with("View.tsx"))
+    }));
     fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[component_wrappers]]\nmodule = './wrap'\nexport = 'protect'\ncomponent_argument = 0\n[[component_consumers]]\nmodule = './router'\nexport = 'Route'\nrender_props = ['render']\nrender_callback_names = ['Elsewhere']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n");
     let filtered_route = fixture.report();
     assert_eq!(
@@ -445,7 +456,7 @@ fn unmodeled_component_renders_children_and_jsx_props_as_possible_reachability()
         ),
         (
             "src/App.tsx",
-            "import { Frame } from 'external-frame'; import { useItemSelection } from './hook'; import { Leaf } from './Leaf'; import { Page } from './Page'; export function App() { const [, select] = useItemSelection(['beta']); return <div><Leaf action='direct' /><Frame title='x'><Leaf action='child' /></Frame><Frame header={<Leaf action='element' />} render={() => <Leaf action='render' />} component={Page} onSelect={() => select('select')} /></div>; }",
+            "import { Frame } from 'external-frame'; import { useItemSelection } from './hook'; import { Leaf } from './Leaf'; import { Page } from './Page'; export function App() { const [, select] = useItemSelection(['beta']); return <div><Leaf action='direct' /><Frame title='x'><Leaf action='child' /></Frame><Frame>{() => <Leaf action='function-child' />}</Frame><Frame header={<Leaf action='element' />} render={() => <Leaf action='render' />} component={Page} onSelect={() => select('select')} /></div>; }",
         ),
     ]);
     fixture.write(
@@ -481,6 +492,7 @@ fn unmodeled_component_renders_children_and_jsx_props_as_possible_reachability()
             ("component", Reachability::Possible),
             ("direct", Reachability::Reachable),
             ("element", Reachability::Possible),
+            ("function-child", Reachability::Possible),
             ("render", Reachability::Possible),
         ],
         "{:?}",
@@ -514,6 +526,73 @@ fn unmodeled_component_renders_children_and_jsx_props_as_possible_reachability()
         })
         .expect("callback passed to the unmodeled component is not invoked");
     assert_eq!(select.conclusion, Conclusion::Unresolved);
+}
+
+#[test]
+fn unmodeled_higher_order_component_renders_wrapped_component_as_possible() {
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values: string[]) { return [null, (_action: string) => {}]; }",
+        ),
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf({ action }: { action: string }) { const [, apply] = useItemSelection(['alpha']); apply(action); return null; }",
+        ),
+        (
+            "src/Panel.tsx",
+            "import { withSize, connect } from 'external-hoc'; import { Leaf } from './Leaf'; function Panel({ action }: { action: string }) { return <Leaf action={action} />; } export const SizedPanel = withSize(Panel); export const ConnectedPanel = connect((_state: unknown) => ({}))(Panel);",
+        ),
+        (
+            "src/App.tsx",
+            "import { SizedPanel, ConnectedPanel } from './Panel'; export function App() { return <div><SizedPanel action='sized' /><ConnectedPanel action='connected' /></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let mut actions = report
+        .creations
+        .iter()
+        .flat_map(|creation| {
+            creation.invocations.iter().map(move |invocation| {
+                (
+                    invocation.arguments["action"].clone(),
+                    creation.reachability,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    actions.sort_by_key(|(value, _)| format!("{value:?}"));
+    assert_eq!(
+        actions,
+        [
+            (
+                QueryValue::String {
+                    value: "connected".to_owned()
+                },
+                Reachability::Possible
+            ),
+            (
+                QueryValue::String {
+                    value: "sized".to_owned()
+                },
+                Reachability::Possible
+            ),
+        ],
+        "{:?}",
+        report.coverage.gaps
+    );
+    assert!(report.gaps.iter().any(
+        |gap| gap.kind == "render_assumed_through_unmodeled_component"
+            && gap.assessment == QueryGapAssessment::Direct
+    ));
 }
 
 #[test]

@@ -34,6 +34,7 @@ use crate::{
 const MAX_CALL_DEPTH: usize = 128;
 const MAX_REVERSE_IMPORTER_EVALUATIONS: usize = 5_000;
 const MAX_UNREACHED_RENDER_EVALUATIONS: usize = 5_000;
+const MAX_ASSUMED_RENDER_EVALUATIONS: usize = 20_000;
 const MAX_REVERSE_IMPORTER_SOURCE_BYTES: usize = 20_000;
 const MAX_HEAP_ALTERNATIVES: usize = 32;
 const MAX_RENDER_VISITS_PER_SITE: usize = 16;
@@ -95,6 +96,13 @@ enum AbstractValue {
     ConfiguredComponent(ComponentConsumer),
     Undefined,
     Unknown(String),
+    /// The unknown result of a call that received components, such as an unmodeled
+    /// higher-order component. Rendering it may render the wrapped components; otherwise it
+    /// behaves like `Unknown`.
+    AssumedWrapper {
+        reason: String,
+        wrapped: Rc<Vec<TrackedValue>>,
+    },
 }
 
 impl AbstractValue {
@@ -253,6 +261,19 @@ pub fn audit(
     Ok(solver.report(model_hash))
 }
 
+/// The result of one solver pass over a snapshot.
+pub struct QueryPass {
+    pub report: QueryReport,
+    /// Unparsed files requested anywhere in the pass.
+    pub requested_imports: BTreeSet<std::path::PathBuf>,
+    /// Unparsed files requested while exploring configured roots: values the root paths read and
+    /// unknown components on the entry corridor.
+    pub root_requested_imports: BTreeSet<std::path::PathBuf>,
+    pub producer_paths: BTreeSet<std::path::PathBuf>,
+    pub reachable_seed_callsites: Vec<SourceSpan>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn execute_query(
     project: &Project,
     snapshot: &Snapshot,
@@ -260,13 +281,9 @@ pub fn execute_query(
     query_hash: &str,
     reverse_seed_paths: &BTreeSet<std::path::PathBuf>,
     reverse_producer_paths: &BTreeSet<std::path::PathBuf>,
+    entry_corridor: &BTreeMap<std::path::PathBuf, usize>,
     run_roots: bool,
-) -> Result<(
-    QueryReport,
-    BTreeSet<std::path::PathBuf>,
-    BTreeSet<std::path::PathBuf>,
-    Vec<SourceSpan>,
-)> {
+) -> Result<QueryPass> {
     let captures = query
         .factory_arguments
         .iter()
@@ -298,6 +315,21 @@ pub fn execute_query(
         },
     };
     let mut solver = Solver::new(project, snapshot, model)?;
+    solver.entry_corridor = entry_corridor.keys().cloned().collect();
+    if !entry_corridor.is_empty() {
+        let mut corridor_files = entry_corridor
+            .keys()
+            .filter_map(|path| solver.symbol_linker.file_at(path))
+            .map(|file| file.file_id)
+            .collect::<BTreeSet<_>>();
+        corridor_files.extend(
+            solver
+                .factory_candidates()
+                .iter()
+                .map(|candidate| candidate.file_id),
+        );
+        solver.corridor_files = corridor_files;
+    }
     let phase_start = Instant::now();
     if project.config.entries.is_empty() {
         if query.scope == QueryScope::Reachable {
@@ -339,7 +371,8 @@ pub fn execute_query(
             );
         }
     }
-    let requested_imports = solver.requested_imports.clone();
+    let requested_imports = std::mem::take(&mut solver.requested_imports);
+    let root_requested_imports = std::mem::take(&mut solver.root_requested_imports);
     if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
         eprintln!(
             "query module environments: hits={} misses={}",
@@ -372,12 +405,13 @@ pub fn execute_query(
             phase_start.elapsed().as_millis()
         );
     }
-    Ok((
+    Ok(QueryPass {
         report,
         requested_imports,
+        root_requested_imports,
         producer_paths,
         reachable_seed_callsites,
-    ))
+    })
 }
 
 struct Solver<'a> {
@@ -408,6 +442,12 @@ struct Solver<'a> {
     query_gap_keys: BTreeSet<(String, Option<String>)>,
     location_sources: RefCell<BTreeMap<FileId, LocationSource>>,
     requested_imports: BTreeSet<std::path::PathBuf>,
+    root_requested_imports: BTreeSet<std::path::PathBuf>,
+    entry_corridor: BTreeSet<std::path::PathBuf>,
+    /// Files on the entry corridor plus factory hosts. Empty when the corridor is unknown.
+    corridor_files: BTreeSet<FileId>,
+    assumed_evaluations: usize,
+    assumed_budget_reported: bool,
     capability_producer_files: BTreeSet<FileId>,
     caller_producer_files: BTreeSet<FileId>,
     current_choice: Option<String>,
@@ -527,6 +567,11 @@ impl<'a> Solver<'a> {
             query_gap_keys: BTreeSet::new(),
             location_sources: RefCell::new(BTreeMap::new()),
             requested_imports: BTreeSet::new(),
+            root_requested_imports: BTreeSet::new(),
+            entry_corridor: BTreeSet::new(),
+            corridor_files: BTreeSet::new(),
+            assumed_evaluations: 0,
+            assumed_budget_reported: false,
             capability_producer_files: BTreeSet::new(),
             caller_producer_files: BTreeSet::new(),
             current_choice: None,
@@ -593,6 +638,8 @@ impl<'a> Solver<'a> {
             for props in self.entry_input_combinations(&entry.export)? {
                 let choice = choice_label(&props);
                 self.current_choice = Some(choice.clone());
+                self.assumed_evaluations = 0;
+                self.assumed_budget_reported = false;
                 self.prepare_globals(Some(entry_file.file_id));
                 let record = props
                     .into_iter()
@@ -834,31 +881,50 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn request_import_for_local(&mut self, file_id: FileId, local: &str) {
-        let Some(file) = self.symbol_linker.file(file_id) else {
-            return;
-        };
-        let Some(import) = file
+    /// Returns the resolved file of a value import when that file is not in the snapshot.
+    fn unparsed_import_target(&self, file_id: FileId, local: &str) -> Option<std::path::PathBuf> {
+        let file = self.symbol_linker.file(file_id)?;
+        let import = file
             .flow
             .imports
             .iter()
-            .find(|import| import.local == local && !import.type_only)
-        else {
-            return;
-        };
-        let Some(path) = self
+            .find(|import| import.local == local && !import.type_only)?;
+        let path = self
             .symbol_linker
             .import_resolutions(&file.path)
             .find(|resolution| {
                 resolution.specifier == import.module
                     && resolution.status == crate::link::ResolutionStatus::Resolved
             })
-            .and_then(|resolution| resolution.resolved_path.as_ref())
-        else {
+            .and_then(|resolution| resolution.resolved_path.as_ref())?;
+        self.symbol_linker
+            .file_at(path)
+            .is_none()
+            .then(|| path.clone())
+    }
+
+    fn request_import_for_local(&mut self, file_id: FileId, local: &str) {
+        if let Some(path) = self.unparsed_import_target(file_id, local) {
+            if self.current_reachability != Reachability::Unknown {
+                self.root_requested_imports.insert(path.clone());
+            }
+            self.requested_imports.insert(path);
+        }
+    }
+
+    /// Requests the file of an unknown component. Off the entry corridor this only feeds the
+    /// general expansion when `general` is set; root paths follow corridor files, which can lead
+    /// toward factory hosts, and leave other components to the possible-render assumption.
+    fn request_component_import(&mut self, file_id: FileId, local: &str, general: bool) {
+        let Some(path) = self.unparsed_import_target(file_id, local) else {
             return;
         };
-        if self.symbol_linker.file_at(path).is_none() {
-            self.requested_imports.insert(path.clone());
+        let on_corridor = self.entry_corridor.contains(&path);
+        if on_corridor && self.current_reachability != Reachability::Unknown {
+            self.root_requested_imports.insert(path.clone());
+        }
+        if general || on_corridor {
+            self.requested_imports.insert(path);
         }
     }
 
@@ -1533,6 +1599,9 @@ impl<'a> Solver<'a> {
                 return TrackedValue::unknown("unreached_render_budget_exhausted");
             }
         }
+        if self.current_reachability == Reachability::Possible && self.assumed_budget_exhausted() {
+            return TrackedValue::unknown("assumed_render_budget_exhausted");
+        }
         if self.reverse_budget_active {
             self.reverse_evaluations += 1;
             if self.reverse_evaluations > MAX_REVERSE_IMPORTER_EVALUATIONS {
@@ -1801,6 +1870,9 @@ impl<'a> Solver<'a> {
                                 .symbol_linker
                                 .resolve_exported_value(file.file_id, "default");
                             return self.linked_value(exported, &expression.span);
+                        }
+                        if self.current_reachability != Reachability::Unknown {
+                            self.root_requested_imports.insert(target.clone());
                         }
                         self.requested_imports.insert(target);
                     } else {
@@ -2181,6 +2253,13 @@ impl<'a> Solver<'a> {
             kind: QueryCallPathKind::Call,
             span: span.clone(),
         });
+        let callee = match callee.value {
+            AbstractValue::AssumedWrapper { reason, .. } => TrackedValue {
+                value: AbstractValue::Unknown(reason),
+                ..callee
+            },
+            _ => callee,
+        };
         let result = match callee.value {
             AbstractValue::ModelFunction => self.call_model(&arguments, span),
             AbstractValue::Capability(capability) => {
@@ -2248,7 +2327,19 @@ impl<'a> Solver<'a> {
                         self.scan_callback_bodies(argument, &span, 0);
                     }
                 }
-                TrackedValue::unknown("unknown_call_result")
+                let wrapped = arguments
+                    .iter()
+                    .filter(|argument| self.is_component_like(argument))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if wrapped.is_empty() {
+                    TrackedValue::unknown("unknown_call_result")
+                } else {
+                    TrackedValue::plain(AbstractValue::AssumedWrapper {
+                        reason: "unknown_call_result".to_owned(),
+                        wrapped: Rc::new(wrapped),
+                    })
+                }
             }
             _ => {
                 self.mark_values_unresolved(
@@ -2662,16 +2753,31 @@ impl<'a> Solver<'a> {
                 ),
             }
         }
-        if matches!(&component.value, AbstractValue::Unknown(_))
-            && let FlowJsxTag::Identifier { name, .. } = tag
-            && (values.contains_key("children")
-                || values.contains_key("render")
-                || values.contains_key("component")
-                || values
-                    .values()
-                    .any(|value| !capability_ids(value).is_empty()))
-        {
-            self.request_import_for_local(file_id, name);
+        if matches!(&component.value, AbstractValue::Unknown(_)) {
+            let local = match tag {
+                FlowJsxTag::Identifier {
+                    name,
+                    intrinsic: false,
+                    ..
+                }
+                | FlowJsxTag::Member { object: name, .. } => Some(name.as_str()),
+                _ => None,
+            };
+            let renders_content = matches!(tag, FlowJsxTag::Identifier { .. })
+                && (values.contains_key("children")
+                    || values.contains_key("render")
+                    || values.contains_key("component"));
+            if let Some(local) = local {
+                if matches!(tag, FlowJsxTag::Identifier { .. })
+                    && values
+                        .values()
+                        .any(|value| !capability_ids(value).is_empty())
+                {
+                    self.request_import_for_local(file_id, local);
+                } else if renders_content || self.current_reachability != Reachability::Unknown {
+                    self.request_component_import(file_id, local, renders_content);
+                }
+            }
         }
         TrackedValue::plain(AbstractValue::element(ElementValue {
             component: Box::new(component),
@@ -2712,12 +2818,30 @@ impl<'a> Solver<'a> {
             }
             _ => return,
         };
+        if self.current_reachability == Reachability::Possible {
+            if self.assumed_budget_exhausted() {
+                return;
+            }
+            // Under an assumption, explore only what can lead toward a factory host: corridor
+            // components, or components handed JSX or callbacks from the path above.
+            if let AbstractValue::Function(key) = &element.component.value
+                && !self.corridor_files.is_empty()
+                && !self.corridor_files.contains(&key.file_id)
+                && !element.props.values().any(|value| {
+                    self.carries_render_content(value, 0) || !capability_ids(value).is_empty()
+                })
+            {
+                return;
+            }
+        }
         let previous_trace = std::mem::take(&mut self.trace);
         self.trace = merge_trace(&previous_trace, &element.trace);
         self.trace.push(TraceStep {
             kind: match &element.component.value {
                 AbstractValue::ConfiguredComponent(_) => QueryCallPathKind::ModeledRender,
-                AbstractValue::Unknown(_) if self.current_reachability != Reachability::Unknown => {
+                AbstractValue::Unknown(_) | AbstractValue::AssumedWrapper { .. }
+                    if self.current_reachability != Reachability::Unknown =>
+                {
                     QueryCallPathKind::AssumedRender
                 }
                 _ => QueryCallPathKind::Render,
@@ -2860,7 +2984,22 @@ impl<'a> Solver<'a> {
                     }
                 }
                 if self.current_reachability != Reachability::Unknown {
-                    self.render_through_unmodeled_component(&element);
+                    self.render_through_unmodeled_component(&element, &[]);
+                }
+            }
+            AbstractValue::AssumedWrapper { reason, wrapped } => {
+                self.mark_values_unresolved(
+                    element.props.values(),
+                    &format!("element has unknown component target: {reason}"),
+                    element.span.clone(),
+                );
+                if self.model.scan_callback_bodies {
+                    for prop in element.props.values() {
+                        self.scan_callback_bodies(prop, &element.span, 0);
+                    }
+                }
+                if self.current_reachability != Reachability::Unknown {
+                    self.render_through_unmodeled_component(&element, wrapped);
                 }
             }
             AbstractValue::Union(components) => {
@@ -2892,43 +3031,113 @@ impl<'a> Solver<'a> {
     /// Explores what an unmodeled component may render on a path from a configured root.
     ///
     /// Children, JSX-valued props, component props, and render functions that return JSX are
-    /// treated as rendered. Anything reached this way is only possibly reachable, and creations
-    /// record each assumed component so the assumption can be resolved later.
-    fn render_through_unmodeled_component(&mut self, element: &ElementValue) {
+    /// treated as rendered, as are components wrapped by an unmodeled higher-order component,
+    /// which receive the element's props. Anything reached this way is only possibly reachable,
+    /// and creations record each assumed component so the assumption can be resolved later.
+    fn render_through_unmodeled_component(
+        &mut self,
+        element: &ElementValue,
+        wrapped: &[TrackedValue],
+    ) {
         let previous = self.current_reachability;
         self.current_reachability = Reachability::Possible;
         self.assumed_renders.push(element.span.clone());
+        for component in wrapped {
+            self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
+                component: Box::new(component.clone()),
+                props: element.props.clone(),
+                span: element.span.clone(),
+                trace: self.trace.clone(),
+            })));
+        }
         for value in element.props.values() {
-            match &value.value {
-                AbstractValue::Function(key) => {
-                    if self
-                        .functions
-                        .get(key)
-                        .is_some_and(|function| statements_render_jsx(&function.body))
-                    {
-                        self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
-                            component: Box::new(value.clone()),
-                            props: BTreeMap::new(),
-                            span: element.span.clone(),
-                            trace: self.trace.clone(),
-                        })));
-                    }
-                }
-                AbstractValue::Closure(closure) => {
-                    if arrow_body_renders_jsx(&closure.body) {
-                        let returned = self.invoke_value(
-                            value.clone(),
-                            vec![TrackedValue::unknown("unmodeled_component_argument")],
-                            element.span.clone(),
-                        );
-                        self.render(returned);
-                    }
-                }
-                _ => self.render(value.clone()),
-            }
+            self.render_assumed_prop(value, &element.span);
         }
         self.assumed_renders.pop();
         self.current_reachability = previous;
+    }
+
+    /// Renders a prop handed to an unmodeled component, including function children.
+    fn render_assumed_prop(&mut self, value: &TrackedValue, span: &SourceSpan) {
+        match &value.value {
+            AbstractValue::Array(values) | AbstractValue::Union(values) => {
+                for value in values.iter() {
+                    self.render_assumed_prop(value, span);
+                }
+            }
+            AbstractValue::Function(key) => {
+                if self
+                    .functions
+                    .get(key)
+                    .is_some_and(|function| statements_render_jsx(&function.body))
+                {
+                    self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
+                        component: Box::new(value.clone()),
+                        props: BTreeMap::new(),
+                        span: span.clone(),
+                        trace: self.trace.clone(),
+                    })));
+                }
+            }
+            AbstractValue::Closure(closure) => {
+                if arrow_body_renders_jsx(&closure.body) {
+                    let returned = self.invoke_value(
+                        value.clone(),
+                        vec![TrackedValue::unknown("unmodeled_component_argument")],
+                        span.clone(),
+                    );
+                    self.render(returned);
+                }
+            }
+            _ => self.render(value.clone()),
+        }
+    }
+
+    /// Counts one assumed-render step and reports when the per-root budget is exhausted.
+    fn assumed_budget_exhausted(&mut self) -> bool {
+        self.assumed_evaluations += 1;
+        if self.assumed_evaluations <= MAX_ASSUMED_RENDER_EVALUATIONS {
+            return false;
+        }
+        if !self.assumed_budget_reported {
+            self.assumed_budget_reported = true;
+            if let Some(span) = self.assumed_renders.first().cloned() {
+                self.record_coverage_gap("assumed render budget exhausted", &span);
+            }
+        }
+        true
+    }
+
+    /// Returns whether a prop value can carry something renderable: JSX, a component, or a
+    /// render function.
+    fn carries_render_content(&self, value: &TrackedValue, depth: usize) -> bool {
+        match &value.value {
+            AbstractValue::Element(_) => true,
+            AbstractValue::Array(values) | AbstractValue::Union(values) => values
+                .iter()
+                .any(|value| self.carries_render_content(value, depth)),
+            AbstractValue::Record(fields) => {
+                depth < 4
+                    && fields
+                        .values()
+                        .any(|value| self.carries_render_content(value, depth + 1))
+            }
+            _ => self.is_component_like(value),
+        }
+    }
+
+    /// Returns whether a value can be rendered as a component: a function or closure that returns
+    /// JSX, a configured component, or another assumed wrapper.
+    fn is_component_like(&self, value: &TrackedValue) -> bool {
+        match &value.value {
+            AbstractValue::Function(key) => self
+                .functions
+                .get(key)
+                .is_some_and(|function| statements_render_jsx(&function.body)),
+            AbstractValue::Closure(closure) => arrow_body_renders_jsx(&closure.body),
+            AbstractValue::ConfiguredComponent(_) | AbstractValue::AssumedWrapper { .. } => true,
+            _ => false,
+        }
     }
 
     fn render_child_callback(&mut self, child: TrackedValue, span: &SourceSpan) {
@@ -4865,7 +5074,9 @@ fn render_compact_value(value: &TrackedValue) -> String {
                 .join(", ")
         ),
         AbstractValue::Undefined => "undefined".to_owned(),
-        AbstractValue::Unknown(reason) => format!("<{reason}>"),
+        AbstractValue::Unknown(reason) | AbstractValue::AssumedWrapper { reason, .. } => {
+            format!("<{reason}>")
+        }
         AbstractValue::Union(values) => format!(
             "({})",
             values
@@ -4898,9 +5109,11 @@ fn query_value(value: &TrackedValue) -> QueryValue {
             elements: elements.iter().map(query_value).collect(),
         },
         AbstractValue::Undefined => QueryValue::Undefined,
-        AbstractValue::Unknown(reason) => QueryValue::Unknown {
-            reason: reason.clone(),
-        },
+        AbstractValue::Unknown(reason) | AbstractValue::AssumedWrapper { reason, .. } => {
+            QueryValue::Unknown {
+                reason: reason.clone(),
+            }
+        }
         AbstractValue::Boolean(value) => QueryValue::Boolean { value: *value },
         AbstractValue::Union(values) if array_alternatives(value) || enum_alternatives(value) => {
             QueryValue::Alternatives {
@@ -4954,7 +5167,7 @@ fn exact_equality(left: &AbstractValue, right: &AbstractValue) -> Option<bool> {
 fn nullish(value: &AbstractValue) -> Option<bool> {
     match value {
         AbstractValue::Null | AbstractValue::Undefined => Some(true),
-        AbstractValue::Unknown(_) => None,
+        AbstractValue::Unknown(_) | AbstractValue::AssumedWrapper { .. } => None,
         AbstractValue::Union(values) => {
             same_known(values.iter().map(|value| nullish(&value.value)))
         }
@@ -5022,7 +5235,7 @@ fn truthy(value: &AbstractValue) -> Option<bool> {
         AbstractValue::Number(value) => Some(*value != 0),
         AbstractValue::EnumMember { value, .. } => Some(*value != 0),
         AbstractValue::String(value) => Some(!value.is_empty()),
-        AbstractValue::Unknown(_) => None,
+        AbstractValue::Unknown(_) | AbstractValue::AssumedWrapper { .. } => None,
         AbstractValue::Union(values) => same_known(values.iter().map(|value| truthy(&value.value))),
         _ => Some(true),
     }
@@ -5036,7 +5249,7 @@ fn same_known(values: impl Iterator<Item = Option<bool>>) -> Option<bool> {
 
 fn value_is_uncertain(value: &TrackedValue) -> bool {
     match &value.value {
-        AbstractValue::Unknown(_) => true,
+        AbstractValue::Unknown(_) | AbstractValue::AssumedWrapper { .. } => true,
         AbstractValue::Union(values) => {
             !finite_array_alternatives(value) || values.iter().any(value_is_uncertain)
         }
