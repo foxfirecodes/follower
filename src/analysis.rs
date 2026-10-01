@@ -3,6 +3,7 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -155,6 +156,7 @@ struct SourceCatalog {
 
 impl SourceCatalog {
     fn build(project: &Project, query: &QuerySpec) -> Result<Self> {
+        let phase_start = Instant::now();
         let mut imports_by_stem: BTreeMap<String, Vec<(PathBuf, String)>> = BTreeMap::new();
         let mut configured_files = 0;
         let mut candidate_paths = BTreeSet::new();
@@ -198,7 +200,20 @@ impl SourceCatalog {
             skipped_candidate_files: 0,
             inventory_round_limit_hit: false,
         };
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!(
+                "query source catalog scan: {} ms",
+                phase_start.elapsed().as_millis()
+            );
+        }
+        let phase_start = Instant::now();
         catalog.follow_factory_reexports(project, query)?;
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!(
+                "query source catalog reexports: {} ms",
+                phase_start.elapsed().as_millis()
+            );
+        }
         Ok(catalog)
     }
 
@@ -578,6 +593,21 @@ impl Analyzer {
         let mut visited = BTreeSet::new();
         let mut indexes: BTreeMap<FileId, FileUseIndex> = BTreeMap::new();
         let mut reverse_cache: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+        // Importer tasks check the same modules repeatedly as the snapshot
+        // grows. Keep all resolved targets for a specifier to preserve the
+        // previous `any` behavior if duplicate resolution records exist.
+        let mut resolved_modules: BTreeMap<PathBuf, BTreeMap<String, BTreeSet<PathBuf>>> =
+            BTreeMap::new();
+        for resolution in &snapshot.resolutions {
+            if let Some(target) = &resolution.resolved_path {
+                resolved_modules
+                    .entry(resolution.importer.clone())
+                    .or_default()
+                    .entry(resolution.specifier.clone())
+                    .or_default()
+                    .insert(target.clone());
+            }
+        }
         while let Some((_, task)) = pending.pop_first() {
             match task {
                 BackwardTask::Symbol {
@@ -659,12 +689,23 @@ impl Analyzer {
                             result.limit_hit = true;
                             break;
                         }
+                        let old_resolutions = snapshot.resolutions.len();
                         if self
                             .extend_snapshot(snapshot, std::slice::from_ref(&path))
                             .is_err()
                         {
                             result.skipped_files += 1;
                             continue;
+                        }
+                        for resolution in snapshot.resolutions.iter().skip(old_resolutions) {
+                            if let Some(target) = &resolution.resolved_path {
+                                resolved_modules
+                                    .entry(resolution.importer.clone())
+                                    .or_default()
+                                    .entry(resolution.specifier.clone())
+                                    .or_default()
+                                    .insert(target.clone());
+                            }
                         }
                         result.added_files += 1;
                     }
@@ -677,11 +718,10 @@ impl Analyzer {
                         .entry(importer_id)
                         .or_insert_with(|| FileUseIndex::new(importer));
                     let matches_target = |module: &str| {
-                        snapshot.resolutions.iter().any(|resolution| {
-                            resolution.importer == path
-                                && resolution.specifier == module
-                                && resolution.resolved_path.as_ref() == Some(&child)
-                        })
+                        resolved_modules
+                            .get(&path)
+                            .and_then(|modules| modules.get(module))
+                            .is_some_and(|targets| targets.contains(&child))
                     };
                     for import in &importer.flow.imports {
                         if import.type_only
@@ -805,12 +845,26 @@ impl Analyzer {
 
     pub fn query(&self, query: &QuerySpec, query_hash: &str) -> Result<QueryReport> {
         query.validate()?;
+        let phase_start = Instant::now();
         let mut snapshot = self.index()?;
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!(
+                "query initial index: {} ms",
+                phase_start.elapsed().as_millis()
+            );
+        }
+        let phase_start = Instant::now();
         let catalog = if self.project.config.source_contains_any.is_empty() {
             None
         } else {
             Some(SourceCatalog::build(&self.project, query)?)
         };
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!(
+                "query source catalog: {} ms",
+                phase_start.elapsed().as_millis()
+            );
+        }
         let mut followed = 0;
         let mut skipped = BTreeSet::new();
         let mut reverse_seed_paths = BTreeSet::new();
@@ -905,6 +959,7 @@ impl Analyzer {
                         .filter(|path| corridor_seeds.insert(path.clone()))
                         .collect::<BTreeSet<_>>();
                     if !new_paths.is_empty() {
+                        let phase_start = Instant::now();
                         let (paths, hit_limit) = catalog.entry_corridor(&self.project, &new_paths);
                         entry_path_not_found += new_paths
                             .iter()
@@ -919,11 +974,16 @@ impl Analyzer {
                                 entry_corridor.len(),
                                 hit_limit
                             );
+                            eprintln!(
+                                "query entry corridor elapsed: {} ms",
+                                phase_start.elapsed().as_millis()
+                            );
                         }
                     }
                     let original_files = snapshot.files.len();
                     let original_resolutions = snapshot.resolutions.len();
                     let original_snapshot_id = snapshot.snapshot_id.clone();
+                    let phase_start = Instant::now();
                     let walk = self.walk_backward_uses(
                         &mut snapshot,
                         catalog,
@@ -938,6 +998,10 @@ impl Analyzer {
                         eprintln!(
                             "query backward uses: parsed={} reached_entry={} limit_hit={}",
                             walk.added_files, walk.reached_entry, walk.limit_hit
+                        );
+                        eprintln!(
+                            "query backward uses elapsed: {} ms",
+                            phase_start.elapsed().as_millis()
                         );
                     }
                     if walk.reached_entry && walk.added_files > 0 {
@@ -997,7 +1061,14 @@ impl Analyzer {
                 if !report.coverage.gaps.is_empty() {
                     report.coverage.complete = false;
                 }
+                let phase_start = Instant::now();
                 self.attach_callsite_inventory(&mut report, &snapshot, query, Some(catalog))?;
+                if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+                    eprintln!(
+                        "query callsite inventory: {} ms",
+                        phase_start.elapsed().as_millis()
+                    );
+                }
                 report.finish_gaps();
                 return Ok(report);
             }
@@ -1008,7 +1079,15 @@ impl Analyzer {
                     .filter(|path| reverse_requests.contains(*path))
                     .cloned(),
             );
+            let phase_start = Instant::now();
             self.extend_snapshot(&mut snapshot, &additions)?;
+            if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+                eprintln!(
+                    "query snapshot expansion: files={} elapsed={} ms",
+                    additions.len(),
+                    phase_start.elapsed().as_millis()
+                );
+            }
             for path in additions
                 .iter()
                 .filter(|path| reverse_requests.contains(*path))

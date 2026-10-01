@@ -127,7 +127,9 @@ adds files needed for modeled flow. After that expansion settles, queries with e
 lightweight import graph to find candidate paths from factory callsites toward entries. A backward
 use walk follows the containing function or module binding through local references, exports,
 re-exports, and imported references. It parses candidate importers on demand, prioritizing paths
-nearer the entry. Root reachability is then evaluated forward through modeled calls and JSX in
+nearer the entry. The walk indexes resolved import targets as files are added, so repeated symbol
+checks do not rescan the growing resolution list. Root reachability is then evaluated forward
+through modeled calls and JSX in
 the expanded snapshot. An import or symbol reference alone does not prove root reachability or
 runtime rendering. Unsupported dynamic loaders and registry wiring can still leave paths unknown;
 budget limits are reported as coverage gaps. Each expansion round currently rebuilds the solver and
