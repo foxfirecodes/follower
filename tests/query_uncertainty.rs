@@ -109,6 +109,7 @@ fn hiding_unresolved_rows_does_not_remove_gap_provenance() {
     );
     let report = fixture.report();
     assert!(report.creations[0].unresolved.is_empty());
+    assert!(report.creations[0].unresolved_count > 0);
     assert!(
         report.gaps.iter().any(|gap| {
             gap.assessment == QueryGapAssessment::Direct

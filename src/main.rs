@@ -128,7 +128,7 @@ fn run_query(
             || report
                 .creations
                 .iter()
-                .any(|creation| !creation.unresolved.is_empty()))
+                .any(|creation| creation.unresolved_count > 0))
     {
         anyhow::bail!("query has incomplete coverage or unresolved escapes");
     }
@@ -166,6 +166,12 @@ fn print_query_report(report: &QueryReport) {
         }
         for unresolved in &creation.unresolved {
             println!("  unresolved {}", unresolved.summary);
+        }
+        if creation.unresolved_count > creation.unresolved.len() {
+            println!(
+                "  {} unresolved details omitted by query report options",
+                creation.unresolved_count - creation.unresolved.len()
+            );
         }
     }
     println!(

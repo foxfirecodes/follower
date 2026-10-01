@@ -117,6 +117,18 @@ cached across separate CLI runs. During each solver pass, module environments an
 links are reused; environments are invalidated when module globals initialize. Set
 `FOLLOWER_PROFILE_QUERY=1` to print generic phase timings and cache counts to stderr.
 
+Configured `[[entries]]` modules are indexed even if the text prefilter does not match them. This
+does not index every source file: the initial parse still uses the filter, then import expansion
+adds files needed for modeled flow. Root reachability is evaluated forward through modeled calls
+and JSX. Reverse importer discovery walks from a known producer toward files that import it and
+evaluates relevant functions with unknown parameters; an import alone does not prove root
+reachability or runtime rendering. Each expansion round currently rebuilds the solver and
+re-evaluates previously discovered reverse importer seeds. Query report schema version 6 records
+the seed's function or module binding, source location, matched import names, and evaluation mode
+in each creation's optional `reverse_importer` field. The HTML detail and creation list show it.
+`unresolved_count` remains available even when `include_unresolved_escapes = false` hides the
+individual references; strict exit checks use the count.
+
 `callback_selector_imports` models imported functions that return the result of invoking one
 callback argument. Each entry names the module, exported function, and zero-based argument index.
 This keeps library-specific selector behavior in the project definition.
@@ -145,7 +157,7 @@ This keeps library-specific selector behavior in the project definition.
   unresolved escapes. This includes `candidate_invocation` rows with gaps and ambiguous-linkage
   reports with no creation rows. The JSON report is still printed before the unsuccessful exit.
 
-Query report schema version 5 includes both stable source byte spans and repository-relative,
+Query report schema version 6 includes both stable source byte spans and repository-relative,
 one-based line/column locations for factory calls and invocations. JSON also includes
 `callsite_inventory`: syntactic calls found in parsed candidate files, labeled `analyzed`,
 `filtered`, `unresolved`, or `skipped`. Inventory discovery scans every configured source for the

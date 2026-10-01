@@ -26,7 +26,8 @@ use crate::{
     queries::{AuditFinding, AuditReport, Conclusion, Coverage, FindingRef},
     query::{
         QueryCallsiteInventory, QueryCreation, QueryGap, QueryInvocation, QueryLocation,
-        QueryReport, QueryScope, QuerySpec, QueryValue, Reachability,
+        QueryReport, QueryReverseImporter, QueryReverseImporterEvaluation, QueryScope, QuerySpec,
+        QueryValue, Reachability,
     },
 };
 
@@ -121,10 +122,19 @@ struct CapabilityState {
     origin: EvidenceId,
     factory_arguments: Vec<TrackedValue>,
     reachability: Reachability,
+    reverse_importer: Option<ReverseImporterSeed>,
     registrations: Vec<EvidenceId>,
     invocations: Vec<InvocationState>,
     unresolved: Vec<EvidenceId>,
     assumptions: Vec<String>,
+}
+
+#[derive(Clone)]
+struct ReverseImporterSeed {
+    symbol: String,
+    matched_imports: Vec<String>,
+    evaluation: QueryReverseImporterEvaluation,
+    span: SourceSpan,
 }
 
 struct InvocationState {
@@ -356,6 +366,7 @@ struct Solver<'a> {
     caller_producer_files: BTreeSet<FileId>,
     current_choice: Option<String>,
     current_reachability: Reachability,
+    current_reverse_importer: Option<ReverseImporterSeed>,
     call_depth: usize,
     active_captures: Vec<BTreeSet<String>>,
     reverse_evaluations: usize,
@@ -474,6 +485,7 @@ impl<'a> Solver<'a> {
             caller_producer_files: BTreeSet::new(),
             current_choice: None,
             current_reachability: Reachability::Reachable,
+            current_reverse_importer: None,
             call_depth: 0,
             active_captures: Vec::new(),
             reverse_evaluations: 0,
@@ -2739,6 +2751,7 @@ impl<'a> Solver<'a> {
             origin,
             factory_arguments: arguments.to_vec(),
             reachability: self.current_reachability,
+            reverse_importer: self.current_reverse_importer.clone(),
             registrations: Vec::new(),
             invocations,
             unresolved,
@@ -3251,6 +3264,7 @@ impl<'a> Solver<'a> {
                 if file_len > MAX_REVERSE_IMPORTER_SOURCE_BYTES {
                     self.seed_direct_import_uses(
                         file_id,
+                        &function.name,
                         &function.body,
                         &function.params,
                         &imported_names,
@@ -3288,8 +3302,15 @@ impl<'a> Solver<'a> {
                 self.reverse_evaluations = 0;
                 self.reverse_budget_reported = false;
                 self.reverse_budget_active = true;
+                self.current_reverse_importer = Some(ReverseImporterSeed {
+                    symbol: function.name.clone(),
+                    matched_imports: imported_names.iter().cloned().collect(),
+                    evaluation: QueryReverseImporterEvaluation::Function,
+                    span: function.span.clone(),
+                });
                 let returned = self.call_function(&key, arguments);
                 self.render(returned);
+                self.current_reverse_importer = None;
                 self.reverse_budget_active = false;
             }
             for binding in globals {
@@ -3298,9 +3319,16 @@ impl<'a> Solver<'a> {
                 if references.names.is_disjoint(&imported_names) {
                     continue;
                 }
+                self.current_reverse_importer = Some(ReverseImporterSeed {
+                    symbol: pattern_names(&binding.pattern).join(", "),
+                    matched_imports: imported_names.iter().cloned().collect(),
+                    evaluation: QueryReverseImporterEvaluation::ModuleBinding,
+                    span: binding.span.clone(),
+                });
                 let environment = self.module_environment(file_id);
                 let returned = self.eval(&binding.value, &environment, file_id);
                 self.render(returned);
+                self.current_reverse_importer = None;
             }
         }
         if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
@@ -3308,11 +3336,13 @@ impl<'a> Solver<'a> {
         }
         self.current_choice = None;
         self.current_reachability = Reachability::Reachable;
+        self.current_reverse_importer = None;
     }
 
     fn seed_direct_import_uses(
         &mut self,
         file_id: FileId,
+        symbol: &str,
         statements: &[FlowStatement],
         params: &[FlowPattern],
         imported_names: &BTreeSet<String>,
@@ -3329,6 +3359,12 @@ impl<'a> Solver<'a> {
             uses.truncate(64);
         }
         for expression in uses {
+            self.current_reverse_importer = Some(ReverseImporterSeed {
+                symbol: symbol.to_owned(),
+                matched_imports: imported_names.iter().cloned().collect(),
+                evaluation: QueryReverseImporterEvaluation::DirectImportUse,
+                span: expression.span.clone(),
+            });
             self.heap.clear();
             self.heap_versions.clear();
             let mut references = ClosureReferences::default();
@@ -3435,6 +3471,7 @@ impl<'a> Solver<'a> {
             let value = self.eval(&expression, &environment, file_id);
             self.render(value);
             self.reverse_budget_active = false;
+            self.current_reverse_importer = None;
         }
     }
 
@@ -3721,6 +3758,15 @@ impl<'a> Solver<'a> {
                         factory_callsite: capability.callsite.clone(),
                         factory_location: self.query_location(&capability.callsite),
                         reachability: capability.reachability,
+                        reverse_importer: capability.reverse_importer.as_ref().map(|seed| {
+                            QueryReverseImporter {
+                                symbol: seed.symbol.clone(),
+                                matched_imports: seed.matched_imports.clone(),
+                                evaluation: seed.evaluation,
+                                span: seed.span.clone(),
+                                location: self.query_location(&seed.span),
+                            }
+                        }),
                         choice: capability.choice.clone(),
                         factory_arguments,
                         factory_argument_evidence,
@@ -3747,6 +3793,7 @@ impl<'a> Solver<'a> {
                         } else {
                             Vec::new()
                         },
+                        unresolved_count: capability.unresolved.len(),
                         all_unresolved_evidence_ids: capability
                             .unresolved
                             .iter()
@@ -3777,7 +3824,7 @@ impl<'a> Solver<'a> {
             })
             .collect();
         QueryReport {
-            schema_version: 5,
+            schema_version: 6,
             snapshot_id: self.snapshot.snapshot_id.clone(),
             config_hash: self.snapshot.config_hash.clone(),
             query_hash: query_hash.to_owned(),

@@ -178,6 +178,19 @@ impl Project {
                 }
             }
         }
+        for entry in &self.config.entries {
+            let path = self.resolve_path(&entry.module);
+            if !is_source_file(&path) {
+                bail!(
+                    "entry module is not a supported source file: {}",
+                    path.display()
+                );
+            }
+            files
+                .push(path.canonicalize().with_context(|| {
+                    format!("failed to locate entry module {}", path.display())
+                })?);
+        }
         files.sort();
         files.dedup();
         Ok(files)

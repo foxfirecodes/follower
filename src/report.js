@@ -62,7 +62,7 @@
   $('#title').textContent = report.query_id;
   $('#subtitle').textContent = `${report.kind.replaceAll('_', ' ')} · ${report.scope.replaceAll('_', ' ')}`;
   $('#snapshot').textContent = `snapshot ${report.snapshot_id.slice(0, 16)} · schema ${report.schema_version}`;
-  const unresolvedCount = report.creations.filter(creation => creation.unresolved.length).length;
+  const unresolvedCount = report.creations.filter(creation => creation.unresolved_count > 0).length;
   const metrics = [
     ['Creations', report.creations.length],
     ['Candidate calls', report.creations.reduce((sum, creation) => sum + creation.invocations.length, 0)],
@@ -82,7 +82,7 @@
     loc(a.factory_location).localeCompare(loc(b.factory_location)) || a.choice.localeCompare(b.choice));
   const creationSearch = $('#creation-search');
   const creationFilter = $('#creation-filter');
-  const creationHaystack = creation => [creation.creation_id, creation.choice, loc(creation.factory_location), ...Object.values(creation.factory_arguments).map(valueText), ...creation.invocations.flatMap(invocation => Object.values(invocation.arguments).map(valueText))].join(' ').toLowerCase();
+  const creationHaystack = creation => [creation.creation_id, creation.choice, loc(creation.factory_location), creation.reverse_importer?.symbol, creation.reverse_importer?.location && loc(creation.reverse_importer.location), ...Object.values(creation.factory_arguments).map(valueText), ...creation.invocations.flatMap(invocation => Object.values(invocation.arguments).map(valueText))].join(' ').toLowerCase();
   function renderCreationList() {
     const search = creationSearch.value.trim().toLowerCase();
     const filtered = creationsBySite.filter(creation => (creationFilter.value === 'all' || creation.conclusion === creationFilter.value) && (!search || creationHaystack(creation).includes(search)));
@@ -100,6 +100,7 @@
       main.append(node('span', '', creation.choice || 'default context'), badge(status(creation), creation.conclusion));
       if (creation.reachability === 'unknown') main.append(badge('reachability unknown', 'unknown'));
       row.append(main, node('div', 'row-small mono', creation.creation_id));
+      if (creation.reverse_importer) row.append(node('div', 'row-small', `via ${creation.reverse_importer.symbol || 'module binding'} · ${loc(creation.reverse_importer.location)}`));
       fragment.append(row);
     });
     list.append(fragment);
@@ -132,8 +133,18 @@
     if (creation.reachability === 'unknown') head.append(badge('reachability unknown', 'unknown'));
     detail.append(head);
     const definition = node('dl', 'kv');
-    [['Creation ID', creation.creation_id], ['Reachability', creation.reachability], ['Capability path', creation.capability_path.join(' → ') || 'return value'], ['Registrations', creation.registrations.length], ['Invocations', creation.invocations.length], ['Unresolved', creation.unresolved.length]].forEach(([label, value]) => definition.append(node('dt', '', label), node('dd', 'mono', value)));
+    [['Creation ID', creation.creation_id], ['Reachability', creation.reachability], ['Capability path', creation.capability_path.join(' → ') || 'return value'], ['Registrations', creation.registrations.length], ['Invocations', creation.invocations.length], ['Unresolved', creation.unresolved_count]].forEach(([label, value]) => definition.append(node('dt', '', label), node('dd', 'mono', value)));
     detail.append(definition);
+    if (creation.unresolved_count > creation.unresolved.length) detail.append(node('p', 'aside', 'Unresolved details were omitted by the query report option; coverage gaps and evidence remain available.'));
+    if (creation.reverse_importer) {
+      const seed = creation.reverse_importer;
+      const origin = node('div', 'section');
+      origin.append(node('h3', '', 'Reverse importer seed'));
+      const description = seed.evaluation === 'direct_import_use' ? 'Direct imported use in a large file' : seed.evaluation === 'module_binding' ? 'Module binding' : 'Function body';
+      origin.append(node('p', '', `${seed.symbol || 'module binding'} · ${description}`), node('p', 'mono muted', loc(seed.location)));
+      origin.append(node('p', 'mini muted', `Matched imports: ${seed.matched_imports.join(', ') || 'unknown'}`));
+      detail.append(origin);
+    }
     const factory = node('div', 'section'); factory.append(node('h3', '', 'Factory arguments'), valueRows(creation.factory_arguments, creation.factory_argument_evidence)); detail.append(factory);
     const invocations = node('div', 'section'); invocations.append(node('h3', '', `Invocations (${creation.invocations.length})`));
     creation.invocations.forEach(invocation => {

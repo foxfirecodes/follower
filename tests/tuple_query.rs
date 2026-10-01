@@ -3,7 +3,10 @@ mod support;
 use code_flow::{
     Project,
     queries::Conclusion,
-    query::{QueryCallsiteStatus, QueryGapAssessment, QueryGapTarget, QueryValue, load_query},
+    query::{
+        QueryCallsiteStatus, QueryGapAssessment, QueryGapTarget, QueryReverseImporterEvaluation,
+        QueryScope, QueryValue, load_query,
+    },
 };
 use support::TestProject;
 
@@ -58,6 +61,25 @@ fn text_prefilter_keeps_matching_directory_files_and_explicit_support_files() {
     assert!(!sources.iter().any(|path| path.ends_with("Skipped.ts")));
     let snapshot = fixture.analyzer().index().expect("index selected sources");
     assert_eq!(snapshot.files.len(), 3);
+}
+
+#[test]
+fn configured_entry_is_indexed_without_matching_the_text_filter() {
+    let fixture = TestProject::new(&[
+        ("src/Host.tsx", "export function Host() { return null; }"),
+        ("src/Unrelated.ts", "export const unrelated = true;"),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['makeCallback']\n[[entries]]\nmodule = 'src/Host.tsx'\nexport = 'Host'\n",
+    );
+    let sources = Project::load(fixture.root.join("flow.toml"))
+        .unwrap()
+        .discover_sources()
+        .unwrap();
+    assert!(sources.iter().any(|path| path.ends_with("Host.tsx")));
+    assert!(sources.iter().any(|path| path.ends_with("factory.ts")));
+    assert!(!sources.iter().any(|path| path.ends_with("Unrelated.ts")));
 }
 
 #[test]
@@ -139,6 +161,76 @@ fn filtered_query_follows_reverse_importers_of_wrapper_returning_capability() {
                     }
             ))
     );
+    let seed = report
+        .creations
+        .iter()
+        .find_map(|creation| {
+            creation.reverse_importer.as_ref().filter(|seed| {
+                seed.location
+                    .as_ref()
+                    .is_some_and(|location| location.path == "src/Host.ts")
+            })
+        })
+        .expect("reverse importer provenance");
+    assert_eq!(seed.symbol, "Host");
+    assert_eq!(seed.matched_imports, ["useWidget"]);
+    assert_eq!(seed.evaluation, QueryReverseImporterEvaluation::Function);
+    assert_eq!(seed.location.as_ref().unwrap().start_line, 1);
+}
+
+#[test]
+fn reverse_importer_report_names_a_large_file_direct_use() {
+    let padding = "x".repeat(20_100);
+    let host = format!(
+        "import {{ useWidget }} from './wrapper'; /*{padding}*/ export function Host() {{ useWidget(); }}"
+    );
+    let fixture = TestProject::new(&[
+        ("src/Host.ts", &host),
+        (
+            "src/wrapper.ts",
+            "import { makeCallback } from './factory'; export function useWidget() { return makeCallback('alpha'); }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['makeCallback']\n");
+    let mut query = fixture.query();
+    query.scope = QueryScope::AllCreations;
+    let report = fixture.analyzer().query(&query, "test-query").unwrap();
+    let seed = report
+        .creations
+        .iter()
+        .filter_map(|creation| creation.reverse_importer.as_ref())
+        .find(|seed| seed.evaluation == QueryReverseImporterEvaluation::DirectImportUse)
+        .expect("large-file direct import seed");
+    assert_eq!(seed.symbol, "Host");
+    assert_eq!(seed.matched_imports, ["useWidget"]);
+    assert_eq!(seed.location.as_ref().unwrap().path, "src/Host.ts");
+}
+
+#[test]
+fn reverse_importer_report_names_module_binding() {
+    let fixture = TestProject::new(&[
+        (
+            "src/Host.ts",
+            "import { useWidget } from './wrapper'; export const installed = useWidget();",
+        ),
+        (
+            "src/wrapper.ts",
+            "import { makeCallback } from './factory'; export function useWidget() { return makeCallback('alpha'); }",
+        ),
+    ]);
+    fixture.write("flow.toml", "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['makeCallback']\n");
+    let mut query = fixture.query();
+    query.scope = QueryScope::AllCreations;
+    let report = fixture.analyzer().query(&query, "test-query").unwrap();
+    let seed = report
+        .creations
+        .iter()
+        .filter_map(|creation| creation.reverse_importer.as_ref())
+        .find(|seed| seed.evaluation == QueryReverseImporterEvaluation::ModuleBinding)
+        .expect("module binding seed");
+    assert_eq!(seed.symbol, "installed");
+    assert_eq!(seed.matched_imports, ["useWidget"]);
+    assert_eq!(seed.location.as_ref().unwrap().path, "src/Host.ts");
 }
 
 #[test]

@@ -201,12 +201,31 @@ pub struct QueryInvocation {
     pub argument_evidence: BTreeMap<String, Option<String>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryReverseImporterEvaluation {
+    Function,
+    DirectImportUse,
+    ModuleBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryReverseImporter {
+    pub symbol: String,
+    pub matched_imports: Vec<String>,
+    pub evaluation: QueryReverseImporterEvaluation,
+    pub span: SourceSpan,
+    pub location: Option<QueryLocation>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryCreation {
     pub creation_id: String,
     pub factory_callsite: SourceSpan,
     pub factory_location: Option<QueryLocation>,
     pub reachability: Reachability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse_importer: Option<QueryReverseImporter>,
     pub choice: String,
     pub factory_arguments: BTreeMap<String, QueryValue>,
     #[serde(default)]
@@ -215,6 +234,8 @@ pub struct QueryCreation {
     pub registrations: Vec<FindingRef>,
     pub invocations: Vec<QueryInvocation>,
     pub unresolved: Vec<FindingRef>,
+    #[serde(default)]
+    pub unresolved_count: usize,
     #[serde(skip)]
     pub(crate) all_unresolved_evidence_ids: Vec<String>,
     pub conclusion: Conclusion,
