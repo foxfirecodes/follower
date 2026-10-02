@@ -267,6 +267,8 @@
   }
   $('#boundary-search').addEventListener('input', renderBoundaries);
   $('#callsite-notice').textContent = 'Each matching factory callsite with the values it was called with and the calls made with its result. Calls are found in the source, so a call no explored path executed is still listed; reachability says whether a path from a configured root reaches the callsite.';
+  const arrayCount = value => value.kind === 'array' ? 1 : value.kind === 'alternatives' ? value.values.reduce((sum, item) => sum + arrayCount(item), 0) : 0;
+  const arrayList = values => values.flatMap(value => value.kind === 'array' ? [value] : value.kind === 'alternatives' ? arrayList(value.values) : []);
   const callsiteCertainty = status => status === 'called' ? 'exact' : status === 'unused' || status === 'not_called' ? 'conditional' : 'unknown';
   function renderCallsites() {
     const search = $('#callsite-search').value.trim().toLowerCase();
@@ -282,8 +284,20 @@
       const body = node('div', 'gap-body');
       if (item.enclosing) body.append(node('div', 'mini', `In ${item.enclosing}`));
       body.append(node('div', 'mini', `Reachability: ${item.reachability}${item.unreached_reason ? ` (${item.unreached_reason.replaceAll('_', ' ')})` : ''} · ${item.contexts} explored contexts`));
-      Object.entries(item.factory_arguments).forEach(([label, values]) => body.append(node('div', 'mini mono', `${label} = ${values.map(valueText).join(' | ')}`)));
-      Object.entries(item.possible_elements || {}).forEach(([label, values]) => body.append(node('div', 'mini mono', `${label} may contain ${values.map(valueText).join(', ')}`)));
+      Object.entries(item.factory_arguments).forEach(([label, values]) => {
+        const arrays = values.reduce((sum, value) => sum + arrayCount(value), 0);
+        const elements = (item.possible_elements || {})[label];
+        if (elements && arrays > 4) {
+          // Many possible arrays read better as the elements they are drawn from.
+          body.append(node('div', 'mini mono', `${label} = one of ${arrays} arrays of: ${elements.map(valueText).join(', ')}`));
+          const all = node('details', 'mini'); all.append(node('summary', '', `Show all ${arrays} arrays`));
+          arrayList(values).forEach(array => all.append(node('div', 'mini mono', valueText(array))));
+          body.append(all);
+        } else {
+          body.append(node('div', 'mini mono', `${label} = ${values.map(valueText).join(' | ')}`));
+          if (elements && arrays <= 1) body.append(node('div', 'mini mono', `${label} may contain ${elements.map(valueText).join(', ')}`));
+        }
+      });
       Object.entries(item.values_from_callers || {}).forEach(([label, callers]) => callers.forEach(caller => body.append(node('div', 'mini mono', `${label} = ${valueText(caller.value)} from ${loc(caller.caller)}`))));
       item.capability.calls.forEach(call => {
         const args = Object.entries(call.arguments).map(([label, values]) => `${label} = ${values.map(valueText).join(' | ')}`).join(', ');

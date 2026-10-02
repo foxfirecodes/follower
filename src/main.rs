@@ -291,6 +291,18 @@ fn print_query_report(report: &QueryReport) {
     );
 }
 
+/// Possible arrays shown one by one; more are summarized by their elements.
+const SHOWN_ARRAYS: usize = 4;
+
+/// The number of arrays a value may be.
+fn array_count(value: &QueryValue) -> usize {
+    match value {
+        QueryValue::Array { .. } => 1,
+        QueryValue::Alternatives { values } => values.iter().map(array_count).sum(),
+        _ => 0,
+    }
+}
+
 /// The values at each callsite and the calls made with its result, before the per-creation
 /// detail.
 fn print_callsite_values(report: &QueryReport) {
@@ -338,10 +350,25 @@ fn print_callsite_values(report: &QueryReport) {
                 .unwrap_or_default()
         );
         for (label, value) in &callsite.factory_arguments {
-            println!("    factory {label} = {}", values(value));
-        }
-        for (label, elements) in &callsite.possible_elements {
-            println!("    factory {label} may contain {}", values(elements));
+            let arrays = value.iter().map(array_count).sum::<usize>();
+            let elements = callsite.possible_elements.get(label);
+            // Many possible arrays read better as the elements they are drawn from.
+            match elements {
+                Some(elements) if arrays > SHOWN_ARRAYS => println!(
+                    "    factory {label} = one of {arrays} arrays of: {}",
+                    elements
+                        .iter()
+                        .map(render_query_value)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => println!("    factory {label} = {}", values(value)),
+            }
+            if let Some(elements) = elements
+                && arrays <= 1
+            {
+                println!("    factory {label} may contain {}", values(elements));
+            }
         }
         for (label, callers) in &callsite.values_from_callers {
             for caller in callers {

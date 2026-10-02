@@ -389,8 +389,9 @@ pub struct QueryCallsiteValues {
     /// The distinct values of each projected factory argument across contexts.
     pub factory_arguments: BTreeMap<String, Vec<QueryValue>>,
     pub factory_arguments_resolved: bool,
-    /// For an unresolved argument that is a local array built from literal elements and `push`
-    /// calls, the values it may contain, in source order.
+    /// The elements an array argument may contain, for an argument with several possible
+    /// arrays, such as a list filtered by conditions, or an unresolved local array built from
+    /// literal elements and `push` calls. An unknown element means some arrays are unknown.
     #[serde(default)]
     pub possible_elements: BTreeMap<String, Vec<QueryValue>>,
     /// For an unresolved argument that reads the enclosing function's parameters, its value

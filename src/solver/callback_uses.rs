@@ -1752,6 +1752,17 @@ impl Solver<'_> {
         // Where an argument is unresolved, what the source still says about it.
         let mut possible_elements = BTreeMap::new();
         let mut values_from_callers = BTreeMap::new();
+        // An argument with several possible arrays, such as a list filtered by unknown
+        // predicates, is summarized by the elements they hold.
+        for (label, values) in &factory_arguments {
+            if values.iter().map(array_count).sum::<usize>() > 1 {
+                let mut elements = Vec::new();
+                for value in values {
+                    collect_array_elements(value, &mut elements);
+                }
+                possible_elements.insert(label.clone(), elements);
+            }
+        }
         if let Some(scope) = self.candidate_scope(candidate) {
             for projection in &query.factory_arguments {
                 if factory_arguments
@@ -1763,8 +1774,15 @@ impl Solver<'_> {
                 let Some(argument) = candidate.arguments.get(projection.index) else {
                     continue;
                 };
-                if let Some(elements) = self.pushed_elements(&scope, argument) {
-                    possible_elements.insert(projection.label.clone(), elements);
+                if let Some(pushed) = self.pushed_elements(&scope, argument) {
+                    let elements = possible_elements
+                        .entry(projection.label.clone())
+                        .or_insert_with(Vec::new);
+                    for element in pushed {
+                        if !elements.contains(&element) {
+                            elements.push(element);
+                        }
+                    }
                 }
                 let callers = self.values_from_callers(&scope, argument, graph);
                 if !callers.is_empty() {
@@ -1989,6 +2007,35 @@ fn parameter_position<'p>(
 
 fn span_key(span: &SourceSpan) -> (u32, u32) {
     (span.file_id.0, span.start)
+}
+
+/// The number of arrays a value may be.
+fn array_count(value: &QueryValue) -> usize {
+    match value {
+        QueryValue::Array { .. } => 1,
+        QueryValue::Alternatives { values } => values.iter().map(array_count).sum(),
+        _ => 0,
+    }
+}
+
+/// The distinct elements of every array a value may be, in first-seen order. An unknown
+/// alternative is kept, since the arrays it stands for may hold anything.
+fn collect_array_elements(value: &QueryValue, elements: &mut Vec<QueryValue>) {
+    let mut add = |element: &QueryValue| {
+        if !elements.contains(element) {
+            elements.push(element.clone());
+        }
+    };
+    match value {
+        QueryValue::Array { elements: items } => items.iter().for_each(&mut add),
+        QueryValue::Alternatives { values } => {
+            for value in values {
+                collect_array_elements(value, elements);
+            }
+        }
+        QueryValue::Unknown { .. } => add(value),
+        _ => {}
+    }
 }
 
 /// Orders reachability from strongest to weakest.

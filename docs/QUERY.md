@@ -392,9 +392,13 @@ unknown event argument. `escapes` lists where the result went that the walk does
 such as an unknown function, a store, a property write, a component it cannot resolve, or a hook
 whose callers are not in the parsed files. `status` is `called`, `called_with_unknown_arguments`,
 `escapes`, `not_called` (used, for example passed to code that ignores it, but never called), or
-`unused` (not bound, or bound and never used). Where a factory argument stays unresolved,
-`possible_elements` lists what a local array built from literal elements and `push` calls may
-contain, such as the types pushed under conditions too many to keep as separate arrays, and
+`unused` (not bound, or bound and never used). For an array argument with several possible
+arrays, such as a list filtered by conditions the model cannot decide, `possible_elements` lists
+the elements they hold; the text output and the HTML report show that list and the number of
+arrays instead of every array when there are more than four. Where a factory argument stays
+unresolved, `possible_elements` also lists what a local array built from literal elements and
+`push` calls may contain, such as the types pushed under conditions too many to keep as separate
+arrays, and
 `values_from_callers` gives the argument's value with what each caller passes, when it reads only
 the enclosing function's parameters and a caller passes values that do not depend on its own
 locals; up to 32 callers are evaluated, one level up. A function that passes its own parameter
