@@ -43,6 +43,40 @@ Run it with:
 follower query --project flow.toml --query query.toml --format json
 ```
 
+Use `--format csv` for a flat table, for agents and spreadsheets, with one row per call made with
+the factory result and item it applies to:
+
+```sh
+follower query --project flow.toml --query query.toml --format csv > report.csv
+follower view report.csv
+```
+
+`row_kind` is `call`, `excluded_call` (a call whose conditions match nothing the callsite
+requests), `escape` (somewhere the result went that the walk does not follow), or `no_call` (an
+item the callsite requests that no call applies to, or a callsite whose result is never called).
+`item.<label>` holds one element of the first factory argument whose values are arrays, with
+`item_complete` saying whether every element the call applies to is known, so a lookup by item is
+a filter on one column. Each row also has the callsite's path, line, enclosing function,
+`reachability`, `unreached_reason`, and `status`; the call's path and line, `arg.<label>` for each
+projected invocation argument, `arguments_resolved`, and `found`: `explored` if an explored path
+ran the call, `source` if only the source walk found it, or `inferred` if it was found through
+props passed next to a module import. `context`, `via`, `instance`, and `conditions` give where
+the call sits, how the result reached it, the instance whose items it uses, and the conditions on
+its path; `unfollowed` counts the places the callsite's result went that the walk does not
+follow, and `note` explains unknown values and other rows. Other factory arguments are
+`factory.<label>`. Multiple values in a cell are joined with ` | `, values print as
+`Enum.Member`, bare strings, or `?reason` for an unknown, and paths are relative to the
+repository that holds them, found by the nearest `.git`. When a callsite has calls, its escapes
+are one row each without an item; when it has none, each item it requests gets the escape rows.
+
+`follower view report.csv` writes `report.html`, or `--output` elsewhere, as a self-contained,
+owner-readable page built from the CSV alone, so it shows exactly what an agent reading the CSV
+sees. It groups rows by item by default and can group by callsite, call file, argument, status, or
+enclosing function, with search over the shown columns, filters, a needs-review view (rows whose
+answer is not complete: a result not called or escaping, an unknown argument, or items not all
+known), and a column picker. A search that narrows to three groups or fewer opens them, and
+`report.html#q=Kind.A&group=callsite` opens with that search and grouping.
+
 Add `--html-report` to write an interactive, self-contained report to a new owner-readable file
 in `/tmp`. The command prints its path to stderr and leaves JSON or text stdout unchanged. Set
 `[report] html = true` in the query TOML to generate it on every run. The report is also written

@@ -23,8 +23,9 @@ cargo run --bin follower -- query \
   --query fixtures/factory-query/query.toml
 ```
 
-Use `--format json` for the stable machine-readable report. The query declaration and current
-semantics are documented in [`docs/QUERY.md`](docs/QUERY.md).
+Use `--format json` for the stable machine-readable report, and `--format csv` for a flat table of
+callsites, calls, and items that `follower view` turns into a browsable page. The query
+declaration and current semantics are documented in [`docs/QUERY.md`](docs/QUERY.md).
 
 Queries can also select tuple return elements with `returned_index`, and project numeric enum
 member names from TS source. Project configs accept `[import_aliases]` for paths such as `@sample/*`.

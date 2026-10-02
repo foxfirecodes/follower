@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use code_flow::{
     Analyzer, Project,
+    csv_report::query_report_csv,
+    csv_viewer::write_csv_viewer,
     html_report::write_query_report_html,
     query::{QueryReport, QueryValue, load_query},
 };
@@ -48,13 +50,21 @@ enum Command {
         project: PathBuf,
         #[arg(long)]
         query: PathBuf,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
+        #[arg(long, value_enum, default_value_t = QueryFormat::Text)]
+        format: QueryFormat,
         #[arg(long)]
         fail_on_unresolved: bool,
         /// Write a self-contained, private HTML report to /tmp.
         #[arg(long)]
         html_report: bool,
+    },
+    /// Write a browsable page for a query CSV from `query --format csv`.
+    View {
+        /// The CSV to show.
+        csv: PathBuf,
+        /// Where to write the page; defaults to the CSV path with an `.html` extension.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -62,6 +72,15 @@ enum Command {
 enum OutputFormat {
     Json,
     Text,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum QueryFormat {
+    Json,
+    Text,
+    /// One row per call and item it applies to, for agents and spreadsheets. `follower view`
+    /// turns it into a browsable page.
+    Csv,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -102,13 +121,27 @@ fn main() -> Result<()> {
             fail_on_unresolved,
             html_report,
         } => run_query(&project, &query, format, fail_on_unresolved, html_report),
+        Command::View { csv, output } => view(&csv, output),
     }
+}
+
+fn view(csv: &std::path::Path, output: Option<PathBuf>) -> Result<()> {
+    let text = std::fs::read_to_string(csv)
+        .with_context(|| format!("failed to read {}", csv.display()))?;
+    let output = output.unwrap_or_else(|| csv.with_extension("html"));
+    let title = csv.file_name().map_or_else(
+        || csv.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    write_csv_viewer(&text, &title, &output)?;
+    eprintln!("Viewer: {}", output.display());
+    Ok(())
 }
 
 fn run_query(
     config_path: &std::path::Path,
     query_path: &std::path::Path,
-    format: OutputFormat,
+    format: QueryFormat,
     fail_on_unresolved: bool,
     html_report: bool,
 ) -> Result<()> {
@@ -120,8 +153,9 @@ fn run_query(
         eprintln!("HTML report: {}", path.display());
     }
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-        OutputFormat::Text => print_query_report(&report),
+        QueryFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        QueryFormat::Text => print_query_report(&report),
+        QueryFormat::Csv => print!("{}", query_report_csv(&report, &query)),
     }
     if fail_on_unresolved
         && (!report.coverage.complete

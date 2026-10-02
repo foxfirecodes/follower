@@ -2,6 +2,8 @@
 
 pub mod analysis;
 pub mod cache;
+pub mod csv_report;
+pub mod csv_viewer;
 pub mod evidence;
 pub mod frontend;
 mod frontend_lowering;
