@@ -369,6 +369,10 @@ Snapshot reuse is not implemented yet.
 
 ## Current analysis fragment
 
+Optional chains read and call like their plain forms: `value?.name` is `value.name` and
+`callback?.(argument)` is `callback(argument)`, so on a missing value the result is unknown, as
+an unsupported expression was before.
+
 The engine follows object and array destructuring, local calls and closures, records, finite computed record
 selection, arrays and finite spreads, exact string/boolean/numeric-enum strict-equality branches,
 null comparisons, logical expressions, conditional expressions, finite-array `.map` and `.filter`,

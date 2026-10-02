@@ -500,6 +500,15 @@ fn uncalled_callbacks_carrying_the_result_run_as_possible_handlers() {
 }
 
 #[test]
+fn optional_chains_read_and_call_like_their_plain_forms() {
+    let (exact, other) = exact_actions(&[(
+        "src/App.tsx",
+        "import { Leaf } from './Leaf'; function Picker({ config, render }) { return <div><Leaf action={config?.label} />{render?.('rendered')}</div>; } export function App() { return <Picker config={{ label: 'chained' }} render={(action) => <Leaf action={action} />} />; }",
+    )]);
+    assert_eq!(exact, ["chained", "rendered"], "{other:?}");
+}
+
+#[test]
 fn class_property_methods_are_bound_to_instance_props() {
     let (exact, other) = exact_actions(&[(
         "src/App.tsx",

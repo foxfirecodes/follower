@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use oxc::{
     ast::ast::{
-        Argument, ArrayExpressionElement, ArrowFunctionBody, BindingPattern, Class, ClassElement,
-        Declaration, ExportDefaultDeclarationKind, Expression, FormalParameters, Function,
-        IdentifierReference, ImportDeclaration, ImportDeclarationSpecifier, ImportOrExportKind,
-        JSXAttributeItem, JSXAttributeValue, JSXChild, JSXElement, JSXElementName, JSXExpression,
-        ObjectPropertyKind, SimpleAssignmentTarget, Statement, TSEnumDeclaration,
+        Argument, ArrayExpressionElement, ArrowFunctionBody, BindingPattern, CallExpression,
+        ChainElement, Class, ClassElement, Declaration, ExportDefaultDeclarationKind, Expression,
+        FormalParameters, Function, IdentifierReference, ImportDeclaration,
+        ImportDeclarationSpecifier, ImportOrExportKind, JSXAttributeItem, JSXAttributeValue,
+        JSXChild, JSXElement, JSXElementName, JSXExpression, ObjectPropertyKind,
+        SimpleAssignmentTarget, Statement, StaticMemberExpression, TSEnumDeclaration,
         VariableDeclaration,
     },
     ast_visit::Visit,
@@ -915,113 +916,38 @@ impl Lowerer<'_> {
                 }
                 FlowExpressionKind::Array { elements }
             }
-            Expression::StaticMemberExpression(member)
-                if matches!(&member.object, Expression::ThisExpression(_))
-                    && self.current_class.is_some() =>
-            {
-                let property = member.property.name.as_str();
-                let name = if property == "props" {
-                    "props".to_owned()
-                } else {
-                    format!(
-                        "{}.{}",
-                        self.current_class.as_deref().unwrap_or_default(),
-                        property
-                    )
-                };
-                // A method read as a value is bound to the instance, so calling it later passes
-                // the instance's props like a direct `this.method()` call.
-                if let Some(arity) = self.class_members.get(property).copied() {
-                    let span = self.span(member.span);
-                    let identifier = |name: String| FlowExpression {
-                        kind: FlowExpressionKind::Identifier {
-                            name,
-                            module_binding: false,
-                        },
-                        span: span.clone(),
-                    };
-                    let parameters = (0..arity).map(|index| format!("__bound_argument_{index}"));
-                    return FlowExpression {
-                        kind: FlowExpressionKind::Arrow {
-                            params: parameters
-                                .clone()
-                                .map(|name| FlowPattern {
-                                    kind: FlowPatternKind::Identifier { name },
-                                    span: span.clone(),
-                                })
-                                .collect(),
-                            body: FlowArrowBody::Expression {
-                                expression: Box::new(FlowExpression {
-                                    kind: FlowExpressionKind::Call {
-                                        callee: Box::new(identifier(name)),
-                                        arguments: std::iter::once("props".to_owned())
-                                            .chain(parameters)
-                                            .map(identifier)
-                                            .collect(),
-                                    },
-                                    span: span.clone(),
-                                }),
-                            },
-                        },
-                        span,
-                    };
-                }
-                FlowExpressionKind::Identifier {
-                    name,
-                    module_binding: false,
-                }
-            }
-            Expression::StaticMemberExpression(member) => FlowExpressionKind::StaticMember {
-                object: Box::new(self.lower_expression(&member.object)),
-                property: member.property.name.to_string(),
-            },
+            Expression::StaticMemberExpression(member) => return self.lower_static_member(member),
             Expression::ComputedMemberExpression(member) => FlowExpressionKind::ComputedMember {
                 object: Box::new(self.lower_expression(&member.object)),
                 property: Box::new(self.lower_expression(&member.expression)),
             },
-            Expression::CallExpression(call) => {
-                let mut arguments: Vec<_> = call
-                    .arguments
-                    .iter()
-                    .map(|argument| match argument {
-                        Argument::SpreadElement(spread) => {
-                            self.unsupported_expression("spread_call_argument", spread.span)
-                        }
-                        _ => self.lower_expression(argument.to_expression()),
-                    })
-                    .collect();
-                if let Expression::StaticMemberExpression(member) = &call.callee
-                    && matches!(&member.object, Expression::ThisExpression(_))
-                    && let Some(class) = &self.current_class
-                {
-                    arguments.insert(
-                        0,
-                        FlowExpression {
-                            kind: FlowExpressionKind::Identifier {
-                                name: "props".to_owned(),
-                                module_binding: false,
-                            },
-                            span: self.span(call.span),
+            Expression::CallExpression(call) => return self.lower_call(call),
+            // `a?.b` and `f?.(x)` read and call like `a.b` and `f(x)`; on a missing value the read
+            // or call is unknown, as without the guard.
+            Expression::ChainExpression(chain) => {
+                return match &chain.expression {
+                    ChainElement::CallExpression(call) => self.lower_call(call),
+                    ChainElement::StaticMemberExpression(member) => {
+                        self.lower_static_member(member)
+                    }
+                    ChainElement::ComputedMemberExpression(member) => FlowExpression {
+                        kind: FlowExpressionKind::ComputedMember {
+                            object: Box::new(self.lower_expression(&member.object)),
+                            property: Box::new(self.lower_expression(&member.expression)),
                         },
-                    );
-                    return FlowExpression {
-                        kind: FlowExpressionKind::Call {
-                            callee: Box::new(FlowExpression {
-                                kind: FlowExpressionKind::Identifier {
-                                    name: format!("{class}.{}", member.property.name),
-                                    module_binding: false,
-                                },
-                                span: self.span(member.span),
-                            }),
-                            arguments,
+                        span,
+                    },
+                    ChainElement::TSNonNullExpression(assertion) => {
+                        self.lower_expression(&assertion.expression)
+                    }
+                    ChainElement::PrivateFieldExpression(_) => FlowExpression {
+                        kind: FlowExpressionKind::Unsupported {
+                            syntax: "unsupported_expression".to_owned(),
+                            references: referenced_names(expression),
                         },
-                        span: self.span(call.span),
-                    };
-                }
-                FlowExpressionKind::Call {
-                    callee: Box::new(self.lower_expression(&call.callee)),
-                    arguments,
-                }
+                        span,
+                    },
+                };
             }
             Expression::ImportExpression(import) => match &import.source {
                 Expression::StringLiteral(source) => FlowExpressionKind::DynamicImport {
@@ -1130,6 +1056,123 @@ impl Lowerer<'_> {
             },
         };
         FlowExpression { kind, span }
+    }
+
+    fn lower_static_member(&self, member: &StaticMemberExpression<'_>) -> FlowExpression {
+        let span = self.span(member.span);
+        if !(matches!(&member.object, Expression::ThisExpression(_))
+            && self.current_class.is_some())
+        {
+            return FlowExpression {
+                kind: FlowExpressionKind::StaticMember {
+                    object: Box::new(self.lower_expression(&member.object)),
+                    property: member.property.name.to_string(),
+                },
+                span,
+            };
+        }
+        let property = member.property.name.as_str();
+        let name = if property == "props" {
+            "props".to_owned()
+        } else {
+            format!(
+                "{}.{}",
+                self.current_class.as_deref().unwrap_or_default(),
+                property
+            )
+        };
+        // A method read as a value is bound to the instance, so calling it later passes
+        // the instance's props like a direct `this.method()` call.
+        if let Some(arity) = self.class_members.get(property).copied() {
+            let span = self.span(member.span);
+            let identifier = |name: String| FlowExpression {
+                kind: FlowExpressionKind::Identifier {
+                    name,
+                    module_binding: false,
+                },
+                span: span.clone(),
+            };
+            let parameters = (0..arity).map(|index| format!("__bound_argument_{index}"));
+            return FlowExpression {
+                kind: FlowExpressionKind::Arrow {
+                    params: parameters
+                        .clone()
+                        .map(|name| FlowPattern {
+                            kind: FlowPatternKind::Identifier { name },
+                            span: span.clone(),
+                        })
+                        .collect(),
+                    body: FlowArrowBody::Expression {
+                        expression: Box::new(FlowExpression {
+                            kind: FlowExpressionKind::Call {
+                                callee: Box::new(identifier(name)),
+                                arguments: std::iter::once("props".to_owned())
+                                    .chain(parameters)
+                                    .map(identifier)
+                                    .collect(),
+                            },
+                            span: span.clone(),
+                        }),
+                    },
+                },
+                span,
+            };
+        }
+        FlowExpression {
+            kind: FlowExpressionKind::Identifier {
+                name,
+                module_binding: false,
+            },
+            span: self.span(member.span),
+        }
+    }
+
+    fn lower_call(&self, call: &CallExpression<'_>) -> FlowExpression {
+        let mut arguments: Vec<_> = call
+            .arguments
+            .iter()
+            .map(|argument| match argument {
+                Argument::SpreadElement(spread) => {
+                    self.unsupported_expression("spread_call_argument", spread.span)
+                }
+                _ => self.lower_expression(argument.to_expression()),
+            })
+            .collect();
+        if let Expression::StaticMemberExpression(member) = &call.callee
+            && matches!(&member.object, Expression::ThisExpression(_))
+            && let Some(class) = &self.current_class
+        {
+            arguments.insert(
+                0,
+                FlowExpression {
+                    kind: FlowExpressionKind::Identifier {
+                        name: "props".to_owned(),
+                        module_binding: false,
+                    },
+                    span: self.span(call.span),
+                },
+            );
+            return FlowExpression {
+                kind: FlowExpressionKind::Call {
+                    callee: Box::new(FlowExpression {
+                        kind: FlowExpressionKind::Identifier {
+                            name: format!("{class}.{}", member.property.name),
+                            module_binding: false,
+                        },
+                        span: self.span(member.span),
+                    }),
+                    arguments,
+                },
+                span: self.span(call.span),
+            };
+        }
+        FlowExpression {
+            kind: FlowExpressionKind::Call {
+                callee: Box::new(self.lower_expression(&call.callee)),
+                arguments,
+            },
+            span: self.span(call.span),
+        }
     }
 
     fn lower_jsx_element(&self, element: &JSXElement<'_>) -> FlowExpression {
