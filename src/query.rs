@@ -90,6 +90,10 @@ pub struct QuerySpec {
     pub capability: CapabilityQuery,
     #[serde(default)]
     pub report: QueryReportOptions,
+    /// Evaluation steps allowed per entry input below components the model cannot follow. More
+    /// steps explore more possible paths; exact paths do not use this budget.
+    #[serde(default)]
+    pub assumed_render_steps: Option<usize>,
 }
 
 impl QuerySpec {

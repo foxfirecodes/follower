@@ -380,6 +380,38 @@ fn default_props_fill_missing_class_and_function_component_props() {
 }
 
 #[test]
+fn assumed_render_steps_bound_possible_exploration() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        LEAF,
+        (
+            "src/App.tsx",
+            "import { Frame } from 'external-frame'; import { Leaf } from './Leaf'; export function App() { return <Frame><Leaf /></Frame>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", TUPLE_QUERY);
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1);
+    assert_eq!(report.creations[0].reachability, Reachability::Possible);
+    fixture.write(
+        "query.toml",
+        &format!("assumed_render_steps = 1\n{TUPLE_QUERY}"),
+    );
+    let report = fixture.report();
+    assert!(report.creations.is_empty(), "{:?}", report.creations);
+    assert!(
+        report
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == "assumed_render_budget_exhausted")
+    );
+}
+
+#[test]
 fn class_property_methods_are_bound_to_instance_props() {
     let (exact, other) = exact_actions(&[(
         "src/App.tsx",

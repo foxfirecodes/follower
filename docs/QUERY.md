@@ -254,7 +254,9 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   at its budget, components it did not reach can be skipped; the stop is reported as a gap. A
   component is explored once per entry input for the same props, which removes repeated paths
   that would only duplicate results; props too deep to fingerprint are always explored. Assumed
-  rendering has a 1,000,000-step budget per entry input; exhausting it is a coverage gap.
+  rendering has a 1,000,000-step budget per entry input, set with the query's top-level
+  `assumed_render_steps`; exhausting it is a coverage gap. Exact paths do not use this budget, so a
+  larger one only finds more possible creations, at a cost in time.
 - JSX can also leave the model inside a component that is parsed. On paths from configured roots,
   elements handed to an unknown or unsupported call, or referenced by an unsupported expression,
   are explored as possible with a `jsx_passed_to_an_unmodeled_call` gap. After a parsed component

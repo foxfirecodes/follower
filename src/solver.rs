@@ -542,6 +542,9 @@ pub fn execute_query(
         },
     };
     let mut solver = Solver::new(project, snapshot, model)?;
+    if let Some(steps) = query.assumed_render_steps {
+        solver.assumed_budget = steps;
+    }
     solver.entry_corridor = entry_corridor.keys().cloned().collect();
     solver.use_chain = use_chain
         .iter()
@@ -703,6 +706,7 @@ struct Solver<'a> {
     recent_uncertainty: VecDeque<(usize, Rc<str>, SourceSpan)>,
     uncertainty_reasons: std::collections::HashMap<String, Rc<str>>,
     assumed_evaluations: usize,
+    assumed_budget: usize,
     assumed_budget_reported: bool,
     capability_producer_files: BTreeSet<FileId>,
     caller_producer_files: BTreeSet<FileId>,
@@ -843,6 +847,7 @@ impl<'a> Solver<'a> {
             recent_uncertainty: VecDeque::new(),
             uncertainty_reasons: std::collections::HashMap::new(),
             assumed_evaluations: 0,
+            assumed_budget: MAX_ASSUMED_RENDER_EVALUATIONS,
             assumed_budget_reported: false,
             capability_producer_files: BTreeSet::new(),
             caller_producer_files: BTreeSet::new(),
@@ -4404,7 +4409,7 @@ impl<'a> Solver<'a> {
     /// Counts one assumed-render step and reports when the per-root budget is exhausted.
     fn assumed_budget_exhausted(&mut self) -> bool {
         self.assumed_evaluations += 1;
-        if self.assumed_evaluations <= MAX_ASSUMED_RENDER_EVALUATIONS {
+        if self.assumed_evaluations <= self.assumed_budget {
             return false;
         }
         self.render_truncations += 1;
