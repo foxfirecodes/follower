@@ -412,6 +412,12 @@ Snapshot reuse is not implemented yet.
 
 ## Current analysis fragment
 
+`new Set(iterable)` holds the iterable's members, and `includes` or `has` on a known array or
+such a set compares like `===`: it is decided when one element matches or every comparison is.
+`a && b` yields `a` only when `a` is falsy, and `a || b` only when it is truthy, so that operand
+keeps its truthiness even when its value is unknown; `unknown && false` is falsy, which lets a
+filter drop an element its other conditions exclude.
+
 Optional chains read and call like their plain forms: `value?.name` is `value.name` and
 `callback?.(argument)` is `callback(argument)`, so on a missing value the result is unknown, as
 an unsupported expression was before.

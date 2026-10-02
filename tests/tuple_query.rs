@@ -904,6 +904,39 @@ fn many_possible_arrays_are_summarized_by_their_elements() {
 }
 
 #[test]
+fn set_and_array_membership_decide_filters_with_unknown_conditions() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/kinds.ts",
+            "export enum Kind { A = 1, B = 2, C = 3, D = 4 }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Kind } from './kinds'; import { check } from 'external-check'; import { useItemSelection } from './hook'; const ALL = [{ kind: Kind.A }, { kind: Kind.B }, { kind: Kind.C }, { kind: Kind.D }]; const EXCLUDED = new Set([Kind.A]); const RETIRED = [Kind.D]; function Picker() { const types = ALL.filter(({ kind }) => check(kind) === true && !EXCLUDED.has(kind) && !RETIRED.includes(kind)).map((entry) => entry.kind); const [, apply] = useItemSelection(types); apply('pick'); return null; } export function App() { return <Picker />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'reachable'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("{:?}", report.callsites);
+    };
+    // An unknown condition joined by `&&` with a decided exclusion is decided for that element.
+    let mut names = Vec::new();
+    for value in &callsite.possible_elements["items"] {
+        collect_enum_members(value, &mut names);
+    }
+    assert_eq!(names, ["B", "C"]);
+}
+
+#[test]
 fn calls_of_a_wrapper_that_forwards_its_parameter_give_the_argument() {
     let fixture = TestProject::new(&[
         HOOK,

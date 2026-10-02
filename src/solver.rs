@@ -2290,10 +2290,26 @@ impl<'a> Solver<'a> {
                 match short_circuits {
                     Some(true) => left,
                     Some(false) => self.eval(right, environment, file_id),
-                    None => TrackedValue::plain(AbstractValue::union(vec![
-                        left,
-                        self.eval(right, environment, file_id),
-                    ])),
+                    None => {
+                        // `a && b` yields `a` only when `a` is falsy and `a || b` only when it is
+                        // truthy, so that side keeps its truthiness even when its value is not
+                        // known: `unknown && false` is falsy.
+                        let left = match operator {
+                            FlowLogicalOperator::And => TrackedValue {
+                                value: AbstractValue::Unknown(FALSY_OPERAND.to_owned()),
+                                ..left
+                            },
+                            FlowLogicalOperator::Or => TrackedValue {
+                                value: AbstractValue::Unknown(TRUTHY_OPERAND.to_owned()),
+                                ..left
+                            },
+                            FlowLogicalOperator::Coalesce => left,
+                        };
+                        TrackedValue::plain(AbstractValue::union(vec![
+                            left,
+                            self.eval(right, environment, file_id),
+                        ]))
+                    }
                 }
             }
             FlowExpressionKind::Conditional {
@@ -2508,6 +2524,23 @@ impl<'a> Solver<'a> {
                         |argument| self.eval(argument, environment, file_id),
                     );
                     return self.eval_array_filter_value(receiver, &callback, &expression.span);
+                }
+                // Membership in a known array, or a set built from one.
+                if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
+                    && matches!(property.as_str(), "includes" | "has")
+                    && let [needle] = arguments.as_slice()
+                    && is_plain_read(object)
+                {
+                    let receiver = self.eval(object, environment, file_id);
+                    if matches!(
+                        receiver.value,
+                        AbstractValue::Array(_) | AbstractValue::Union(_)
+                    ) {
+                        let needle = self.eval(needle, environment, file_id);
+                        if let Some(found) = array_membership(&receiver, &needle) {
+                            return TrackedValue::plain(AbstractValue::Boolean(found));
+                        }
+                    }
                 }
                 let callee_value = self.eval(callee, environment, file_id);
                 let arguments = arguments
@@ -8022,6 +8055,46 @@ fn query_value(value: &TrackedValue) -> QueryValue {
     }
 }
 
+/// Whether a known array holds a value, compared like `===`, when every comparison is decided
+/// or one element matches.
+fn array_membership(receiver: &TrackedValue, needle: &TrackedValue) -> Option<bool> {
+    if let AbstractValue::Union(needles) = &needle.value {
+        return same_known(
+            needles
+                .iter()
+                .map(|needle| array_membership(receiver, needle)),
+        );
+    }
+    match &receiver.value {
+        AbstractValue::Array(elements) => {
+            let mut undecided = false;
+            for element in elements.iter() {
+                match exact_equality(&element.value, &needle.value) {
+                    Some(true) => return Some(true),
+                    Some(false) => {}
+                    None => undecided = true,
+                }
+            }
+            (!undecided).then_some(false)
+        }
+        AbstractValue::Union(receivers) => same_known(
+            receivers
+                .iter()
+                .map(|receiver| array_membership(receiver, needle)),
+        ),
+        _ => None,
+    }
+}
+
+/// An identifier or a chain of property reads, which evaluates the same each time.
+fn is_plain_read(expression: &FlowExpression) -> bool {
+    match &expression.kind {
+        FlowExpressionKind::Identifier { .. } => true,
+        FlowExpressionKind::StaticMember { object, .. } => is_plain_read(object),
+        _ => false,
+    }
+}
+
 fn exact_equality(left: &AbstractValue, right: &AbstractValue) -> Option<bool> {
     match (left, right) {
         (AbstractValue::Null, AbstractValue::Null) => Some(true),
@@ -8118,11 +8191,18 @@ fn truthy(value: &AbstractValue) -> Option<bool> {
         AbstractValue::Number(value) => Some(*value != 0),
         AbstractValue::EnumMember { value, .. } => Some(*value != 0),
         AbstractValue::String(value) => Some(!value.is_empty()),
+        AbstractValue::Unknown(reason) if reason == FALSY_OPERAND => Some(false),
+        AbstractValue::Unknown(reason) if reason == TRUTHY_OPERAND => Some(true),
         AbstractValue::Unknown(_) | AbstractValue::AssumedWrapper { .. } => None,
         AbstractValue::Union(values) => same_known(values.iter().map(|value| truthy(&value.value))),
         _ => Some(true),
     }
 }
+
+/// The left operand of `&&` when it is the result: an unknown value known to be falsy.
+const FALSY_OPERAND: &str = "falsy_operand";
+/// The left operand of `||` when it is the result: an unknown value known to be truthy.
+const TRUTHY_OPERAND: &str = "truthy_operand";
 
 fn same_known(values: impl Iterator<Item = Option<bool>>) -> Option<bool> {
     let mut values = values;

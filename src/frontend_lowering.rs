@@ -78,6 +78,14 @@ impl Lowerer<'_> {
                 self.scoping.symbol_scope_id(symbol) == self.scoping.root_scope_id()
             })
     }
+    /// Whether a name refers to a global, such as the built-in `Set`, rather than a binding.
+    fn is_global_reference(&self, identifier: &IdentifierReference<'_>) -> bool {
+        identifier
+            .reference_id
+            .get()
+            .is_none_or(|reference| self.scoping.get_reference(reference).symbol_id().is_none())
+    }
+
     fn span(&self, span: Span) -> SourceSpan {
         SourceSpan {
             file_id: self.file_id,
@@ -922,6 +930,26 @@ impl Lowerer<'_> {
                 property: Box::new(self.lower_expression(&member.expression)),
             },
             Expression::CallExpression(call) => return self.lower_call(call),
+            // A set built from an iterable holds the iterable's members, so membership reads
+            // like the iterable's; `set.has(value)` is evaluated like `includes`.
+            Expression::NewExpression(new)
+                if matches!(&new.callee, Expression::Identifier(identifier)
+                    if identifier.name == "Set" && self.is_global_reference(identifier))
+                    && new.arguments.len() <= 1 =>
+            {
+                return match new.arguments.first() {
+                    None => FlowExpression {
+                        kind: FlowExpressionKind::Array {
+                            elements: Vec::new(),
+                        },
+                        span,
+                    },
+                    Some(Argument::SpreadElement(spread)) => {
+                        self.unsupported_expression("spread_call_argument", spread.span)
+                    }
+                    Some(argument) => self.lower_expression(argument.to_expression()),
+                };
+            }
             // `a?.b` and `f?.(x)` read and call like `a.b` and `f(x)`; on a missing value the read
             // or call is unknown, as without the guard.
             Expression::ChainExpression(chain) => {
