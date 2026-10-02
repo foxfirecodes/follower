@@ -538,14 +538,15 @@ fn component_boundaries_suggest_contracts_that_make_creations_reachable() {
         .join("\n");
     fixture.write("flow.toml", &format!("{config}\n{contracts}"));
     let report = fixture.report();
-    assert_eq!(report.creations.len(), 2, "{:?}", report.coverage.gaps);
-    assert!(
-        report
-            .creations
-            .iter()
-            .all(|creation| creation.reachability == Reachability::Reachable),
+    // Both paths call the factory with the same values at one callsite, so they are one
+    // creation with an invocation from each.
+    assert_eq!(report.creations.len(), 1, "{:?}", report.coverage.gaps);
+    assert_eq!(
+        report.creations[0].reachability,
+        Reachability::Reachable,
         "{contracts}"
     );
+    assert_eq!(report.creations[0].invocations.len(), 2);
     assert!(report.component_boundaries.is_empty());
 }
 
@@ -1147,6 +1148,21 @@ fn shared_provider_renders_children_at_every_use() {
         .map(|invocation| format!("{:?}", invocation.arguments["action"]))
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(actions.len(), 20, "{:?}", report.coverage.gaps);
+}
+
+#[test]
+fn shared_layer_renders_children_captured_by_closures_and_nested_elements() {
+    // Every use reaches the consumer site through a callback built in the layer and an element
+    // built in the positioned wrapper. Each carries a different use's children.
+    let uses = (0..80)
+        .map(|index| format!("<Positioned><Leaf action='use-{index}' /></Positioned>"))
+        .collect::<Vec<_>>()
+        .concat();
+    let app = format!(
+        "import {{ Leaf }} from './Leaf'; function Consumer({{ children }}) {{ return children(null); }} function Layer({{ children }}) {{ return <Consumer>{{(value) => children}}</Consumer>; }} function Inner({{ children }}) {{ return children; }} function Positioned(props) {{ return <Layer><Inner {{...props}} /></Layer>; }} export function App() {{ return <div>{uses}</div>; }}"
+    );
+    let (exact, other) = exact_actions(&[("src/App.tsx", app.as_str())]);
+    assert_eq!(exact.len(), 80, "{other:?}");
 }
 
 #[test]

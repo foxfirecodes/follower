@@ -149,7 +149,7 @@ pub fn load_query(path: &Path) -> Result<(QuerySpec, String)> {
     Ok((query, hash))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reachability {
     Reachable,

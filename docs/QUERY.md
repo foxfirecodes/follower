@@ -221,15 +221,21 @@ an array, so a component can call a function child. JSX text follows the React w
 indentation-only text is dropped, and other text is a string child. Contexts created by React `createContext` need no contract: their `Provider` renders
 its children and their `Consumer` calls its function child. A configured render callback name filter is intended
 for focused traces; each skipped callback is reported as a coverage gap. Repeated renders at one
-source site are bounded to 16 visits per component and callback identity and per set of JSX it
-receives, with a coverage gap if the bound is reached; a wrapper used in many places therefore
-still renders the children given at each use. Filtered `all_creations` queries postpone entry execution until import and
+source site are bounded per component and callback identity and per set of JSX it receives, to 64
+visits on exact paths and 16 on possible ones, with a coverage gap if the bound is reached. The
+set includes JSX inside the elements and callbacks the site receives, so a wrapper used in many
+places still renders the children given at each use, even when it hands them to a callback or
+wraps them in another element. A component already rendered exactly with the same props for the
+same entry input is not explored again: its creations stand, and what it reported to enclosing
+components is replayed. Filtered `all_creations` queries postpone entry execution until import and
 backward-use expansion has settled, avoiding repeated full entry walks during early rounds.
 
 ## Semantics
 
 - Each result is centered on one dynamic creation context. Multiple finite root inputs at the same
-  source callsite remain separate, so values from unrelated registry rows do not cross-pair.
+  source callsite remain separate, so values from unrelated registry rows do not cross-pair. Exact
+  paths that call the factory at the same callsite for the same root input with the same projected
+  factory arguments share one creation, which lists the invocations of every such path.
 - Projected values preserve strings, integral numbers, numeric enum members (name and value),
   arrays, finite array alternatives, `null`, `undefined`, and explicit unknowns. A branch-built array
   remains a set of possible arrays instead of collapsing to one merged list. String enum members

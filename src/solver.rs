@@ -40,10 +40,13 @@ const MAX_ASSUMED_RENDER_EVALUATIONS: usize = 1_000_000;
 const MAX_REVERSE_IMPORTER_SOURCE_BYTES: usize = 20_000;
 const MAX_HEAP_ALTERNATIVES: usize = 32;
 const MAX_RENDER_VISITS_PER_SITE: usize = 16;
+/// Exact renders at one site stop later; paths through shared components multiply quickly, and
+/// cutting an exact path loses creations that no assumption recovers.
+const MAX_EXACT_RENDER_VISITS_PER_SITE: usize = 64;
 const TEXT_FILTER_GAP: &str =
     "directory sources were text-filtered; files without a configured term were not analyzed";
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct FunctionKey {
     file_id: FileId,
     name: String,
@@ -153,6 +156,24 @@ enum Assumption {
     /// A component whose body is not fully modeled renders JSX it received but did not render
     /// in the model.
     UnrenderedJsx,
+}
+
+/// A render being remembered: under an assumption only its key, and on an exact path also what
+/// it showed its ancestors.
+enum RenderMemo {
+    Assumed((Option<String>, String, u64), usize),
+    Exact {
+        key: (Option<String>, String, u64),
+        truncations: usize,
+        log_start: usize,
+        uncertainty: usize,
+    },
+}
+
+/// What an exact render showed its ancestors: the JSX it rendered and the uncertainty it met.
+struct RenderReplay {
+    marks: Vec<RenderMark>,
+    uncertainty: usize,
 }
 
 /// Something a render can reach: a JSX element or closure site, or a function component.
@@ -609,7 +630,8 @@ pub fn execute_query(
         }
     }
     let requested_imports = std::mem::take(&mut solver.requested_imports);
-    let root_requested_imports = std::mem::take(&mut solver.root_requested_imports);
+    let mut root_requested_imports = std::mem::take(&mut solver.root_requested_imports);
+    root_requested_imports.append(&mut solver.root_requested_possible);
     if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
         eprintln!(
             "query module environments: hits={} misses={}",
@@ -687,6 +709,8 @@ struct Solver<'a> {
     requested_imports: BTreeSet<std::path::PathBuf>,
     root_requested_imports: Vec<std::path::PathBuf>,
     root_requested_paths: BTreeSet<std::path::PathBuf>,
+    /// Root requests from possible paths, after `root_requested_imports` in priority.
+    root_requested_possible: Vec<std::path::PathBuf>,
     entry_corridor: BTreeSet<std::path::PathBuf>,
     /// Files on the entry corridor plus factory hosts. Empty when the corridor is unknown.
     corridor_files: BTreeSet<FileId>,
@@ -694,6 +718,15 @@ struct Solver<'a> {
     use_chain: BTreeSet<FunctionKey>,
     /// Components already explored under an assumption, keyed by choice, component, and props.
     assumed_component_renders: BTreeSet<(Option<String>, String, u64)>,
+    /// Exact renders already explored; an entry is empty while its render is still running.
+    exact_renders:
+        std::collections::HashMap<(Option<String>, String, u64), Option<Rc<RenderReplay>>>,
+    /// Callbacks already scanned, by value, reachability, and choice. The values are kept so
+    /// their addresses stay unique.
+    scanned_callbacks: std::collections::HashSet<(usize, Reachability, Option<String>)>,
+    scanned_callback_values: Vec<Rc<ClosureValue>>,
+    /// The returned value of each exact creation, by callsite, choice, and argument values.
+    interned_creations: std::collections::HashMap<u64, TrackedValue>,
     /// Components returned by a configured wrapper, which may add props when rendering them.
     wrapped_components: BTreeSet<FunctionKey>,
     /// Counts budget stops that may have cut a render short.
@@ -836,10 +869,15 @@ impl<'a> Solver<'a> {
             requested_imports: BTreeSet::new(),
             root_requested_imports: Vec::new(),
             root_requested_paths: BTreeSet::new(),
+            root_requested_possible: Vec::new(),
             entry_corridor: BTreeSet::new(),
             corridor_files: BTreeSet::new(),
             use_chain: BTreeSet::new(),
             assumed_component_renders: BTreeSet::new(),
+            interned_creations: std::collections::HashMap::new(),
+            scanned_callbacks: std::collections::HashSet::new(),
+            scanned_callback_values: Vec::new(),
+            exact_renders: std::collections::HashMap::new(),
             wrapped_components: BTreeSet::new(),
             render_truncations: 0,
             render_log: Vec::new(),
@@ -1161,9 +1199,22 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// Requests a file for the root phase. Requests from exact paths come before those from
+    /// possible paths, so a limited root budget parses what exact paths need first.
     fn request_root_import(&mut self, path: &std::path::Path) {
-        if self.root_requested_paths.insert(path.to_path_buf()) {
-            self.root_requested_imports.push(path.to_path_buf());
+        if self.current_reachability == Reachability::Reachable {
+            if self.root_requested_paths.insert(path.to_path_buf()) {
+                self.root_requested_imports.push(path.to_path_buf());
+            } else if let Some(index) = self
+                .root_requested_possible
+                .iter()
+                .position(|requested| requested == path)
+            {
+                let path = self.root_requested_possible.remove(index);
+                self.root_requested_imports.push(path);
+            }
+        } else if self.root_requested_paths.insert(path.to_path_buf()) {
+            self.root_requested_possible.push(path.to_path_buf());
         }
     }
 
@@ -3049,6 +3100,16 @@ impl<'a> Solver<'a> {
         match &value.value {
             AbstractValue::Closure(closure) => {
                 self.record_coverage_gap("callback body explored through opaque consumer", span);
+                // The same callback handed down through many components is scanned once.
+                let key = (
+                    Rc::as_ptr(closure).addr(),
+                    self.current_reachability,
+                    self.current_choice.clone(),
+                );
+                if !self.scanned_callbacks.insert(key) {
+                    return;
+                }
+                self.scanned_callback_values.push(Rc::clone(closure));
                 let returned = self.call_closure(closure, Vec::new());
                 self.scan_callback_bodies(&returned, span, depth + 1);
             }
@@ -3687,7 +3748,7 @@ impl<'a> Solver<'a> {
         // receives so one busy wrapper cannot exhaust the budget for content passed elsewhere.
         let mut content = Vec::new();
         for value in element.props.values() {
-            collect_render_content_sites(value, &mut content, 0);
+            self.collect_render_content_sites(value, &mut content, 0);
         }
         content.sort_unstable();
         content.dedup();
@@ -3708,8 +3769,10 @@ impl<'a> Solver<'a> {
         // remembered, so a later path can still complete it, and props too deep to fingerprint
         // are always explored.
         let mut memo = None;
-        // Unions only dispatch to their alternatives, which are remembered individually.
-        if self.current_reachability == Reachability::Possible
+        // Unions only dispatch to their alternatives, which are remembered individually. Exact
+        // renders are remembered too: creations are interned, so a repeated subtree with the same
+        // props would only repeat its results, and it replays what it showed its ancestors.
+        if self.current_reachability != Reachability::Unknown
             && !matches!(
                 element.component.value,
                 AbstractValue::Intrinsic(_) | AbstractValue::Union(_)
@@ -3741,12 +3804,36 @@ impl<'a> Solver<'a> {
                 ),
             };
             let memo_key = (self.current_choice.clone(), component, fingerprint);
-            if complete {
+            if complete && self.current_reachability == Reachability::Possible {
                 if !self.assumed_component_renders.insert(memo_key.clone()) {
                     self.trace = previous_trace;
                     return;
                 }
-                memo = Some((memo_key, self.render_truncations));
+                memo = Some(RenderMemo::Assumed(memo_key, self.render_truncations));
+            } else if complete {
+                match self.exact_renders.get(&memo_key) {
+                    Some(Some(replay)) => {
+                        let replay = Rc::clone(replay);
+                        self.render_log.extend(replay.marks.iter().cloned());
+                        self.uncertainty_events += replay.uncertainty;
+                        self.trace = previous_trace;
+                        return;
+                    }
+                    // The same render is already running further up this path.
+                    Some(None) => {
+                        self.trace = previous_trace;
+                        return;
+                    }
+                    None => {
+                        self.exact_renders.insert(memo_key.clone(), None);
+                        memo = Some(RenderMemo::Exact {
+                            key: memo_key,
+                            truncations: self.render_truncations,
+                            log_start: self.render_log.len(),
+                            uncertainty: self.uncertainty_events,
+                        });
+                    }
+                }
             }
         }
         // Assumed renders have their own budget so they cannot crowd out exact paths.
@@ -3757,12 +3844,23 @@ impl<'a> Solver<'a> {
             element.span.start,
             identity,
         );
+        let budget = if self.current_reachability == Reachability::Reachable {
+            MAX_EXACT_RENDER_VISITS_PER_SITE
+        } else {
+            MAX_RENDER_VISITS_PER_SITE
+        };
         let visits = self.render_visits.entry(key).or_default();
         *visits += 1;
-        if *visits > MAX_RENDER_VISITS_PER_SITE {
+        if *visits > budget {
             self.render_truncations += 1;
-            if let Some((memo_key, _)) = &memo {
-                self.assumed_component_renders.remove(memo_key);
+            match &memo {
+                Some(RenderMemo::Assumed(key, _)) => {
+                    self.assumed_component_renders.remove(key);
+                }
+                Some(RenderMemo::Exact { key, .. }) => {
+                    self.exact_renders.remove(key);
+                }
+                None => {}
             }
             self.record_coverage_gap("render visit budget exhausted", &element.span);
             self.mark_values_unresolved(
@@ -3955,10 +4053,36 @@ impl<'a> Solver<'a> {
                 }
             }
         }
-        if let Some((memo_key, truncations)) = memo
-            && self.render_truncations != truncations
-        {
-            self.assumed_component_renders.remove(&memo_key);
+        match memo {
+            Some(RenderMemo::Assumed(key, truncations))
+                if self.render_truncations != truncations =>
+            {
+                self.assumed_component_renders.remove(&key);
+            }
+            Some(RenderMemo::Exact {
+                key,
+                truncations,
+                log_start,
+                uncertainty,
+            }) => {
+                if self.render_truncations == truncations {
+                    // Ancestors may watch JSX that arrived in props or inside captured closures.
+                    let marks = self.render_log[log_start..]
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    let replay = RenderReplay {
+                        marks,
+                        uncertainty: self.uncertainty_events - uncertainty,
+                    };
+                    self.exact_renders.insert(key, Some(Rc::new(replay)));
+                } else {
+                    self.exact_renders.remove(&key);
+                }
+            }
+            _ => {}
         }
         self.trace = previous_trace;
     }
@@ -4603,6 +4727,23 @@ impl<'a> Solver<'a> {
             .iter()
             .map(|value| self.materialize(value))
             .collect::<Vec<_>>();
+        // Another exact path to the same callsite with the same choice and argument values is
+        // the same creation; reusing it keeps the subtrees below identical, so they can be
+        // remembered instead of explored again.
+        let interning = (self.current_reachability == Reachability::Reachable).then(|| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (
+                &span,
+                &self.current_choice,
+                arguments.iter().map(query_value).collect::<Vec<_>>(),
+            )
+                .hash(&mut hasher);
+            hasher.finish()
+        });
+        if let Some(returned) = interning.and_then(|key| self.interned_creations.get(&key)) {
+            return returned.clone();
+        }
         let mut captures = BTreeMap::new();
         let mut missing_capture = false;
         for (name, source) in &self.model.captures {
@@ -4797,7 +4938,7 @@ impl<'a> Solver<'a> {
             choice: Some(choice),
             heap_id: None,
         };
-        if let Some(index) = self.model.returned_index {
+        let returned = if let Some(index) = self.model.returned_index {
             let mut elements = vec![TrackedValue::unknown("unselected_return_element"); index + 1];
             elements[index] = capability;
             TrackedValue {
@@ -4820,7 +4961,11 @@ impl<'a> Solver<'a> {
                 };
             }
             returned
+        };
+        if let Some(key) = interning {
+            self.interned_creations.insert(key, returned.clone());
         }
+        returned
     }
 
     fn emit_modeled_effects(
@@ -5999,6 +6144,44 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// Sources of the JSX a value carries. Elements and closures count with the JSX in their
+    /// props and captures, so a render callback such as `(context) => renderPortal(context,
+    /// children)`, or an element such as `<Inner {...props} />`, built inside a shared wrapper is
+    /// told apart by the children each use passes.
+    fn collect_render_content_sites(
+        &self,
+        value: &TrackedValue,
+        sites: &mut Vec<(u32, u32)>,
+        depth: usize,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        match &value.value {
+            AbstractValue::Element(element) => {
+                sites.push((element.span.file_id.0, element.span.start));
+                for value in element.props.values() {
+                    self.collect_render_content_sites(value, sites, depth + 1);
+                }
+            }
+            AbstractValue::Closure(closure) => {
+                sites.push((closure.span.file_id.0, closure.span.start));
+                let references = self.body_references(&closure.span, &closure.body);
+                for name in &references.names {
+                    if let Some(captured) = closure.environment.get(name) {
+                        self.collect_render_content_sites(captured, sites, depth + 1);
+                    }
+                }
+            }
+            AbstractValue::Array(values) | AbstractValue::Union(values) => {
+                for value in values.iter() {
+                    self.collect_render_content_sites(value, sites, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Names a closure body references. A source span identifies one closure, and the IR does not
     /// change during a pass, so the walk is done once per closure.
     fn body_references(&self, span: &SourceSpan, body: &FlowArrowBody) -> Rc<ClosureReferences> {
@@ -6176,22 +6359,6 @@ fn hash_value_fingerprint(
 }
 
 /// Collects source sites of JSX elements and render functions carried by a prop value.
-fn collect_render_content_sites(value: &TrackedValue, sites: &mut Vec<(u32, u32)>, depth: usize) {
-    if depth > 8 {
-        return;
-    }
-    match &value.value {
-        AbstractValue::Element(element) => sites.push((element.span.file_id.0, element.span.start)),
-        AbstractValue::Closure(closure) => sites.push((closure.span.file_id.0, closure.span.start)),
-        AbstractValue::Array(values) | AbstractValue::Union(values) => {
-            for value in values.iter() {
-                collect_render_content_sites(value, sites, depth + 1);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn contains_element(value: &TrackedValue, depth: usize) -> bool {
     match &value.value {
         AbstractValue::Element(_) => true,
