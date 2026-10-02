@@ -429,6 +429,31 @@ fn blocks_loops_try_and_throw_keep_paths_exact() {
 }
 
 #[test]
+fn recursion_over_unknown_data_stops_at_the_recursion_budget() {
+    let app = (
+        "src/App.tsx",
+        "import { Leaf } from './Leaf'; import { tree } from 'external-tree'; function walk(node, depth) { if (node.child != null) { return walk(node.child, [...depth, node.key]); } return <Leaf action='leaf' />; } function count(node) { if (node.next != null) { return count(node.next); } return <Leaf action={node.label} />; } export function App() { return <div>{walk(tree, [])}{count({ next: { next: { next: { label: 'deep' } } } })}</div>; }",
+    );
+    let (exact, other) = exact_actions(&[app]);
+    // Known data recurses as deep as it goes; unknown data stops at the recursion budget, and
+    // the path that returns before recursing is still explored at every level.
+    assert_eq!(exact, ["deep", "leaf"], "{other:?}");
+    let fixture = TestProject::new(&[HOOK, LEAF, app]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", TUPLE_QUERY);
+    let report = fixture.report();
+    let stops = report
+        .gaps
+        .iter()
+        .filter(|gap| gap.kind == "recursion_depth_budget_exhausted")
+        .count();
+    assert_eq!(stops, 1, "{:?}", report.coverage.gaps);
+}
+
+#[test]
 fn class_property_methods_are_bound_to_instance_props() {
     let (exact, other) = exact_actions(&[(
         "src/App.tsx",

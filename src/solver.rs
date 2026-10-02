@@ -34,6 +34,10 @@ use crate::{
 };
 
 const MAX_CALL_DEPTH: usize = 128;
+/// Nested calls of one function. Recursion over known data, such as a menu tree, ends sooner;
+/// recursion over unknown data would otherwise run to the call depth budget, repeating the same
+/// exploration at every level.
+const MAX_RECURSION_DEPTH: usize = 8;
 const MAX_REVERSE_IMPORTER_EVALUATIONS: usize = 5_000;
 const MAX_UNREACHED_RENDER_EVALUATIONS: usize = 5_000;
 const MAX_ASSUMED_RENDER_EVALUATIONS: usize = 1_000_000;
@@ -792,6 +796,8 @@ struct Solver<'a> {
     interned_creations: std::collections::HashMap<u64, TrackedValue>,
     /// Factory callsites no exact or possible path reached, with the reason.
     unreached_callsites: Vec<QueryUnreachedCallsite>,
+    /// Calls of each function in progress.
+    active_functions: std::collections::HashMap<FunctionKey, usize>,
     /// Components returned by a configured wrapper, which may add props when rendering them.
     wrapped_components: BTreeSet<FunctionKey>,
     /// Counts budget stops that may have cut a render short.
@@ -945,6 +951,7 @@ impl<'a> Solver<'a> {
             scanned_callback_values: Vec::new(),
             exact_renders: std::collections::HashMap::new(),
             unreached_callsites: Vec::new(),
+            active_functions: std::collections::HashMap::new(),
             wrapped_components: BTreeSet::new(),
             render_truncations: 0,
             render_log: Vec::new(),
@@ -1395,6 +1402,19 @@ impl<'a> Solver<'a> {
         let Some(function) = self.functions.get(key).copied() else {
             return TrackedValue::unknown(format!("missing_function:{}", key.name));
         };
+        // A cut here depends only on the calls above it in the same function, so unlike the call
+        // depth budget it does not stop enclosing renders from being remembered.
+        let active = self.active_functions.entry(key.clone()).or_default();
+        if *active >= MAX_RECURSION_DEPTH {
+            self.record_coverage_gap("recursion depth budget exhausted", &function.span);
+            self.mark_values_unresolved(
+                arguments.iter(),
+                "recursion depth budget exhausted",
+                function.span.clone(),
+            );
+            return TrackedValue::unknown("recursion_depth_budget_exhausted");
+        }
+        *active += 1;
         let trace_len = self.trace.len();
         if self
             .trace
@@ -1425,6 +1445,9 @@ impl<'a> Solver<'a> {
         let returned = self.execute_statements(&function.body, &mut environment, key.file_id);
         self.active_captures.pop();
         self.call_depth -= 1;
+        if let Some(active) = self.active_functions.get_mut(key) {
+            *active -= 1;
+        }
         self.trace.truncate(trace_len);
         let returned = returned.unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined));
         if returns_capability_data(&returned) && self.symbol_linker.file(key.file_id).is_some_and(|file| {

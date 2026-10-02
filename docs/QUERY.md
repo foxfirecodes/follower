@@ -408,7 +408,9 @@ known records, but record key insertion order is not stored; records with multip
 coverage gap when array order might matter. Arrays and records bound to locals share heap identity
 across aliases and helper calls; local `.push` and static record-property writes update that
 identity. Unknown branches retain up to 32 possible heap values; exceeding that budget produces a
-coverage gap. Reassignment of captured
+coverage gap. A function calls itself at most 8 levels deep on one path, so recursion over
+unknown data stops early, with a coverage gap, instead of repeating the same exploration at
+every level. Reassignment of captured
 bindings and opaque calls receiving callback-bearing namespaces are conservatively unresolved.
 Dynamic mutation targets, external mutation, live closure cells, full JavaScript coercion,
 non-null loose comparisons, repeated loop iterations, and array methods
