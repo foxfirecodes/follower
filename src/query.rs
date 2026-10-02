@@ -414,6 +414,10 @@ pub struct QueryCallerValue {
 pub struct QueryCapabilityUse {
     pub status: QueryCapabilityStatus,
     pub calls: Vec<QueryCapabilityCall>,
+    /// Calls the walk found whose conditions no element the callsite requests meets, as when a
+    /// shared descriptor carries several hooks' callbacks and a switch picks the component.
+    #[serde(default)]
+    pub excluded_calls: Vec<QueryCapabilityCall>,
     pub escapes: Vec<QueryCapabilityEscape>,
 }
 
@@ -448,6 +452,26 @@ pub struct QueryCapabilityCall {
     /// Whether an explored path executed this call. A call no path executed may be behind a
     /// condition, a handler, or a component no path rendered; its arguments are still reported.
     pub explored: bool,
+    /// The caller site that supplied the callsite's arguments for this call, when the result
+    /// reached it through a caller, such as the element rendering a wrapper with a function
+    /// child.
+    #[serde(default)]
+    pub instance: Option<QueryLocation>,
+    /// Conditions on the path that compare with enum members of a factory argument's elements,
+    /// each a set one compared value must be in, as for `kind === Kind.A || kind === Kind.B`.
+    #[serde(default)]
+    pub guards: Vec<Vec<QueryValue>>,
+    /// Enum members conditions on the path rule out, as after `if (kind !== Kind.A) return`
+    /// for `Kind.A` in the code before it, or `kind !== Kind.A` itself.
+    #[serde(default)]
+    pub guards_not: Vec<QueryValue>,
+    /// For each array factory argument, the elements this call can apply to: the instance's or
+    /// callsite's elements, narrowed by `guards`.
+    #[serde(default)]
+    pub elements: BTreeMap<String, Vec<QueryValue>>,
+    /// Whether every element the callsite or instance requests is known.
+    #[serde(default)]
+    pub elements_complete: bool,
 }
 
 /// Somewhere the factory result went that the walk could not follow.

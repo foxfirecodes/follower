@@ -303,9 +303,12 @@
         const args = Object.entries(call.arguments).map(([label, values]) => `${label} = ${values.map(valueText).join(' | ')}`).join(', ');
         body.append(node('h3', 'mini', `Call at ${loc(call.location)}${call.explored ? '' : ' · not executed by an explored path'}`));
         body.append(node('div', 'mini mono', args || 'no projected arguments'));
+        Object.entries(call.elements || {}).forEach(([label, values]) => body.append(node('div', 'mini mono', `for ${label}: ${values.map(valueText).join(', ') || 'none'}${call.elements_complete ? '' : ' (incomplete)'}`)));
+        if (call.instance) body.append(node('div', 'mini', `Instance at ${loc(call.instance)}`));
         if (call.context.length) body.append(node('div', 'mini', `In ${call.context.join(', in ')}`));
         if (call.via.length) body.append(node('div', 'mini', `Via ${call.via.join(' → ')}`));
       });
+      (item.capability.excluded_calls || []).forEach(call => body.append(node('div', 'mini', `Excluded call at ${loc(call.location)}: its conditions (${call.guards.map(set => set.map(valueText).join(' | ')).join('; ')}) match nothing this callsite requests`)));
       item.capability.escapes.forEach(escape => body.append(node('div', 'mini', `Escapes at ${loc(escape.location)}: ${escape.detail}`)));
       card.append(body); list.append(card);
     });

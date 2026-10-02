@@ -12,7 +12,7 @@ use crate::{
     ids::FileId,
     ir::{
         FlowArrowBody, FlowAssignmentTarget, FlowExpression, FlowExpressionKind, FlowJsxProp,
-        FlowJsxTag, FlowPattern, FlowPatternKind, FlowStatement, SourceSpan,
+        FlowJsxTag, FlowLogicalOperator, FlowPattern, FlowPatternKind, FlowStatement, SourceSpan,
     },
     link::{LinkedSymbol, LinkedValue, ValueResolution, pattern_names},
     query::{
@@ -20,6 +20,8 @@ use crate::{
         QueryCapabilityStatus, QueryCapabilityUse, QuerySpec, QueryValue, Reachability,
     },
 };
+
+use crate::query::QueryCallPathKind;
 
 use super::{
     Environment, FactoryCallCandidate, FunctionKey, Solver, TrackedValue, UseEdge, UseNode,
@@ -134,6 +136,47 @@ struct FoundCall {
     inner: Option<SourceSpan>,
     /// Whether this call passes a wrapper's parameter on, so calls of the wrapper replace it.
     forwards: bool,
+    /// The conditions the call runs under, along the whole path from the callsite.
+    guards: Rc<Vec<OwnedGuard>>,
+    /// The caller site that supplied the callsite's arguments, when the path left the callsite's
+    /// scope through a caller, such as the element that renders a wrapper with a function child.
+    instance: Option<SourceSpan>,
+}
+
+/// A condition on the walk's path, with where to evaluate the values it compares with.
+#[derive(Clone)]
+struct OwnedGuard {
+    file_id: FileId,
+    test: FlowExpression,
+    /// Whether the test holds or fails where the guarded code runs.
+    holds: bool,
+    locals: Rc<BTreeSet<String>>,
+}
+
+fn guard_key(guards: &[OwnedGuard]) -> Vec<(u32, u32, u32, bool)> {
+    guards
+        .iter()
+        .map(|guard| {
+            (
+                guard.file_id.0,
+                guard.test.span.start,
+                guard.test.span.end,
+                guard.holds,
+            )
+        })
+        .collect()
+}
+
+/// Whether a test compares anything with `===`, so it may say which value runs the code.
+fn has_equality(test: &FlowExpression) -> bool {
+    match &test.kind {
+        FlowExpressionKind::StrictEquality { .. } => true,
+        FlowExpressionKind::Logical { left, right, .. } => {
+            has_equality(left) || has_equality(right)
+        }
+        FlowExpressionKind::LogicalNot { value } => has_equality(value),
+        _ => false,
+    }
 }
 
 /// An argument as written at a call, with where to evaluate it.
@@ -168,8 +211,9 @@ struct Forward {
 /// An occurrence's outcome in the walk loop.
 enum Found {
     Call(FoundCall),
-    /// A lead, the argument mapping it carries, and a hop to add to the path.
-    Lead(OwnedLead, Rc<Forward>, Option<String>),
+    /// A lead, the argument mapping it carries, a hop to add to the path, and the conditions
+    /// at the occurrence.
+    Lead(OwnedLead, Rc<Forward>, Option<String>, Rc<Vec<OwnedGuard>>),
 }
 
 struct Walk {
@@ -424,32 +468,53 @@ fn context_of(frames: &[Frame<'_>], index: usize) -> Vec<String> {
         .collect()
 }
 
-/// Calls `found` for every expression in statements, with the frames from the statement down.
+/// A condition an expression runs under: the test, and whether it holds there.
+type Guard<'e> = (&'e FlowExpression, bool);
+
+/// Whether a statement list always leaves the enclosing function or block when it runs.
+fn ends_in_jump(statements: &[FlowStatement]) -> bool {
+    matches!(
+        statements.last(),
+        Some(FlowStatement::Return { .. } | FlowStatement::Throw { .. })
+    )
+}
+
+/// Calls `found` for every expression in statements, with the frames from the statement down
+/// and the conditions it runs under.
 fn visit_statements<'e>(
     statements: &'e [FlowStatement],
     frames: &mut Vec<Frame<'e>>,
-    found: &mut dyn FnMut(&[Frame<'e>]),
+    guards: &mut Vec<Guard<'e>>,
+    found: &mut dyn FnMut(&[Frame<'e>], &[Guard<'e>]),
 ) {
+    // Conditions an early return leaves for the statements after it.
+    let depth = guards.len();
     for statement in statements {
         match statement {
             FlowStatement::Bind(binding) => {
-                visit(&binding.value, Role::Bind(&binding.pattern), frames, found);
+                visit(
+                    &binding.value,
+                    Role::Bind(&binding.pattern),
+                    frames,
+                    guards,
+                    found,
+                );
             }
             FlowStatement::Return {
                 value: Some(value), ..
-            } => visit(value, Role::Return, frames, found),
+            } => visit(value, Role::Return, frames, guards, found),
             FlowStatement::Expression { value, .. } | FlowStatement::Throw { value, .. } => {
-                visit(value, Role::Other, frames, found);
+                visit(value, Role::Other, frames, guards, found);
             }
             FlowStatement::Assign { target, value, .. } => {
-                visit(value, Role::Assign(target), frames, found);
+                visit(value, Role::Assign(target), frames, guards, found);
                 match target {
                     FlowAssignmentTarget::StaticMember { object, .. } => {
-                        visit(object, Role::Other, frames, found);
+                        visit(object, Role::Other, frames, guards, found);
                     }
                     FlowAssignmentTarget::ComputedMember { object, property } => {
-                        visit(object, Role::Other, frames, found);
-                        visit(property, Role::Other, frames, found);
+                        visit(object, Role::Other, frames, guards, found);
+                        visit(property, Role::Other, frames, guards, found);
                     }
                     FlowAssignmentTarget::Identifier { .. }
                     | FlowAssignmentTarget::Unsupported { .. } => {}
@@ -461,23 +526,35 @@ fn visit_statements<'e>(
                 alternate,
                 ..
             } => {
-                visit(test, Role::Other, frames, found);
-                visit_statements(consequent, frames, found);
-                visit_statements(alternate, frames, found);
+                visit(test, Role::Other, frames, guards, found);
+                guards.push((test, true));
+                visit_statements(consequent, frames, guards, found);
+                guards.pop();
+                guards.push((test, false));
+                visit_statements(alternate, frames, guards, found);
+                guards.pop();
+                // `if (kind !== Kind.A) return null;` leaves `kind === Kind.A` for the rest.
+                if ends_in_jump(consequent) && !ends_in_jump(alternate) {
+                    guards.push((test, false));
+                } else if ends_in_jump(alternate) && !ends_in_jump(consequent) {
+                    guards.push((test, true));
+                }
             }
             FlowStatement::Return { value: None, .. } | FlowStatement::Unsupported(_) => {}
         }
     }
+    guards.truncate(depth);
 }
 
 fn visit<'e>(
     expression: &'e FlowExpression,
     role: Role<'e>,
     frames: &mut Vec<Frame<'e>>,
-    found: &mut dyn FnMut(&[Frame<'e>]),
+    guards: &mut Vec<Guard<'e>>,
+    found: &mut dyn FnMut(&[Frame<'e>], &[Guard<'e>]),
 ) {
     frames.push(Frame { expression, role });
-    found(frames);
+    found(frames, guards);
     match &expression.kind {
         FlowExpressionKind::Record { fields } => {
             for field in fields {
@@ -486,21 +563,27 @@ fn visit<'e>(
                 } else {
                     Role::Field(&field.property)
                 };
-                visit(&field.value, role, frames, found);
+                visit(&field.value, role, frames, guards, found);
             }
         }
         FlowExpressionKind::Array { elements } => {
             for (index, element) in elements.iter().enumerate() {
-                visit(element, Role::Element(index), frames, found);
+                visit(element, Role::Element(index), frames, guards, found);
             }
         }
-        FlowExpressionKind::Spread { value } => visit(value, Role::Through, frames, found),
+        FlowExpressionKind::Spread { value } => visit(value, Role::Through, frames, guards, found),
         FlowExpressionKind::LogicalNot { value }
         | FlowExpressionKind::LooseNullEquality { value, .. } => {
-            visit(value, Role::Other, frames, found);
+            visit(value, Role::Other, frames, guards, found);
         }
         FlowExpressionKind::StaticMember { object, property } => {
-            visit(object, Role::Member(Some(property.clone())), frames, found);
+            visit(
+                object,
+                Role::Member(Some(property.clone())),
+                frames,
+                guards,
+                found,
+            );
         }
         FlowExpressionKind::ComputedMember { object, property } => {
             let key = match &property.kind {
@@ -508,46 +591,66 @@ fn visit<'e>(
                 FlowExpressionKind::String { value } => Some(value.clone()),
                 _ => None,
             };
-            visit(object, Role::Member(key), frames, found);
-            visit(property, Role::Other, frames, found);
+            visit(object, Role::Member(key), frames, guards, found);
+            visit(property, Role::Other, frames, guards, found);
         }
         FlowExpressionKind::Call { callee, arguments } => {
-            visit(callee, Role::Callee, frames, found);
+            visit(callee, Role::Callee, frames, guards, found);
             for (index, argument) in arguments.iter().enumerate() {
-                visit(argument, Role::Argument(index), frames, found);
+                visit(argument, Role::Argument(index), frames, guards, found);
             }
         }
         FlowExpressionKind::StrictEquality { left, right, .. } => {
-            visit(left, Role::Other, frames, found);
-            visit(right, Role::Other, frames, found);
+            visit(left, Role::Other, frames, guards, found);
+            visit(right, Role::Other, frames, guards, found);
         }
-        FlowExpressionKind::Logical { left, right, .. } => {
-            visit(left, Role::Through, frames, found);
-            visit(right, Role::Through, frames, found);
+        FlowExpressionKind::Logical {
+            left,
+            right,
+            operator,
+        } => {
+            visit(left, Role::Through, frames, guards, found);
+            // The right side of `&&` runs when the left holds, and of `||` when it does not.
+            let guard = match operator {
+                FlowLogicalOperator::And => Some((left.as_ref(), true)),
+                FlowLogicalOperator::Or => Some((left.as_ref(), false)),
+                FlowLogicalOperator::Coalesce => None,
+            };
+            guards.extend(guard);
+            visit(right, Role::Through, frames, guards, found);
+            if guard.is_some() {
+                guards.pop();
+            }
         }
         FlowExpressionKind::Conditional {
             test,
             consequent,
             alternate,
         } => {
-            visit(test, Role::Other, frames, found);
-            visit(consequent, Role::Through, frames, found);
-            visit(alternate, Role::Through, frames, found);
+            visit(test, Role::Other, frames, guards, found);
+            guards.push((test, true));
+            visit(consequent, Role::Through, frames, guards, found);
+            guards.pop();
+            guards.push((test, false));
+            visit(alternate, Role::Through, frames, guards, found);
+            guards.pop();
         }
         FlowExpressionKind::Arrow { body, .. } => match body {
             FlowArrowBody::Expression { expression } => {
-                visit(expression, Role::ArrowBody, frames, found);
+                visit(expression, Role::ArrowBody, frames, guards, found);
             }
-            FlowArrowBody::Statements { statements } => visit_statements(statements, frames, found),
+            FlowArrowBody::Statements { statements } => {
+                visit_statements(statements, frames, guards, found);
+            }
         },
         FlowExpressionKind::JsxElement { props, .. } => {
             for prop in props {
                 match prop {
                     FlowJsxProp::Property { name, value, .. } => {
-                        visit(value, Role::Prop(name), frames, found);
+                        visit(value, Role::Prop(name), frames, guards, found);
                     }
                     FlowJsxProp::Spread { value, .. } => {
-                        visit(value, Role::PropSpread, frames, found);
+                        visit(value, Role::PropSpread, frames, guards, found);
                     }
                     FlowJsxProp::Unsupported(_) => {}
                 }
@@ -556,6 +659,20 @@ fn visit<'e>(
         _ => {}
     }
     frames.pop();
+}
+
+/// Visits a scope's body.
+fn visit_body<'e>(body: &ScopeBody<'e>, found: &mut dyn FnMut(&[Frame<'e>], &[Guard<'e>])) {
+    let mut frames = Vec::new();
+    let mut guards = Vec::new();
+    match body {
+        ScopeBody::Statements(statements) => {
+            visit_statements(statements, &mut frames, &mut guards, found);
+        }
+        ScopeBody::Expression(expression) => {
+            visit(expression, Role::Return, &mut frames, &mut guards, found);
+        }
+    }
 }
 
 impl Solver<'_> {
@@ -1094,13 +1211,17 @@ impl Solver<'_> {
             ),
             Vec::<String>::new(),
             direct,
+            Rc::new(Vec::<OwnedGuard>::new()),
+            None::<SourceSpan>,
         )]);
         let mut seen = HashSet::new();
         let mut locals_cache = HashMap::<UseNode, Rc<BTreeSet<String>>>::new();
         let mut recorded = HashSet::new();
-        while let Some((scope, target, via, forward)) = queue.pop_front() {
+        while let Some((scope, target, via, forward, carried, instance)) = queue.pop_front() {
             let inner = forward.inner.as_ref().map(span_key);
-            if seen.len() >= WALK_LIMIT || !seen.insert((scope.clone(), target.clone(), inner)) {
+            if seen.len() >= WALK_LIMIT
+                || !seen.insert((scope.clone(), target.clone(), inner, guard_key(&carried)))
+            {
                 continue;
             }
             let Some(code) = self.scope_code(&scope) else {
@@ -1113,9 +1234,26 @@ impl Solver<'_> {
             let mut leads = Vec::new();
             let file_id = code.file_id;
             let imports = &local_imports(&code.body);
-            let mut found = |frames: &[Frame<'_>]| {
+            let mut found = |frames: &[Frame<'_>], local: &[Guard<'_>]| {
                 let frame = frames.last().expect("visited frame");
                 let expression = frame.expression;
+                // The carried conditions and the ones at this occurrence.
+                let here = || {
+                    let mut tests = local
+                        .iter()
+                        .filter(|(test, _)| has_equality(test))
+                        .map(|(test, holds)| OwnedGuard {
+                            file_id,
+                            test: (*test).clone(),
+                            holds: *holds,
+                            locals: locals.clone(),
+                        })
+                        .peekable();
+                    if tests.peek().is_none() {
+                        return carried.clone();
+                    }
+                    Rc::new(carried.iter().cloned().chain(tests).collect::<Vec<_>>())
+                };
                 let steps = match (&target, &expression.kind) {
                     (
                         Target::Name(name, steps),
@@ -1195,6 +1333,8 @@ impl Solver<'_> {
                             via: via.clone(),
                             inner: forward.inner.clone(),
                             forwards: forwarded,
+                            guards: here(),
+                            instance: instance.clone(),
                         }));
                         if forwarded && let Some(arrow) = arrow {
                             let lead = self
@@ -1209,6 +1349,7 @@ impl Solver<'_> {
                                     ),
                                 }),
                                 Some(format!("through {}", describe_arrow(frames, arrow))),
+                                here(),
                             ));
                         }
                     }
@@ -1237,42 +1378,54 @@ impl Solver<'_> {
                             via: via.clone(),
                             inner: forward.inner.clone(),
                             forwards: false,
+                            guards: here(),
+                            instance: instance.clone(),
                         }));
                     }
-                    other => leads.push(Found::Lead(other.into_owned(), forward.clone(), None)),
+                    other => leads.push(Found::Lead(
+                        other.into_owned(),
+                        forward.clone(),
+                        None,
+                        here(),
+                    )),
                 }
             };
-            let mut frames = Vec::new();
-            match code.body {
-                ScopeBody::Statements(statements) => {
-                    visit_statements(statements, &mut frames, &mut found);
-                }
-                ScopeBody::Expression(expression) => {
-                    visit(expression, Role::Return, &mut frames, &mut found);
-                }
-            }
+            visit_body(&code.body, &mut found);
             let is_start = via.is_empty() && matches!(target, Target::Site(_, _, None, _));
             for found in leads {
-                let (lead, forward, via) = match found {
+                let (lead, forward, via, here) = match found {
                     Found::Call(call) => {
                         walk.used = true;
-                        if recorded
-                            .insert((span_key(&call.span), call.inner.as_ref().map(span_key)))
-                        {
+                        if recorded.insert((
+                            span_key(&call.span),
+                            call.inner.as_ref().map(span_key),
+                            guard_key(&call.guards),
+                        )) {
                             walk.calls.push(call);
                         }
                         continue;
                     }
-                    Found::Lead(lead, forward, hop) => {
+                    Found::Lead(lead, forward, hop, here) => {
                         let mut via = via.clone();
                         via.extend(hop);
-                        (lead, forward, via)
+                        (lead, forward, via, here)
                     }
                 };
+                // A path into a caller takes the caller's site as the instance that supplied
+                // the callsite's arguments.
+                let from_caller =
+                    |site: &SourceSpan| instance.clone().or_else(|| Some(site.clone()));
                 match lead {
                     OwnedLead::Same(next) => {
                         walk.used |= !is_start;
-                        queue.push_back((scope.clone(), next, via, forward));
+                        queue.push_back((
+                            scope.clone(),
+                            next,
+                            via,
+                            forward,
+                            carried.clone(),
+                            instance.clone(),
+                        ));
                     }
                     OwnedLead::Enter {
                         scopes,
@@ -1315,6 +1468,8 @@ impl Solver<'_> {
                                     target,
                                     next_via.clone(),
                                     forward.clone(),
+                                    here.clone(),
+                                    instance.clone(),
                                 ));
                             }
                         }
@@ -1356,6 +1511,8 @@ impl Solver<'_> {
                                 ),
                                 next_via,
                                 forward.clone(),
+                                here.clone(),
+                                from_caller(&edge.site),
                             ));
                         }
                     }
@@ -1428,6 +1585,8 @@ impl Solver<'_> {
                                             target,
                                             next_via.clone(),
                                             forward.clone(),
+                                            here.clone(),
+                                            from_caller(&edge.site),
                                         ));
                                     }
                                 }
@@ -1449,6 +1608,8 @@ impl Solver<'_> {
                                                 target,
                                                 next_via.clone(),
                                                 forward.clone(),
+                                                here.clone(),
+                                                from_caller(&edge.site),
                                             ));
                                         }
                                     }
@@ -1462,6 +1623,8 @@ impl Solver<'_> {
                                                 target,
                                                 next_via.clone(),
                                                 forward.clone(),
+                                                here.clone(),
+                                                from_caller(&edge.site),
                                             ));
                                         }
                                     }
@@ -1498,7 +1661,7 @@ impl Solver<'_> {
     fn local_function_params(&self, scope: &UseNode, name: &str) -> Option<Vec<FlowPattern>> {
         let code = self.scope_code(scope)?;
         let mut params = None;
-        let mut found = |frames: &[Frame<'_>]| {
+        let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
             let frame = frames.last().expect("visited frame");
             if params.is_none()
                 && let Role::Bind(pattern) = &frame.role
@@ -1522,15 +1685,7 @@ impl Solver<'_> {
                 }
             }
         };
-        let mut frames = Vec::new();
-        match code.body {
-            ScopeBody::Statements(statements) => {
-                visit_statements(statements, &mut frames, &mut found);
-            }
-            ScopeBody::Expression(expression) => {
-                visit(expression, Role::Return, &mut frames, &mut found);
-            }
-        }
+        visit_body(&code.body, &mut found);
         params
     }
 
@@ -1568,6 +1723,60 @@ impl Solver<'_> {
             UseNode::Function(key) => self.functions[key].span.clone(),
             UseNode::Global(index) => self.globals_ir[*index].1.span.clone(),
         }
+    }
+
+    /// What a condition says a compared value is: in one of the returned sets, as for
+    /// `kind === Kind.A || kind === Kind.B`, and none of the excluded values, as after
+    /// `if (kind !== Kind.C) return;`. Only enum members count, since those are what a
+    /// condition on a selected item compares with.
+    fn guard_values(&mut self, guard: &OwnedGuard) -> (Vec<Vec<QueryValue>>, Vec<QueryValue>) {
+        let mut sets = Vec::new();
+        let mut excluded = Vec::new();
+        for comparison in comparison_sets(&guard.test, guard.holds) {
+            let (pairs, one_of) = match comparison {
+                Comparison::OneOf(pairs) => (pairs, true),
+                Comparison::NoneOf(pairs) => (pairs, false),
+            };
+            let mut values = Vec::new();
+            for (left, right) in pairs {
+                match (
+                    self.guard_constant(guard, left),
+                    self.guard_constant(guard, right),
+                ) {
+                    (Some(value), None) | (None, Some(value)) => {
+                        if !values.contains(&value) {
+                            values.push(value);
+                        }
+                    }
+                    _ => {
+                        values.clear();
+                        break;
+                    }
+                }
+            }
+            if values.is_empty() {
+                continue;
+            }
+            if one_of {
+                sets.push(values);
+            } else {
+                excluded.extend(values);
+            }
+        }
+        (sets, excluded)
+    }
+
+    /// The enum member a side of a comparison names, as in `Kind.A`.
+    fn guard_constant(&mut self, guard: &OwnedGuard, side: &FlowExpression) -> Option<QueryValue> {
+        if !matches!(
+            side.kind,
+            FlowExpressionKind::StaticMember { .. } | FlowExpressionKind::NumericEnumMember { .. }
+        ) || !is_context_free(side, &guard.locals)
+        {
+            return None;
+        }
+        let value = self.evaluate_context_free(guard.file_id, side);
+        matches!(value, QueryValue::EnumMember { .. }).then_some(value)
     }
 
     /// Names a scope binds: its parameters and every binding in its body, nested functions
@@ -1632,7 +1841,7 @@ impl Solver<'_> {
             let mut elements = Vec::new();
             let mut bound = false;
             let mut reassigned = false;
-            let mut found = |frames: &[Frame<'_>]| {
+            let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
                 let frame = frames.last().expect("visited frame");
                 match (&frame.role, &frame.expression.kind) {
                     (
@@ -1661,15 +1870,7 @@ impl Solver<'_> {
                     _ => {}
                 }
             };
-            let mut frames = Vec::new();
-            match code.body {
-                ScopeBody::Statements(statements) => {
-                    visit_statements(statements, &mut frames, &mut found);
-                }
-                ScopeBody::Expression(expression) => {
-                    visit(expression, Role::Return, &mut frames, &mut found);
-                }
-            }
+            visit_body(&code.body, &mut found);
             if !bound || reassigned || elements.is_empty() {
                 return None;
             }
@@ -1779,21 +1980,13 @@ impl Solver<'_> {
     ) -> Option<(FileId, Vec<(String, FlowExpression)>)> {
         let code = self.scope_code(user)?;
         let mut at_site = None;
-        let mut found = |frames: &[Frame<'_>]| {
+        let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
             let expression = frames.last().expect("visited frame").expression;
             if at_site.is_none() && expression.span == *site {
                 at_site = Some(expression.clone());
             }
         };
-        let mut frames = Vec::new();
-        match code.body {
-            ScopeBody::Statements(statements) => {
-                visit_statements(statements, &mut frames, &mut found);
-            }
-            ScopeBody::Expression(expression) => {
-                visit(expression, Role::Return, &mut frames, &mut found);
-            }
-        }
+        visit_body(&code.body, &mut found);
         let at_site = at_site?;
         let mut passed = Vec::new();
         for (name, (index, steps)) in parameters {
@@ -1836,6 +2029,8 @@ impl Solver<'_> {
         let mut reachability = Reachability::Unknown;
         let mut contexts = 0;
         let mut explored_factory_arguments = Vec::new();
+        // The steps of the path each explored context was created on, to match an instance.
+        let mut explored_traces = Vec::new();
         let mut explored =
             BTreeMap::<(u32, u32), (SourceSpan, Vec<BTreeMap<String, QueryValue>>)>::new();
         for capability in self
@@ -1844,6 +2039,13 @@ impl Solver<'_> {
             .filter(|capability| capability.callsite == candidate.span)
         {
             contexts += 1;
+            explored_traces.push(
+                capability
+                    .origin_trace
+                    .iter()
+                    .map(|step| (step.kind, step.span.clone()))
+                    .collect::<Vec<_>>(),
+            );
             if rank(capability.reachability) < rank(reachability) {
                 reachability = capability.reachability;
             }
@@ -1916,6 +2118,122 @@ impl Solver<'_> {
             }
             factory_arguments.insert(projection.label.clone(), values);
         }
+        let factory_arguments_resolved = factory_arguments.values().flatten().all(value_is_known);
+        // Where an argument is unresolved, what the source still says about it.
+        let mut possible_elements = BTreeMap::new();
+        let mut values_from_callers = BTreeMap::new();
+        // An argument with several possible arrays, such as a list filtered by unknown
+        // predicates, is summarized by the elements they hold.
+        for (label, values) in &factory_arguments {
+            if values.iter().map(array_count).sum::<usize>() > 1 {
+                let mut elements = Vec::new();
+                for value in values {
+                    collect_array_elements(value, &mut elements);
+                }
+                possible_elements.insert(label.clone(), elements);
+            }
+        }
+        if let Some(scope) = self.candidate_scope(candidate) {
+            for projection in &query.factory_arguments {
+                if factory_arguments
+                    .get(&projection.label)
+                    .is_some_and(|values| values.iter().all(value_is_known))
+                {
+                    continue;
+                }
+                let Some(argument) = candidate.arguments.get(projection.index) else {
+                    continue;
+                };
+                if let Some(pushed) = self.pushed_elements(&scope, argument) {
+                    let elements = possible_elements
+                        .entry(projection.label.clone())
+                        .or_insert_with(Vec::new);
+                    for element in pushed {
+                        if !elements.contains(&element) {
+                            elements.push(element);
+                        }
+                    }
+                }
+                let callers = self.values_from_callers(&scope, argument, graph);
+                if !callers.is_empty() {
+                    values_from_callers.insert(projection.label.clone(), callers);
+                }
+            }
+        }
+        // The elements of each array argument a call can apply to, before its conditions narrow
+        // them: the instance caller's value when the path went through one, else the callsite's.
+        let callsite_elements = factory_arguments
+            .iter()
+            .map(|(label, values)| {
+                let elements = possible_elements.get(label).cloned().unwrap_or_else(|| {
+                    let mut elements = Vec::new();
+                    for value in values {
+                        collect_array_elements(value, &mut elements);
+                    }
+                    elements
+                });
+                let complete = elements.iter().all(value_is_known)
+                    && (values.iter().all(value_is_known) || possible_elements.contains_key(label));
+                (label.clone(), (elements, complete))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let caller_elements = values_from_callers
+            .iter()
+            .map(|(label, callers)| {
+                let by_caller = callers
+                    .iter()
+                    .map(|caller| {
+                        let mut elements = Vec::new();
+                        collect_array_elements(&caller.value, &mut elements);
+                        (caller.caller.clone(), elements)
+                    })
+                    .collect::<Vec<_>>();
+                (label.clone(), by_caller)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut excluded_calls = Vec::new();
+        // The elements an instance requests, from the contexts explored through it: those whose
+        // path renders the instance's element, or else passes through the function holding its
+        // call.
+        let instance_elements = |span: &SourceSpan, position: usize| {
+            let exact = explored_traces
+                .iter()
+                .enumerate()
+                .filter(|(_, trace)| trace.iter().any(|(_, step)| step == span))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let matched = if exact.is_empty() {
+                explored_traces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, trace)| {
+                        trace.iter().any(|(kind, step)| {
+                            *kind == QueryCallPathKind::Call
+                                && step.file_id == span.file_id
+                                && step.start <= span.start
+                                && span.end <= step.end
+                        })
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            } else {
+                exact
+            };
+            if matched.is_empty() {
+                return None;
+            }
+            let mut elements = Vec::new();
+            for index in matched {
+                collect_array_elements(&explored_factory_arguments[index][position], &mut elements);
+            }
+            Some(elements)
+        };
+        let label_positions = query
+            .factory_arguments
+            .iter()
+            .enumerate()
+            .map(|(position, projection)| (projection.label.clone(), position))
+            .collect::<BTreeMap<_, _>>();
         let mut calls = Vec::new();
         let mut covered = BTreeSet::new();
         // A call that passes a wrapper's parameter on is replaced by the calls of the wrapper.
@@ -1986,6 +2304,75 @@ impl Solver<'_> {
                 arguments.insert(projection.label.clone(), values);
             }
             let arguments_resolved = arguments.values().flatten().all(value_is_known);
+            let instance = call
+                .instance
+                .as_ref()
+                .and_then(|span| self.query_location(span));
+            let mut guards = Vec::new();
+            let mut guards_not = Vec::new();
+            for guard in call.guards.iter() {
+                let (sets, excluded) = self.guard_values(guard);
+                for set in sets {
+                    if !guards.contains(&set) {
+                        guards.push(set);
+                    }
+                }
+                for value in excluded {
+                    if !guards_not.contains(&value) {
+                        guards_not.push(value);
+                    }
+                }
+            }
+            let mut elements = BTreeMap::new();
+            let mut elements_complete = true;
+            let mut ruled_out = false;
+            for (label, (callsite, callsite_complete)) in &callsite_elements {
+                // An instance requests its own elements; the callsite's are every instance's.
+                let source = match &call.instance {
+                    None => Some(callsite.clone()),
+                    Some(span) => instance_elements(span, label_positions[label]).or_else(|| {
+                        let location = self.query_location(span);
+                        caller_elements.get(label).and_then(|callers| {
+                            callers
+                                .iter()
+                                .find(|(caller, _)| *caller == location)
+                                .map(|(_, elements)| elements.clone())
+                        })
+                    }),
+                };
+                let complete = match &source {
+                    Some(source) if call.instance.is_none() => *callsite_complete,
+                    Some(source) => source.iter().all(value_is_known),
+                    None => false,
+                };
+                let source = source.unwrap_or_default();
+                // Conditions on members of the elements' enum say which elements reach the call.
+                let mut domain = source.clone();
+                domain.extend(callsite.iter().cloned());
+                let applicable = guards
+                    .iter()
+                    .filter(|set| guard_applies(set, &domain))
+                    .collect::<Vec<_>>();
+                let ruled = guards_not
+                    .iter()
+                    .filter(|value| guard_applies(std::slice::from_ref(value), &domain))
+                    .collect::<Vec<_>>();
+                let allowed = |element: &&QueryValue| {
+                    applicable.iter().all(|set| set.contains(element)) && !ruled.contains(element)
+                };
+                let narrowed = if complete || applicable.is_empty() {
+                    source.iter().filter(allowed).cloned().collect::<Vec<_>>()
+                } else {
+                    // Unknown elements: the conditions still bound which can reach the call.
+                    applicable[0].iter().filter(allowed).cloned().collect()
+                };
+                // A condition no requested element meets means this callsite's result cannot
+                // reach the call, as when a shared descriptor carries several hooks' callbacks.
+                let conditioned = !applicable.is_empty() || !ruled.is_empty();
+                ruled_out |= complete && conditioned && narrowed.is_empty();
+                elements_complete &= complete || !applicable.is_empty();
+                elements.insert(label.clone(), narrowed);
+            }
             // A wrapper's call ran on an explored path if the call inside the wrapper saw its
             // values there.
             let explored = match (&call.inner, explored_arguments) {
@@ -2002,14 +2389,24 @@ impl Solver<'_> {
                 }
                 (Some(_), None) => false,
             };
-            calls.push(QueryCapabilityCall {
+            let found = QueryCapabilityCall {
                 location: self.query_location(&call.span),
                 context: call.context,
                 via: call.via,
                 arguments,
                 arguments_resolved,
                 explored,
-            });
+                instance,
+                guards,
+                guards_not,
+                elements,
+                elements_complete,
+            };
+            if ruled_out {
+                excluded_calls.push(found);
+            } else {
+                calls.push(found);
+            }
         }
         // Explored invocations the walk did not reach, such as through a value it lost.
         for (key, (span, invocations)) in &explored {
@@ -2033,8 +2430,22 @@ impl Solver<'_> {
                 arguments,
                 arguments_resolved,
                 explored: true,
+                instance: None,
+                guards: Vec::new(),
+                guards_not: Vec::new(),
+                elements: callsite_elements
+                    .iter()
+                    .map(|(label, (elements, _))| (label.clone(), elements.clone()))
+                    .collect(),
+                elements_complete: callsite_elements.values().all(|(_, complete)| *complete),
             });
         }
+        let mut calls = merge_calls(calls);
+        // A call another condition context allows is not excluded.
+        let excluded_calls = merge_calls(excluded_calls)
+            .into_iter()
+            .filter(|excluded| !calls.iter().any(|call| call.location == excluded.location))
+            .collect::<Vec<_>>();
         calls.sort_by(|left, right| {
             location_key(left.location.as_ref()).cmp(&location_key(right.location.as_ref()))
         });
@@ -2070,48 +2481,6 @@ impl Solver<'_> {
         let enclosing = self
             .candidate_scope(candidate)
             .map(|scope| self.describe_node(&scope));
-        let factory_arguments_resolved = factory_arguments.values().flatten().all(value_is_known);
-        // Where an argument is unresolved, what the source still says about it.
-        let mut possible_elements = BTreeMap::new();
-        let mut values_from_callers = BTreeMap::new();
-        // An argument with several possible arrays, such as a list filtered by unknown
-        // predicates, is summarized by the elements they hold.
-        for (label, values) in &factory_arguments {
-            if values.iter().map(array_count).sum::<usize>() > 1 {
-                let mut elements = Vec::new();
-                for value in values {
-                    collect_array_elements(value, &mut elements);
-                }
-                possible_elements.insert(label.clone(), elements);
-            }
-        }
-        if let Some(scope) = self.candidate_scope(candidate) {
-            for projection in &query.factory_arguments {
-                if factory_arguments
-                    .get(&projection.label)
-                    .is_some_and(|values| values.iter().all(value_is_known))
-                {
-                    continue;
-                }
-                let Some(argument) = candidate.arguments.get(projection.index) else {
-                    continue;
-                };
-                if let Some(pushed) = self.pushed_elements(&scope, argument) {
-                    let elements = possible_elements
-                        .entry(projection.label.clone())
-                        .or_insert_with(Vec::new);
-                    for element in pushed {
-                        if !elements.contains(&element) {
-                            elements.push(element);
-                        }
-                    }
-                }
-                let callers = self.values_from_callers(&scope, argument, graph);
-                if !callers.is_empty() {
-                    values_from_callers.insert(projection.label.clone(), callers);
-                }
-            }
-        }
         QueryCallsiteValues {
             location,
             enclosing,
@@ -2125,6 +2494,7 @@ impl Solver<'_> {
             capability: QueryCapabilityUse {
                 status,
                 calls,
+                excluded_calls,
                 escapes,
             },
         }
@@ -2391,7 +2761,7 @@ type Imports = HashMap<String, String>;
 
 fn local_imports(body: &ScopeBody<'_>) -> Imports {
     let mut imports = Imports::new();
-    let mut found = |frames: &[Frame<'_>]| {
+    let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
         let frame = frames.last().expect("visited frame");
         if let (Role::Bind(pattern), FlowExpressionKind::DynamicImport { module }) =
             (&frame.role, &frame.expression.kind)
@@ -2400,13 +2770,7 @@ fn local_imports(body: &ScopeBody<'_>) -> Imports {
             imports.insert(name.clone(), module.clone());
         }
     };
-    let mut frames = Vec::new();
-    match body {
-        ScopeBody::Statements(statements) => visit_statements(statements, &mut frames, &mut found),
-        ScopeBody::Expression(expression) => {
-            visit(expression, Role::Return, &mut frames, &mut found);
-        }
-    }
+    visit_body(body, &mut found);
     imports
 }
 
@@ -2436,6 +2800,117 @@ fn read_path(expression: &FlowExpression) -> Option<(String, Vec<Step>)> {
         }
         _ => None,
     }
+}
+
+/// What a condition says about compared values: one comparison of a set holds, or none does.
+enum Comparison<'e> {
+    OneOf(Vec<(&'e FlowExpression, &'e FlowExpression)>),
+    NoneOf(Vec<(&'e FlowExpression, &'e FlowExpression)>),
+}
+
+/// The comparisons a condition implies, all of which hold together.
+fn comparison_sets(test: &FlowExpression, holds: bool) -> Vec<Comparison<'_>> {
+    match &test.kind {
+        FlowExpressionKind::StrictEquality {
+            left,
+            right,
+            negated,
+        } => {
+            let pair = vec![(left.as_ref(), right.as_ref())];
+            if holds == *negated {
+                vec![Comparison::NoneOf(pair)]
+            } else {
+                vec![Comparison::OneOf(pair)]
+            }
+        }
+        FlowExpressionKind::LogicalNot { value } => comparison_sets(value, !holds),
+        FlowExpressionKind::Logical {
+            left,
+            right,
+            operator,
+        } => match (operator, holds) {
+            // Both sides hold, or both fail.
+            (FlowLogicalOperator::And, true) | (FlowLogicalOperator::Or, false) => {
+                let mut left = comparison_sets(left, holds);
+                left.extend(comparison_sets(right, holds));
+                left
+            }
+            // One side holds, or one fails: only equalities on both sides combine.
+            (FlowLogicalOperator::Or, true) | (FlowLogicalOperator::And, false) => {
+                match (
+                    comparison_sets(left, holds).as_slice(),
+                    comparison_sets(right, holds).as_slice(),
+                ) {
+                    ([Comparison::OneOf(left)], [Comparison::OneOf(right)]) => {
+                        vec![Comparison::OneOf(
+                            left.iter().chain(right).copied().collect(),
+                        )]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            (FlowLogicalOperator::Coalesce, _) => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a condition's values are of the enum the elements are, so it says which of them can
+/// reach the code.
+fn guard_applies(set: &[QueryValue], elements: &[QueryValue]) -> bool {
+    let enum_of = |value: &QueryValue| match value {
+        QueryValue::EnumMember { enum_name, .. } => Some(enum_name.clone()),
+        _ => None,
+    };
+    let kinds = elements.iter().filter_map(enum_of).collect::<BTreeSet<_>>();
+    !set.is_empty()
+        && set
+            .iter()
+            .all(|value| enum_of(value).is_some_and(|name| kinds.contains(&name)))
+}
+
+/// Calls found at one location through several paths, as one call with the union of their
+/// values.
+fn merge_calls(calls: Vec<QueryCapabilityCall>) -> Vec<QueryCapabilityCall> {
+    let mut merged: Vec<QueryCapabilityCall> = Vec::new();
+    for call in calls {
+        let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| existing.location == call.location)
+        else {
+            merged.push(call);
+            continue;
+        };
+        let union = |into: &mut BTreeMap<String, Vec<QueryValue>>,
+                     from: BTreeMap<String, Vec<QueryValue>>| {
+            for (label, values) in from {
+                let into = into.entry(label).or_default();
+                for value in values {
+                    if !into.contains(&value) {
+                        into.push(value);
+                    }
+                }
+            }
+        };
+        union(&mut existing.arguments, call.arguments);
+        union(&mut existing.elements, call.elements);
+        for set in call.guards {
+            if !existing.guards.contains(&set) {
+                existing.guards.push(set);
+            }
+        }
+        // A value one path rules out may reach the call through another.
+        existing
+            .guards_not
+            .retain(|value| call.guards_not.contains(value));
+        existing.arguments_resolved &= call.arguments_resolved;
+        existing.elements_complete &= call.elements_complete;
+        existing.explored |= call.explored;
+        if existing.instance != call.instance {
+            existing.instance = None;
+        }
+    }
+    merged
 }
 
 /// Orders reachability from strongest to weakest.

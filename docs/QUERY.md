@@ -379,43 +379,54 @@ values. `reachability` is the strongest tier among its creations, `unknown` with
 result. The walk follows it through the source from the factory call: through destructuring and
 aliases, `useCallback`, `useMemo`, and `useRef` (whose `current` holds its argument), property
 writes such as `ref.current = value`, record and array fields, JSX props into function and class
-components (including components loaded by `lazy(() => import(...))`, a loader whose record
-argument returns `import(...)`, or a local bound to `await import(...)`, as in `<module.default />`),
+components (including components loaded by `lazy(() => import(...))`, a loader whose record argument
+returns `import(...)`, or a local bound to `await import(...)`, as in `<module.default />`),
 arguments to project functions, and `return` to each caller of a hook. A call of a parameter, such
 as `children({ apply })` or an injected `open({ onClose })`, is followed into the function each
-caller passes for it, written at the call or bound to a name, including through `useCallback`.
-Props passed next to a module import, as in `openSheet(import('./Sheet'), { onClose })`, are taken
-as props of the component the module exports; the path step names the call and module, since this
-is inferred from the call's shape. Callers match through any import name, and a name destructured
-from a namespace, as in `export const { useNotice } = web` over `import * as web`, is the
-declaration it re-exports. When a hook's or parameter's callers are not parsed, the walk asks the
-next round to parse the files that import it, within the root phase's file budget. Each call
-made with the result is in `calls`, with the functions it sits in (`context`, such as `the
-onClose prop of <Panel>`), how the result reached it (`via`, such as `prop onClose of <Panel>` or
-`returned by useNotice to Banner`), and the values of each projected invocation argument. An argument that reads no local values, such as an enum member or a literal, is
-evaluated from module bindings, so it is known even if no explored path executed the call;
-otherwise the values come from explored invocations at the same call, or are unknown with the
-reason, such as a parameter of the enclosing function. `explored` says whether an explored path
-executed the call. Passing the result as an intrinsic element's event handler is a call with an
-unknown event argument. `escapes` lists where the result went that the walk does not follow,
-such as an unknown function, a store, a property write, a component it cannot resolve, or a hook
-whose callers are not in the parsed files. `status` is `called`, `called_with_unknown_arguments`,
-`escapes`, `not_called` (used, for example passed to code that ignores it, but never called), or
-`unused` (not bound, or bound and never used). For an array argument with several possible
-arrays, such as a list filtered by conditions the model cannot decide, `possible_elements` lists
-the elements they hold; the text output and the HTML report show that list and the number of
-arrays instead of every array when there are more than four. Where a factory argument stays
-unresolved, `possible_elements` also lists what a local array built from literal elements and
-`push` calls may contain, such as the types pushed under conditions too many to keep as separate
-arrays, and
-`values_from_callers` gives the argument's value with what each caller passes, when it reads only
-the enclosing function's parameters and a caller passes values that do not depend on its own
-locals; up to 32 callers are evaluated, one level up. A function that passes its own parameter
-on, such as `(kind = Kind.DEFAULT) => { track(); apply(kind); }`, is a wrapper: the walk follows
-the wrapper too, and each call of it reports the value it passes, or the parameter's default when
-it passes none, in place of the call inside the wrapper. Such a call counts as `explored` when the
-call inside the wrapper saw its values on an explored path. The walk visits at most 400 scope and
-target pairs and 8 scope changes per callsite.
+caller passes for it, written at the call or bound to a name, including through `useCallback`. Props
+passed next to a module import, as in `openSheet(import('./Sheet'), { onClose })`, are taken as
+props of the component the module exports; the path step names the call and module, since this is
+inferred from the call's shape. Callers match through any import name, and a name destructured from
+a namespace, as in `export const { useNotice } = web` over `import * as web`, is the declaration it
+re-exports. When a hook's or parameter's callers are not parsed, the walk asks the next round to
+parse the files that import it, within the root phase's file budget. Each call made with the result
+is in `calls`, with the functions it sits in (`context`, such as `the onClose prop of <Panel>`), how
+the result reached it (`via`, such as `prop onClose of <Panel>` or `returned by useNotice to
+Banner`), and the values of each projected invocation argument. An argument that reads no local
+values, such as an enum member or a literal, is evaluated from module bindings, so it is known even
+if no explored path executed the call; otherwise the values come from explored invocations at the
+same call, or are unknown with the reason, such as a parameter of the enclosing function. `explored`
+says whether an explored path executed the call. Passing the result as an intrinsic element's event
+handler is a call with an unknown event argument. `escapes` lists where the result went that the
+walk does not follow, such as an unknown function, a store, a property write, a component it cannot
+resolve, or a hook whose callers are not in the parsed files. `status` is `called`,
+`called_with_unknown_arguments`, `escapes`, `not_called` (used, for example passed to code that
+ignores it, but never called), or `unused` (not bound, or bound and never used). For an array
+argument with several possible arrays, such as a list filtered by conditions the model cannot
+decide, `possible_elements` lists the elements they hold; the text output and the HTML report show
+that list and the number of arrays instead of every array when there are more than four. Where a
+factory argument stays unresolved, `possible_elements` also lists what a local array built from
+literal elements and `push` calls may contain, such as the types pushed under conditions too many to
+keep as separate arrays, and `values_from_callers` gives the argument's value with what each caller
+passes, when it reads only the enclosing function's parameters and a caller passes values that do
+not depend on its own locals; up to 32 callers are evaluated, one level up. Each call also says
+which elements of an array factory argument it can apply to, in `elements`. The walk keeps the
+conditions each step of the path runs under: `if` branches, the code after an early return, `?:`
+branches, and the right side of `&&` and `||`. A condition that compares with members of the
+elements' enum, such as `case Kind.A:` or `visible === Kind.A`, narrows them; `guards` lists the
+sets one compared value must be in, and `guards_not` the members ruled out, as by `if (visible !==
+Kind.A) return`. When the result left the callsite's scope through a caller, such as the element
+that renders a wrapper with a function child, `instance` is that caller site, and the elements start
+from what that instance requests: the contexts explored through it, or a literal it passes.
+`elements_complete` is false when those elements are not all known; the conditions still bound them.
+A call whose conditions match no element the callsite requests cannot be reached with this
+callsite's result, as when a shared descriptor carries several hooks' callbacks and a switch picks
+the component, and moves to `excluded_calls`. A function that passes its own parameter on, such as
+`(kind = Kind.DEFAULT) => { track(); apply(kind); }`, is a wrapper: the walk follows the wrapper
+too, and each call of it reports the value it passes, or the parameter's default when it passes
+none, in place of the call inside the wrapper. Such a call counts as `explored` when the call inside
+the wrapper saw its values on an explored path. The walk visits at most 400 scope and target pairs
+and 8 scope changes per callsite.
 
 Snapshot reuse is not implemented yet.
 

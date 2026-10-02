@@ -388,6 +388,18 @@ fn print_callsite_values(report: &QueryReport) {
                 .collect::<Vec<_>>()
                 .join(", ");
             let mut notes = Vec::new();
+            for (label, elements) in &call.elements {
+                let shown = elements
+                    .iter()
+                    .map(render_query_value)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                notes.push(if call.elements_complete {
+                    format!("for {label} {shown}")
+                } else {
+                    format!("for {label} {shown} (incomplete)")
+                });
+            }
             if let Some(context) = call.context.first() {
                 notes.push(format!("in {context}"));
             }
@@ -405,6 +417,18 @@ fn print_callsite_values(report: &QueryReport) {
                 } else {
                     format!(" ({})", notes.join("; "))
                 }
+            );
+        }
+        for call in &callsite.capability.excluded_calls {
+            let guards = call
+                .guards
+                .iter()
+                .map(|set| values(set))
+                .collect::<Vec<_>>()
+                .join("; ");
+            println!(
+                "      excluded call at {}: its conditions ({guards}) match nothing this callsite requests",
+                place(call.location.as_ref())
             );
         }
         for escape in &callsite.capability.escapes {

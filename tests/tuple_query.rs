@@ -1073,6 +1073,106 @@ fn pushes_through_record_properties_reach_the_factory_argument() {
 }
 
 #[test]
+fn conditions_on_the_path_attribute_calls_to_the_items_they_test() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/kinds.ts",
+            "export enum Kind { A = 1, B = 2, C = 3, D = 4 }",
+        ),
+        (
+            "src/Selected.tsx",
+            "import { useItemSelection } from './hook'; export default function Selected({ items, children }) { const [visible, apply] = useItemSelection(items); return <>{children({ visible, apply })}</>; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Kind } from './kinds'; import { pick } from 'external-pick'; import { useItemSelection } from './hook'; import Selected from './Selected'; function NoticeA({ onClose }) { return <button onClick={() => onClose('a')} />; } function NoticeD({ onClose }) { return <button onClick={() => onClose('d')} />; } function Tooltips({ descriptor }) { switch (descriptor.kind) { case Kind.A: return <NoticeA onClose={descriptor.close} />; case Kind.D: return <NoticeD onClose={descriptor.close} />; default: return null; } } function Header() { const [visible, apply] = useItemSelection([Kind.A, Kind.B]); const [, applyOther] = pick(); const descriptor = visible != null ? { kind: visible, close: apply } : { kind: Kind.D, close: applyOther }; if (visible !== Kind.B) { return <Tooltips descriptor={descriptor} />; } return <button onClick={() => apply('b')} />; } function Notices() { return <Selected items={[Kind.C, Kind.D]}>{({ visible, apply }) => { if (visible === Kind.C) { return <button onClick={() => apply('c')} />; } return <button onClick={() => apply('other')} />; }}</Selected>; } export function App() { return <div><Header /><Notices /></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let names = |values: &[QueryValue]| {
+        let mut names = Vec::new();
+        for value in values {
+            collect_enum_members(value, &mut names);
+        }
+        names
+    };
+    let summary = |calls: &[code_flow::query::QueryCapabilityCall]| {
+        let mut rows = calls
+            .iter()
+            .map(|call| {
+                let QueryValue::String { value } = &call.arguments["action"][0] else {
+                    panic!("{:?}", call.arguments);
+                };
+                (value.clone(), names(&call.elements["items"]))
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    let header = report
+        .callsites
+        .iter()
+        .find(|callsite| {
+            callsite
+                .enclosing
+                .as_deref()
+                .is_some_and(|name| name.starts_with("Header "))
+        })
+        .expect("header callsite");
+    // The switch case for `Kind.D` renders another hook's callback, so this callsite's result,
+    // which only ever selects A or B, cannot reach it; the early return rules B out of the case
+    // for A.
+    assert_eq!(
+        summary(&header.capability.calls),
+        [
+            ("a".to_owned(), vec!["A".to_owned()]),
+            ("b".to_owned(), vec!["B".to_owned()]),
+        ]
+    );
+    assert_eq!(
+        summary(&header.capability.excluded_calls),
+        [("d".to_owned(), Vec::<String>::new())]
+    );
+    // A wrapper's calls take the items of the instance that renders it, narrowed by the
+    // conditions in its function child.
+    let selected = report
+        .callsites
+        .iter()
+        .find(|callsite| {
+            callsite
+                .enclosing
+                .as_deref()
+                .is_some_and(|name| name.starts_with("Selected "))
+        })
+        .expect("wrapper callsite");
+    assert_eq!(
+        summary(&selected.capability.calls),
+        [
+            ("c".to_owned(), vec!["C".to_owned()]),
+            ("other".to_owned(), vec!["D".to_owned()]),
+        ]
+    );
+    assert!(
+        selected
+            .capability
+            .calls
+            .iter()
+            .all(|call| call.instance.is_some()),
+        "{:?}",
+        selected.capability.calls
+    );
+}
+
+#[test]
 fn calls_of_a_wrapper_that_forwards_its_parameter_give_the_argument() {
     let fixture = TestProject::new(&[
         HOOK,
