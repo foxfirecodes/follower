@@ -2144,6 +2144,15 @@ impl<'a> Solver<'a> {
                     );
                     return self.invoke_value(callback, Vec::new(), expression.span.clone());
                 }
+                if let Some(api) = self.react_api_call(file_id, callee, environment) {
+                    return self.eval_react_api(
+                        api,
+                        arguments,
+                        environment,
+                        file_id,
+                        &expression.span,
+                    );
+                }
                 if let Some(kind) = self.known_hook_call(file_id, callee) {
                     match kind {
                         "useMemo" => {
@@ -2459,6 +2468,281 @@ impl<'a> Solver<'a> {
                 left_version.max(right_version)
                     + u64::from(left_version != baseline || right_version != baseline),
             );
+        }
+    }
+
+    /// Whether `local` in `file_id` is imported from one of `modules`, and under which name.
+    fn imported_from(&self, file_id: FileId, local: &str, modules: &[&str]) -> Option<String> {
+        self.symbol_linker
+            .file(file_id)?
+            .flow
+            .imports
+            .iter()
+            .find_map(|import| {
+                (import.local == local
+                    && !import.type_only
+                    && modules.contains(&import.module.as_str()))
+                .then(|| import.imported.clone())
+            })
+    }
+
+    /// Recognizes React element and children APIs, `createPortal`, and `Object.assign` calls.
+    fn react_api_call(
+        &self,
+        file_id: FileId,
+        callee: &FlowExpression,
+        environment: &Environment,
+    ) -> Option<&'static str> {
+        let element_api = |name: &str| match name {
+            "createElement" => Some("createElement"),
+            "cloneElement" => Some("cloneElement"),
+            "isValidElement" => Some("isValidElement"),
+            _ => None,
+        };
+        let children_api = |name: &str| match name {
+            "only" => Some("Children.only"),
+            "toArray" => Some("Children.toArray"),
+            "map" => Some("Children.map"),
+            "forEach" => Some("Children.forEach"),
+            "count" => Some("Children.count"),
+            _ => None,
+        };
+        let namespace = |name: &str, module: &[&str]| {
+            self.imported_from(file_id, name, module)
+                .is_some_and(|imported| imported == "*" || imported == "default")
+        };
+        match &callee.kind {
+            FlowExpressionKind::Identifier { name, .. } => {
+                if let Some(imported) = self.imported_from(file_id, name, &["react"]) {
+                    return element_api(&imported);
+                }
+                if let Some(imported) = self.imported_from(
+                    file_id,
+                    name,
+                    &["react/jsx-runtime", "react/jsx-dev-runtime"],
+                ) {
+                    return matches!(imported.as_str(), "jsx" | "jsxs" | "jsxDEV").then_some("jsx");
+                }
+                (self.imported_from(file_id, name, &["react-dom"]).as_deref()
+                    == Some("createPortal"))
+                .then_some("createPortal")
+            }
+            FlowExpressionKind::StaticMember { object, property } => match &object.kind {
+                FlowExpressionKind::Identifier { name, .. } => {
+                    if namespace(name, &["react"]) {
+                        return element_api(property);
+                    }
+                    if self.imported_from(file_id, name, &["react"]).as_deref() == Some("Children")
+                    {
+                        return children_api(property);
+                    }
+                    if namespace(name, &["react-dom"]) && property == "createPortal" {
+                        return Some("createPortal");
+                    }
+                    (name == "Object"
+                        && property == "assign"
+                        && !environment.contains_key("Object")
+                        && self.symbol_linker.file(file_id).is_some_and(|file| {
+                            file.flow
+                                .imports
+                                .iter()
+                                .all(|import| import.local != "Object")
+                        })
+                        && self
+                            .symbol_linker
+                            .resolve_local_declaration(file_id, "Object")
+                            .is_none())
+                    .then_some("Object.assign")
+                }
+                FlowExpressionKind::StaticMember {
+                    object: inner,
+                    property: children,
+                } if children == "Children" => match &inner.kind {
+                    FlowExpressionKind::Identifier { name, .. } if namespace(name, &["react"]) => {
+                        children_api(property)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Evaluates a recognized React API or `Object.assign` call.
+    fn eval_react_api(
+        &mut self,
+        api: &str,
+        arguments: &[FlowExpression],
+        environment: &Environment,
+        file_id: FileId,
+        span: &SourceSpan,
+    ) -> TrackedValue {
+        let values = arguments
+            .iter()
+            .map(|argument| self.eval(argument, environment, file_id))
+            .collect::<Vec<_>>();
+        let argument = |index: usize| {
+            values
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined))
+        };
+        match api {
+            "createElement" | "jsx" => {
+                let component = argument(0);
+                let component = match &component.value {
+                    AbstractValue::String(name) => {
+                        TrackedValue::plain(AbstractValue::Intrinsic(name.clone()))
+                    }
+                    _ => component,
+                };
+                let mut props = match self.materialize(&argument(1)).value {
+                    AbstractValue::Record(fields) => Rc::unwrap_or_clone(fields),
+                    AbstractValue::Null | AbstractValue::Undefined => RecordFields::default(),
+                    _ => RecordFields {
+                        fields: BTreeMap::new(),
+                        open: Some("create_element_props_unknown".to_owned()),
+                    },
+                };
+                if api == "createElement" {
+                    match &values.get(2..).unwrap_or_default() {
+                        [] => {}
+                        [child] => {
+                            props.insert("children".to_owned(), child.clone());
+                        }
+                        children => {
+                            props.insert(
+                                "children".to_owned(),
+                                TrackedValue::plain(AbstractValue::array(children.to_vec())),
+                            );
+                        }
+                    }
+                }
+                TrackedValue::plain(AbstractValue::element(ElementValue {
+                    component: Box::new(component),
+                    props,
+                    span: span.clone(),
+                    trace: self.trace.clone(),
+                    tag: None,
+                }))
+            }
+            "cloneElement" => {
+                let AbstractValue::Element(element) = argument(0).value else {
+                    self.render_escaped_jsx(values.iter(), span);
+                    return TrackedValue::unknown("clone_of_unknown_element");
+                };
+                let mut element = Rc::unwrap_or_clone(element);
+                match self.materialize(&argument(1)).value {
+                    AbstractValue::Record(fields) => {
+                        element.props.open = element.props.open.take().or(fields.open.clone());
+                        element.props.extend(
+                            fields
+                                .iter()
+                                .map(|(name, value)| (name.clone(), value.clone())),
+                        );
+                    }
+                    AbstractValue::Null | AbstractValue::Undefined => {}
+                    _ => element.props.open = Some("clone_element_props_unknown".to_owned()),
+                }
+                match values.get(2..).unwrap_or_default() {
+                    [] => {}
+                    [child] => {
+                        element.props.insert("children".to_owned(), child.clone());
+                    }
+                    children => {
+                        element.props.insert(
+                            "children".to_owned(),
+                            TrackedValue::plain(AbstractValue::array(children.to_vec())),
+                        );
+                    }
+                }
+                element.span = span.clone();
+                TrackedValue::plain(AbstractValue::element(element))
+            }
+            "isValidElement" => match argument(0).value {
+                AbstractValue::Element(_) => TrackedValue::plain(AbstractValue::Boolean(true)),
+                AbstractValue::Null
+                | AbstractValue::Undefined
+                | AbstractValue::String(_)
+                | AbstractValue::Number(_)
+                | AbstractValue::Boolean(_) => TrackedValue::plain(AbstractValue::Boolean(false)),
+                _ => TrackedValue::unknown("is_valid_element_unknown"),
+            },
+            // A portal renders its children elsewhere in the document.
+            "createPortal" | "Children.only" => argument(0),
+            "Children.toArray" => {
+                let mut children = Vec::new();
+                flatten_children(&argument(0), &mut children);
+                TrackedValue::plain(AbstractValue::array(children))
+            }
+            "Children.count" => {
+                let mut children = Vec::new();
+                if flatten_children(&argument(0), &mut children) {
+                    TrackedValue::plain(AbstractValue::Number(
+                        i64::try_from(children.len()).unwrap_or(i64::MAX),
+                    ))
+                } else {
+                    TrackedValue::unknown("children_count_unknown")
+                }
+            }
+            "Children.map" | "Children.forEach" => {
+                let mut children = Vec::new();
+                flatten_children(&argument(0), &mut children);
+                let callback = argument(1);
+                let results = children
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, child)| {
+                        self.invoke_value(
+                            callback.clone(),
+                            vec![
+                                child,
+                                TrackedValue::plain(AbstractValue::Number(
+                                    i64::try_from(index).unwrap_or(i64::MAX),
+                                )),
+                            ],
+                            span.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if api == "Children.map" {
+                    TrackedValue::plain(AbstractValue::array(results))
+                } else {
+                    TrackedValue::plain(AbstractValue::Undefined)
+                }
+            }
+            "Object.assign" => {
+                let target = self.materialize(&argument(0));
+                match target.value {
+                    AbstractValue::Record(fields) => {
+                        let mut record = Rc::unwrap_or_clone(fields);
+                        for source in values.iter().skip(1) {
+                            let source = self.materialize(source);
+                            spread_into_record(&mut record, &source);
+                        }
+                        let merged = AbstractValue::Record(Rc::new(record));
+                        if let Some(id) = target.heap_id {
+                            self.bump_heap(id, merged.clone());
+                        }
+                        TrackedValue {
+                            value: merged,
+                            ..target
+                        }
+                    }
+                    // Statics assigned onto a component do not change how it renders.
+                    AbstractValue::Function(_) | AbstractValue::Closure(_) => target,
+                    _ => {
+                        self.mark_values_unresolved(
+                            values.iter(),
+                            "Object.assign target is not a known record",
+                            span.clone(),
+                        );
+                        TrackedValue::unknown("object_assign_unknown_target")
+                    }
+                }
+            }
+            _ => TrackedValue::unknown("unmodeled_react_api"),
         }
     }
 
@@ -2975,7 +3259,8 @@ impl<'a> Solver<'a> {
                         FlowJsxTag::Member { property, .. } => Some(property.as_str()),
                         _ => None,
                     };
-                    self.linked_component_consumer(file_id, name, member)
+                    self.react_builtin_component(file_id, name, member)
+                        .or_else(|| self.linked_component_consumer(file_id, name, member))
                 }),
             _ => None,
         };
@@ -3157,6 +3442,35 @@ impl<'a> Solver<'a> {
         if props.open.is_none() {
             props.open.clone_from(&defaults.open);
         }
+    }
+
+    /// React's built-in wrappers render their children: `Fragment`, `Suspense`, `StrictMode`, and
+    /// `Profiler`, imported by name or read from the `react` module.
+    fn react_builtin_component(
+        &self,
+        file_id: FileId,
+        local: &str,
+        member: Option<&str>,
+    ) -> Option<ComponentConsumer> {
+        let imported = self.imported_from(file_id, local, &["react"])?;
+        let export = match member {
+            Some(member) if imported == "*" || imported == "default" => member.to_owned(),
+            Some(_) => return None,
+            None => imported,
+        };
+        matches!(
+            export.as_str(),
+            "Fragment" | "Suspense" | "StrictMode" | "Profiler"
+        )
+        .then(|| ComponentConsumer {
+            module: "react".to_owned(),
+            export,
+            forward_children: true,
+            invoke_children: false,
+            render_props: Vec::new(),
+            render_callback_names: Vec::new(),
+            component_props: Vec::new(),
+        })
     }
 
     /// Finds a configured consumer whose module and export the tag's import chain passes through,
@@ -3484,6 +3798,9 @@ impl<'a> Solver<'a> {
                     }
                 }
                 if self.current_reachability != Reachability::Unknown {
+                    if let Some(tag) = element.tag.clone() {
+                        self.request_component_factory(&tag);
+                    }
                     self.render_through_unmodeled_component(&element, &[]);
                 }
             }
@@ -3549,6 +3866,30 @@ impl<'a> Solver<'a> {
             self.assumed_component_renders.remove(&memo_key);
         }
         self.trace = previous_trace;
+    }
+
+    /// Requests the module of the call that initializes a rendered component, as in
+    /// `const Scroller = createList(...)`, so a parsed factory can model the component.
+    fn request_component_factory(&mut self, tag: &TagOrigin) {
+        let ValueResolution::Resolved(LinkedValue::Declaration(symbol)) =
+            self.symbol_linker.resolve_binding(tag.file_id, &tag.local)
+        else {
+            return;
+        };
+        let Some(index) = self.global_bindings.get(&symbol).copied() else {
+            return;
+        };
+        let (file_id, binding) = self.globals_ir[index];
+        let FlowExpressionKind::Call { callee, .. } = &binding.value.kind else {
+            return;
+        };
+        let Some(local) = imported_callee_local(callee) else {
+            return;
+        };
+        for path in self.symbol_linker.unparsed_link_targets(file_id, local) {
+            self.request_root_import(&path);
+            self.requested_imports.insert(path);
+        }
     }
 
     /// Records one site of a boundary and returns its key.
@@ -5109,11 +5450,7 @@ impl<'a> Solver<'a> {
         span: SourceSpan,
     ) {
         self.uncertainty_events += 1;
-        let mut ids = values
-            .flat_map(|value| self.value_capability_ids(value))
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids.dedup();
+        let ids = self.values_capability_ids(values);
         for capability in ids {
             let origin = self.capabilities[capability].origin;
             let evidence = self.push_evidence(
@@ -5136,16 +5473,30 @@ impl<'a> Solver<'a> {
     }
 
     fn value_capability_ids(&self, value: &TrackedValue) -> Vec<usize> {
-        let mut ids = capability_ids(value);
+        self.values_capability_ids(std::iter::once(value))
+    }
+
+    /// Capabilities reachable from values, including through module globals of namespaces they
+    /// hold. Namespaces are gathered first so the module graph and globals are walked once.
+    fn values_capability_ids<'b>(
+        &self,
+        values: impl Iterator<Item = &'b TrackedValue>,
+    ) -> Vec<usize> {
+        let mut ids = Vec::new();
         let mut namespaces = BTreeSet::new();
-        collect_namespace_ids(value, &mut namespaces);
-        let mut modules = BTreeSet::new();
-        for namespace in namespaces {
-            self.module_initialization_order(namespace, &mut modules, &mut Vec::new());
+        for value in values {
+            collect_capability_ids(value, &mut ids);
+            collect_namespace_ids(value, &mut namespaces);
         }
-        for (symbol, value) in &self.globals {
-            if modules.contains(&symbol.file_id) {
-                ids.extend(capability_ids(value));
+        if !namespaces.is_empty() {
+            let mut modules = BTreeSet::new();
+            for namespace in namespaces {
+                self.module_initialization_order(namespace, &mut modules, &mut Vec::new());
+            }
+            for (symbol, value) in &self.globals {
+                if modules.contains(&symbol.file_id) {
+                    collect_capability_ids(value, &mut ids);
+                }
             }
         }
         ids.sort_unstable();
@@ -6306,6 +6657,32 @@ fn collect_defined_alternatives(value: &TrackedValue, alternatives: &mut Vec<Tra
             }
         }
         _ => alternatives.push(value.clone()),
+    }
+}
+
+/// Collects children as React's `Children` helpers see them: nested arrays are flattened and
+/// `null`, `undefined`, and booleans are skipped. Returns whether the list is exact.
+fn flatten_children(value: &TrackedValue, children: &mut Vec<TrackedValue>) -> bool {
+    match &value.value {
+        AbstractValue::Null | AbstractValue::Undefined | AbstractValue::Boolean(_) => true,
+        AbstractValue::Array(values) => {
+            // Every element is collected, so the walk must not stop at an inexact one.
+            let mut exact = true;
+            for value in values.iter() {
+                exact &= flatten_children(value, children);
+            }
+            exact
+        }
+        AbstractValue::Union(_)
+        | AbstractValue::Unknown(_)
+        | AbstractValue::AssumedWrapper { .. } => {
+            children.push(value.clone());
+            false
+        }
+        _ => {
+            children.push(value.clone());
+            true
+        }
     }
 }
 

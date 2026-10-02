@@ -2,6 +2,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 use oxc_resolver::{ResolveOptions, Resolver};
@@ -159,6 +160,15 @@ pub struct SymbolLinker<'a> {
     /// Text of resolved modules outside the snapshot, read only to rule out exports.
     unparsed_sources: RefCell<HashMap<PathBuf, Option<UnparsedSource>>>,
     may_export: RefCell<HashMap<(PathBuf, String), bool>>,
+    /// Linkage walks of local bindings, which cannot change while the snapshot is fixed.
+    links: RefCell<HashMap<(FileId, String), Rc<LinkOutcome>>>,
+}
+
+/// The result of linking one local binding.
+struct LinkOutcome {
+    resolution: ValueResolution,
+    unparsed: BTreeSet<PathBuf>,
+    exports: Vec<(String, String)>,
 }
 
 struct UnparsedSource {
@@ -219,6 +229,7 @@ impl<'a> SymbolLinker<'a> {
             resolutions_by_importer,
             unparsed_sources: RefCell::new(HashMap::new()),
             may_export: RefCell::new(HashMap::new()),
+            links: RefCell::new(HashMap::new()),
         }
     }
 
@@ -337,22 +348,36 @@ impl<'a> SymbolLinker<'a> {
     }
 
     pub fn resolve_binding(&self, file_id: FileId, local: &str) -> ValueResolution {
-        let Some(file) = self.file(file_id) else {
-            return ValueResolution::Unresolved;
-        };
-        self.resolve_local_binding(file, local, &mut LinkWalk::default())
+        self.link(file_id, local).resolution.clone()
+    }
+
+    fn link(&self, file_id: FileId, local: &str) -> Rc<LinkOutcome> {
+        let key = (file_id, local.to_owned());
+        if let Some(outcome) = self.links.borrow().get(&key) {
+            return Rc::clone(outcome);
+        }
+        let mut walk = LinkWalk::default();
+        let resolution = self
+            .file(file_id)
+            .map_or(ValueResolution::Unresolved, |file| {
+                self.resolve_local_binding(file, local, &mut walk)
+            });
+        let outcome = Rc::new(LinkOutcome {
+            resolution,
+            unparsed: walk.unparsed,
+            exports: walk.exports,
+        });
+        self.links.borrow_mut().insert(key, Rc::clone(&outcome));
+        outcome
     }
 
     /// Returns resolved modules outside the snapshot that linking `local` in `file_id` reached.
     /// Parsing them is what an unresolved binding needs; the set is empty when the binding links
     /// or fails for another reason.
     pub fn unparsed_link_targets(&self, file_id: FileId, local: &str) -> BTreeSet<PathBuf> {
-        let Some(file) = self.file(file_id) else {
-            return BTreeSet::new();
-        };
-        let mut walk = LinkWalk::default();
-        if self.resolve_local_binding(file, local, &mut walk) == ValueResolution::Unresolved {
-            walk.unparsed
+        let outcome = self.link(file_id, local);
+        if outcome.resolution == ValueResolution::Unresolved {
+            outcome.unparsed.clone()
         } else {
             BTreeSet::new()
         }
@@ -362,12 +387,7 @@ impl<'a> SymbolLinker<'a> {
     /// in `file_id` passes through: the import itself, then re-exports on branches that may provide
     /// the binding. A contract on any of them applies to the binding.
     pub fn linked_exports(&self, file_id: FileId, local: &str) -> Vec<(String, String)> {
-        let Some(file) = self.file(file_id) else {
-            return Vec::new();
-        };
-        let mut walk = LinkWalk::default();
-        self.resolve_local_binding(file, local, &mut walk);
-        walk.exports
+        self.link(file_id, local).exports.clone()
     }
 
     pub fn resolve_exported_value(&self, file_id: FileId, name: &str) -> ValueResolution {

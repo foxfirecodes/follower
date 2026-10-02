@@ -122,7 +122,8 @@ are not yet cached across separate CLI runs. One module resolver, with its files
 canonical-path caches, serves the whole query run, so files must not change while it runs. During
 each solver pass, module environments and resolved import links are reused; environments are
 invalidated when module globals initialize. Symbol linkage and the solver use per-snapshot file
-and import-resolution indexes instead of repeatedly scanning the snapshot. Solver values share closures, records, arrays, unions, and JSX elements and copy them only on
+and import-resolution indexes instead of repeatedly scanning the snapshot, and each local
+binding's linkage walk is computed once per solver pass. Solver values share closures, records, arrays, unions, and JSX elements and copy them only on
 write, so branch joins and calls do not deep-copy captured environments. While an unknown branch
 runs, heap writes record the value they replaced; the branch is rewound from that record, and the
 join visits only the heap entries either side wrote rather than the whole heap. Set
@@ -246,7 +247,8 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   that receives a component, such as an unmodeled higher-order component, returns a value that may
   render that component with the element's props. When a root path renders such a value, the
   root phase requests the callee's module, so a parsed higher-order component can replace the
-  assumption on the next round. Under an assumption, a component is explored
+  assumption on the next round. The same applies to a rendered component whose declaration is
+  initialized by a call, such as `const Scroller = createList(...)`. Under an assumption, a component is explored
   only if the backward use walk found it on a use chain toward a factory callsite (or, when no walk
   ran, if its file is on the entry corridor), or if it receives JSX or callbacks. If the walk stops
   at its budget, components it did not reach can be skipped; the stop is reported as a gap. A
@@ -335,7 +337,11 @@ selection, arrays and finite spreads, exact string/boolean/numeric-enum strict-e
 null comparisons, logical expressions, conditional expressions, finite-array `.map` and `.filter`,
 `Object.values` on known records, local `.push`, object literal spreads, destructuring and
 parameter defaults, `defaultProps`, JSX component props/children/spreads,
-React `useMemo`, `useCallback`, `useState`, `memo`, `forwardRef`, and `createContext`, prop renaming, wrapper callbacks, simple
+React `useMemo`, `useCallback`, `useState`, `memo`, `forwardRef`, and `createContext`,
+`createElement` (and `jsx`/`jsxs` from `react/jsx-runtime`), `cloneElement`, `isValidElement`,
+`Children.only`/`toArray`/`map`/`forEach`/`count`, `react-dom` `createPortal`, the built-in
+`Fragment`, `Suspense`, `StrictMode`, and `Profiler` wrappers, `Object.assign` onto records and
+components, prop renaming, wrapper callbacks, simple
 identifier reassignment, and intrinsic `onClick` handlers. Factory matching and ordinary
 function/component calls, enums, and module values use canonical identities across named import
 aliases, explicit renamed re-exports, local imported-then-exported aliases, `export *` chains,

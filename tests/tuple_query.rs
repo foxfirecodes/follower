@@ -380,6 +380,52 @@ fn default_props_fill_missing_class_and_function_component_props() {
 }
 
 #[test]
+fn react_element_and_children_apis_keep_paths_exact() {
+    let (exact, other) = exact_actions(&[(
+        "src/App.tsx",
+        "import * as React from 'react'; import { createPortal } from 'react-dom'; import { Leaf } from './Leaf'; function Only({ children }) { return React.Children.only(children); } function Portal({ children }) { return createPortal(children, null); } function Each({ children }) { return <div>{React.Children.map(children, (child) => React.cloneElement(child, { action: 'mapped' }))}</div>; } function Base(props) { return <Leaf {...props} />; } const Themed = Object.assign(Base, { Overlay: Base }); export function App() { return <React.Suspense fallback={null}><Only><Leaf action='only' /></Only><Portal><Leaf action='portal' /></Portal><Each><Leaf action='original' /></Each>{React.createElement(Leaf, { action: 'created' })}<Themed action='assigned' /></React.Suspense>; }",
+    )]);
+    assert_eq!(
+        exact,
+        ["assigned", "created", "mapped", "only", "portal"],
+        "{other:?}"
+    );
+}
+
+#[test]
+fn root_path_parses_the_factory_that_creates_a_rendered_component() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        LEAF,
+        (
+            "src/panelFactory.tsx",
+            "export function createPanel(className) { return function Panel({ children }) { return <section className={className}>{children}</section>; }; }",
+        ),
+        (
+            "src/design.tsx",
+            "import { createPanel } from './panelFactory'; export const Panel = createPanel('panel');",
+        ),
+        (
+            "src/App.tsx",
+            "import { Panel } from './design'; import { Leaf } from './Leaf'; export function App() { return <Panel><Leaf /></Panel>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", TUPLE_QUERY);
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1, "{:?}", report.coverage.gaps);
+    assert_eq!(
+        report.creations[0].reachability,
+        Reachability::Reachable,
+        "{:?}",
+        report.component_boundaries
+    );
+}
+
+#[test]
 fn component_boundaries_suggest_contracts_that_make_creations_reachable() {
     let fixture = TestProject::new(&[
         HOOK,
