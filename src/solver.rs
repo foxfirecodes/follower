@@ -1702,12 +1702,64 @@ impl<'a> Solver<'a> {
         let FlowExpressionKind::StaticMember { object, property } = &callee.kind else {
             return false;
         };
-        let FlowExpressionKind::Identifier { name, .. } = &object.kind else {
+        let Some((name, path)) = local_path(object) else {
             return false;
         };
+        if !environment.contains_key(&name) {
+            return false;
+        }
+        // Other methods that change an array in place leave its value unknown.
+        if ARRAY_MUTATORS.contains(&property.as_str()) && property != "push" {
+            for argument in arguments {
+                self.eval(argument, environment, file_id);
+            }
+            self.record_coverage_gap(
+                "array changed in place by an unmodeled method",
+                &expression.span,
+            );
+            self.write_path(
+                &name,
+                &path,
+                TrackedValue::unknown("array_changed_in_place"),
+                environment,
+                expression.span.clone(),
+            );
+            return true;
+        }
         if property != "push" {
             return false;
         }
+        if !path.is_empty() {
+            // `record.items.push(value)` appends to the array at that property.
+            let previous = self.eval(object, environment, file_id);
+            let previous = self.materialize(&previous);
+            let added = arguments
+                .iter()
+                .map(|argument| self.eval(argument, environment, file_id))
+                .collect::<Vec<_>>();
+            let value = if let Some(value) = append_array_values(&previous.value, &added) {
+                TrackedValue {
+                    value,
+                    evidence: previous.evidence,
+                    choice: previous.choice.clone(),
+                    heap_id: previous.heap_id,
+                }
+            } else {
+                self.mark_values_unresolved(
+                    std::iter::once(&previous).chain(added.iter()),
+                    "array push receiver is not a finite local array",
+                    expression.span.clone(),
+                );
+                self.record_coverage_gap(
+                    "array push receiver is not a finite local array",
+                    &expression.span,
+                );
+                TrackedValue::unknown("array_push_receiver_not_finite")
+            };
+            self.write_path(&name, &path, value, environment, expression.span.clone());
+            return true;
+        }
+        let name = &name;
         let Some(previous) = environment.get(name).map(|value| self.materialize(value)) else {
             return false;
         };
@@ -1752,6 +1804,94 @@ impl<'a> Solver<'a> {
             self.bump_heap(id, value);
         }
         true
+    }
+
+    /// Writes a value at a property path under a local binding, as for `record.a.b = value`,
+    /// rebuilding the records on the path and keeping their heap identities current. A path
+    /// through something other than known records leaves the binding unresolved.
+    fn write_path(
+        &mut self,
+        name: &str,
+        path: &[String],
+        value: TrackedValue,
+        environment: &mut Environment,
+        span: SourceSpan,
+    ) {
+        let Some(previous) = environment.get(name).cloned() else {
+            return;
+        };
+        let evidence = self.push_evidence(
+            RelationKind::Mutation,
+            "assign_record_path",
+            span.clone(),
+            previous
+                .evidence
+                .into_iter()
+                .chain(value.evidence)
+                .collect(),
+            None,
+            &format!("change {name}.{}", path.join(".")),
+        );
+        if let Some(mut updated) = self.replace_at_path(&previous, path, value) {
+            updated.evidence = Some(evidence);
+            environment.insert(name.to_owned(), updated);
+        } else {
+            self.mark_value_unresolved(&previous, "mutation path is not a known record", span);
+            environment.insert(
+                name.to_owned(),
+                TrackedValue {
+                    evidence: Some(evidence),
+                    ..TrackedValue::unknown("mutation_path_not_a_record")
+                },
+            );
+        }
+    }
+
+    fn replace_at_path(
+        &mut self,
+        current: &TrackedValue,
+        path: &[String],
+        value: TrackedValue,
+    ) -> Option<TrackedValue> {
+        let Some((first, rest)) = path.split_first() else {
+            return Some(value);
+        };
+        let current = self.materialize(current);
+        // After a branch the value may be one of several records; write into each.
+        if let AbstractValue::Union(alternatives) = &current.value {
+            let mut written = Vec::with_capacity(alternatives.len());
+            for alternative in alternatives.iter() {
+                written.push(self.replace_at_path(alternative, path, value.clone())?);
+            }
+            let updated = AbstractValue::union(written);
+            if let Some(id) = current.heap_id {
+                self.bump_heap(id, updated.clone());
+            }
+            return Some(TrackedValue {
+                value: updated,
+                ..current
+            });
+        }
+        let AbstractValue::Record(mut fields) = current.value.clone() else {
+            return None;
+        };
+        let child = fields
+            .get(first)
+            .cloned()
+            .unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined));
+        let child = self.replace_at_path(&child, rest, value)?;
+        if let Some(id) = child.heap_id {
+            self.bump_heap(id, child.value.clone());
+        }
+        Rc::make_mut(&mut fields).insert(first.clone(), child);
+        let updated = AbstractValue::Record(fields);
+        if let Some(id) = current.heap_id {
+            self.bump_heap(id, updated.clone());
+        }
+        Some(TrackedValue {
+            value: updated,
+            ..current
+        })
     }
 
     fn join_branch_environments(
@@ -1942,6 +2082,10 @@ impl<'a> Solver<'a> {
             self.mark_value_unresolved(&value, "mutation target binding is unknown", span);
             return;
         };
+        if matches!(previous.value, AbstractValue::Union(_)) {
+            self.write_path(name, &[property.to_owned()], value, environment, span);
+            return;
+        }
         let AbstractValue::Record(mut fields) = previous.value.clone() else {
             self.mark_values_unresolved(
                 [&previous, &value].into_iter(),
@@ -7111,6 +7255,35 @@ fn collect_heap_alternatives(value: &AbstractValue, alternatives: &mut Vec<Track
     }
 }
 
+/// Array methods that change the array they are called on.
+const ARRAY_MUTATORS: &[&str] = &[
+    "push",
+    "unshift",
+    "splice",
+    "pop",
+    "shift",
+    "sort",
+    "reverse",
+    "fill",
+    "copyWithin",
+];
+
+/// A local name and the static properties read from it, as in `record.items`.
+fn local_path(expression: &FlowExpression) -> Option<(String, Vec<String>)> {
+    match &expression.kind {
+        FlowExpressionKind::Identifier {
+            name,
+            module_binding: false,
+        } => Some((name.clone(), Vec::new())),
+        FlowExpressionKind::StaticMember { object, property } => {
+            let (name, mut path) = local_path(object)?;
+            path.push(property.clone());
+            Some((name, path))
+        }
+        _ => None,
+    }
+}
+
 fn append_array_values(receiver: &AbstractValue, added: &[TrackedValue]) -> Option<AbstractValue> {
     match receiver {
         AbstractValue::Array(elements) => {
@@ -8043,9 +8216,13 @@ fn query_value(value: &TrackedValue) -> QueryValue {
                 || enum_alternatives(value)
                 || literal_alternatives(value) =>
         {
-            QueryValue::Alternatives {
-                values: values.iter().map(query_value).collect(),
+            let mut distinct = Vec::new();
+            for value in values.iter().map(query_value) {
+                if !distinct.contains(&value) {
+                    distinct.push(value);
+                }
             }
+            QueryValue::Alternatives { values: distinct }
         }
         AbstractValue::Union(_) => QueryValue::Unknown {
             reason: "joined_alternatives".to_owned(),

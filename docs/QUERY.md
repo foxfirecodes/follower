@@ -479,7 +479,10 @@ across aliases and helper calls; local `.push` and static record-property writes
 identity. Unknown branches retain up to 32 possible heap values; exceeding that budget produces a
 coverage gap. A function calls itself at most 8 levels deep on one path, so recursion over
 unknown data stops early, with a coverage gap, instead of repeating the same exploration at
-every level. Reassignment of captured
+every level. A push through a property path, as in `record.items.push(value)`, appends to the
+array there, including after a branch joins several records; other methods that change an array
+in place (`unshift`, `splice`, `pop`, `shift`, `sort`, `reverse`, `fill`, `copyWithin`) leave it
+unknown with a coverage gap. Reassignment of captured
 bindings and opaque calls receiving callback-bearing namespaces are conservatively unresolved.
 Dynamic mutation targets, external mutation, live closure cells, full JavaScript coercion,
 non-null loose comparisons, repeated loop iterations, and array methods
