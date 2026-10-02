@@ -1173,6 +1173,51 @@ fn conditions_on_the_path_attribute_calls_to_the_items_they_test() {
 }
 
 #[test]
+fn hook_items_reach_callers_and_default_export_aliases_are_followed() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        ("src/kinds.ts", "export enum Kind { A = 1, B = 2 }"),
+        (
+            "src/Notice.tsx",
+            "import * as React from 'react'; class Notice extends React.Component { handleClose = () => { this.props.onClose('class_close'); }; render() { return <button onClick={this.handleClose} />; } } export default Notice;",
+        ),
+        (
+            "src/App.tsx",
+            "import { Kind } from './kinds'; import { enabled } from 'external-flags'; import { useItemSelection } from './hook'; import Notice from './Notice'; function useBanner(open) { const [visible, apply] = useItemSelection(enabled ? [Kind.A] : []); return { visible, apply }; } function Banner() { const { apply } = useBanner(true); return <Notice onClose={apply} />; } export function App() { return <Banner />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("{:?}", report.callsites);
+    };
+    let [call] = callsite.capability.calls.as_slice() else {
+        panic!("{:?}", callsite.capability.calls);
+    };
+    // The class behind `export default Notice` is followed, and the call keeps the hook's own
+    // items: its argument does not read the hook's parameter, so every caller gets the same.
+    assert_eq!(
+        call.arguments["action"],
+        [QueryValue::String {
+            value: "class_close".to_owned()
+        }]
+    );
+    let mut names = Vec::new();
+    for value in &call.elements["items"] {
+        collect_enum_members(value, &mut names);
+    }
+    assert_eq!(names, ["A"]);
+    assert!(call.elements_complete);
+}
+
+#[test]
 fn calls_of_a_wrapper_that_forwards_its_parameter_give_the_argument() {
     let fixture = TestProject::new(&[
         HOOK,

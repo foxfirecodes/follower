@@ -793,6 +793,16 @@ impl Solver<'_> {
         let Some(&index) = self.global_bindings.get(symbol) else {
             return Vec::new();
         };
+        // `export default Panel` binds the default export to another name.
+        if let Some((file_id, binding)) = self.globals_ir.get(index)
+            && let FlowExpressionKind::Identifier { name, .. } = &binding.value.kind
+            && name != &symbol.name
+        {
+            let scopes = self.resolve_scopes(*file_id, &Imports::new(), name, None);
+            if !scopes.is_empty() {
+                return scopes;
+            }
+        }
         self.lazy_scopes(index)
             .unwrap_or_else(|| vec![UseNode::Global(index)])
     }
@@ -2174,6 +2184,18 @@ impl Solver<'_> {
                 });
                 let complete = elements.iter().all(value_is_known)
                     && (values.iter().all(value_is_known) || possible_elements.contains_key(label));
+                // Literals the callers pass are among the elements, though other callers' values
+                // may not be known.
+                let mut elements = elements;
+                for caller in values_from_callers.get(label).into_iter().flatten() {
+                    let mut passed = Vec::new();
+                    collect_array_elements(&caller.value, &mut passed);
+                    for element in passed {
+                        if !elements.contains(&element) {
+                            elements.push(element);
+                        }
+                    }
+                }
                 (label.clone(), (elements, complete))
             })
             .collect::<BTreeMap<_, _>>();
@@ -2233,6 +2255,37 @@ impl Solver<'_> {
             .iter()
             .enumerate()
             .map(|(position, projection)| (projection.label.clone(), position))
+            .collect::<BTreeMap<_, _>>();
+        // An argument that reads the callsite scope's parameters, as a wrapper's `items` prop,
+        // differs by instance; any other is the same for every caller.
+        let parameters = self
+            .candidate_scope(candidate)
+            .and_then(|scope| self.scope_code(&scope))
+            .map(|code| {
+                code.params
+                    .iter()
+                    .flat_map(pattern_names)
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let per_instance = query
+            .factory_arguments
+            .iter()
+            .map(|projection| {
+                let mut read = BTreeSet::new();
+                if let Some(argument) = candidate.arguments.get(projection.index) {
+                    collect_read_names(argument, &mut read);
+                }
+                // When the callsite's elements are all known, they bound every instance's.
+                let known = callsite_elements
+                    .get(&projection.label)
+                    .is_some_and(|(_, complete)| *complete);
+                (
+                    projection.label.clone(),
+                    !known && !read.is_disjoint(&parameters),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let mut calls = Vec::new();
         let mut covered = BTreeSet::new();
@@ -2327,10 +2380,10 @@ impl Solver<'_> {
             let mut elements_complete = true;
             let mut ruled_out = false;
             for (label, (callsite, callsite_complete)) in &callsite_elements {
-                // An instance requests its own elements; the callsite's are every instance's.
-                let source = match &call.instance {
-                    None => Some(callsite.clone()),
-                    Some(span) => instance_elements(span, label_positions[label]).or_else(|| {
+                // An instance requests its own elements; the callsite's are every instance's. An
+                // argument that does not read the callsite's parameters is the same everywhere.
+                let from_instance = call.instance.as_ref().and_then(|span| {
+                    instance_elements(span, label_positions[label]).or_else(|| {
                         let location = self.query_location(span);
                         caller_elements.get(label).and_then(|callers| {
                             callers
@@ -2338,14 +2391,17 @@ impl Solver<'_> {
                                 .find(|(caller, _)| *caller == location)
                                 .map(|(_, elements)| elements.clone())
                         })
-                    }),
+                    })
+                });
+                let (source, complete) = match from_instance {
+                    Some(source) => {
+                        let complete = source.iter().all(value_is_known);
+                        (source, complete)
+                    }
+                    // The instance's own elements are not known, so neither are the call's.
+                    None if call.instance.is_some() && per_instance[label] => (Vec::new(), false),
+                    None => (callsite.clone(), *callsite_complete),
                 };
-                let complete = match &source {
-                    Some(source) if call.instance.is_none() => *callsite_complete,
-                    Some(source) => source.iter().all(value_is_known),
-                    None => false,
-                };
-                let source = source.unwrap_or_default();
                 // Conditions on members of the elements' enum say which elements reach the call.
                 let mut domain = source.clone();
                 domain.extend(callsite.iter().cloned());
@@ -2894,11 +2950,8 @@ fn merge_calls(calls: Vec<QueryCapabilityCall>) -> Vec<QueryCapabilityCall> {
         };
         union(&mut existing.arguments, call.arguments);
         union(&mut existing.elements, call.elements);
-        for set in call.guards {
-            if !existing.guards.contains(&set) {
-                existing.guards.push(set);
-            }
-        }
+        // Only conditions that hold on every path to the call describe it.
+        existing.guards.retain(|set| call.guards.contains(set));
         // A value one path rules out may reach the call through another.
         existing
             .guards_not
