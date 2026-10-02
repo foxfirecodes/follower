@@ -7994,7 +7994,11 @@ fn query_value(value: &TrackedValue) -> QueryValue {
             }
         }
         AbstractValue::Boolean(value) => QueryValue::Boolean { value: *value },
-        AbstractValue::Union(values) if array_alternatives(value) || enum_alternatives(value) => {
+        AbstractValue::Union(values)
+            if array_alternatives(value)
+                || enum_alternatives(value)
+                || literal_alternatives(value) =>
+        {
             QueryValue::Alternatives {
                 values: values.iter().map(query_value).collect(),
             }
@@ -8129,8 +8133,11 @@ fn same_known(values: impl Iterator<Item = Option<bool>>) -> Option<bool> {
 fn value_is_uncertain(value: &TrackedValue) -> bool {
     match &value.value {
         AbstractValue::Unknown(_) | AbstractValue::AssumedWrapper { .. } => true,
+        // Finite alternatives, such as arrays built in branches or a string chosen by a
+        // condition, are known values.
         AbstractValue::Union(values) => {
-            !finite_array_alternatives(value) || values.iter().any(value_is_uncertain)
+            !(finite_array_alternatives(value) || literal_alternatives(value))
+                || values.iter().any(value_is_uncertain)
         }
         AbstractValue::Array(values) => values.iter().any(value_is_uncertain),
         AbstractValue::Record(fields) => fields.values().any(value_is_uncertain),
@@ -8160,6 +8167,21 @@ fn enum_alternatives(value: &TrackedValue) -> bool {
     match &value.value {
         AbstractValue::EnumMember { .. } | AbstractValue::Undefined => true,
         AbstractValue::Union(values) => values.iter().all(enum_alternatives),
+        _ => false,
+    }
+}
+
+/// Alternatives that are all known literals, such as the members of a string enum, which
+/// project to their strings.
+fn literal_alternatives(value: &TrackedValue) -> bool {
+    match &value.value {
+        AbstractValue::String(_)
+        | AbstractValue::Number(_)
+        | AbstractValue::Boolean(_)
+        | AbstractValue::Null
+        | AbstractValue::Undefined
+        | AbstractValue::EnumMember { .. } => true,
+        AbstractValue::Union(values) => values.iter().all(literal_alternatives),
         _ => false,
     }
 }

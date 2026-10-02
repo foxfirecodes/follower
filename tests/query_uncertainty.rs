@@ -71,8 +71,15 @@ fn nested_unknown_branches_rewind_record_writes_for_the_other_path() {
     };
     let joined = format!(
         "{:?}",
-        QueryValue::Unknown {
-            reason: "joined_alternatives".into()
+        QueryValue::Alternatives {
+            values: vec![
+                QueryValue::String {
+                    value: "inner".into()
+                },
+                QueryValue::String {
+                    value: "outer".into()
+                },
+            ]
         }
     );
     assert_eq!(
@@ -111,10 +118,10 @@ fn partial_returns_preserve_callback_invocations_on_the_continuing_path() {
 }
 
 #[test]
-fn joined_data_becomes_an_explicit_unknown_projection_and_coverage_gap() {
+fn joined_unknown_data_becomes_an_explicit_unknown_projection_and_coverage_gap() {
     let fixture = TestProject::new(&[(
         "src/Host.tsx",
-        "import { makeCallback } from './factory'; export function Host({ flag }) { let value = 'alpha'; if (flag) { value = 'beta'; } makeCallback(value).callback('clicked'); }",
+        "import { makeCallback } from './factory'; export function Host({ flag }) { let value = 'alpha'; if (flag) { value = flag.label; } makeCallback(value).callback('clicked'); }",
     )]);
     let report = fixture.report();
     assert_eq!(report.creations.len(), 1);
@@ -137,6 +144,37 @@ fn joined_data_becomes_an_explicit_unknown_projection_and_coverage_gap() {
             && link.creation_id.as_deref() == Some(report.creations[0].creation_id.as_str())
     }));
     assert!(gap.links.iter().any(|link| !link.evidence_path.is_empty()));
+}
+
+#[test]
+fn joined_literals_project_as_alternatives_without_a_capture_gap() {
+    let fixture = TestProject::new(&[(
+        "src/Host.tsx",
+        "import { makeCallback } from './factory'; export function Host({ flag }) { let value = 'alpha'; if (flag) { value = 'beta'; } makeCallback(value).callback(flag ? 'yes' : 'no'); }",
+    )]);
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1);
+    let string = |value: &str| QueryValue::String {
+        value: value.into(),
+    };
+    assert_eq!(
+        report.creations[0].factory_arguments["created"],
+        QueryValue::Alternatives {
+            values: vec![string("beta"), string("alpha")]
+        }
+    );
+    assert_eq!(
+        report.creations[0].invocations[0].arguments["invoked"],
+        QueryValue::Alternatives {
+            values: vec![string("yes"), string("no")]
+        }
+    );
+    assert!(
+        report
+            .gaps
+            .iter()
+            .all(|gap| gap.kind != "uncertain_callback_factory_capture")
+    );
 }
 
 #[test]
@@ -169,7 +207,7 @@ fn hiding_unresolved_rows_does_not_remove_gap_provenance() {
 fn html_report_is_optional_and_survives_unresolved_exit() {
     let fixture = TestProject::new(&[(
         "src/Host.tsx",
-        "import { makeCallback } from './factory'; export function Host({ flag }) { let value = 'alpha'; if (flag) value = 'beta'; makeCallback(value).callback('clicked'); }",
+        "import { makeCallback } from './factory'; export function Host({ flag }) { let value = 'alpha'; if (flag) value = flag.label; makeCallback(value).callback('clicked'); }",
     )]);
     let run = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_follower"))

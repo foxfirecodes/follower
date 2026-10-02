@@ -247,9 +247,10 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   paths that call the factory at the same callsite for the same root input with the same projected
   factory arguments share one creation, which lists the invocations of every such path.
 - Projected values preserve strings, integral numbers, numeric enum members (name and value),
-  arrays, finite array alternatives, `null`, `undefined`, and explicit unknowns. A branch-built array
-  remains a set of possible arrays instead of collapsing to one merged list. String enum members
-  currently project to their string values.
+  arrays, finite array alternatives, alternatives of known literals (such as a string chosen by a
+  condition), `null`, `undefined`, and explicit unknowns. A branch-built array remains a set of
+  possible arrays instead of collapsing to one merged list. String enum members currently
+  project to their string values. Alternatives that include an unknown value project as unknown.
 - `reachable` reports creations explored from configured entry points and finite input domains.
 - A path from an entry can pass through a component whose behavior is not modeled, such as one
   imported from a file the text prefilter skipped or from an external package. The explorer then
@@ -440,7 +441,8 @@ callback, mapped result, or symbolic iteration contains a capability selected by
 Unknown conditions explore both branches. A partially returning branch also explores the
 continuing path. Modified bindings retain joined alternatives; callback-bearing joins are
 unresolved rather than disappearing after the branch. Strict equality involving an unknown value
-remains unknown, and projected factory captures containing unknown or joined values carry gaps.
+remains unknown, and projected factory captures containing unknown values, including joins with
+an unknown side, carry gaps; finite alternatives of literals or arrays do not.
 Nullish guards narrow finite local alternatives inside their guarded branch, including guards
 combined with `&&` or `||`.
 `for`, `for...in`, `for...of`, and `while` bodies are explored for zero or one iteration, a
