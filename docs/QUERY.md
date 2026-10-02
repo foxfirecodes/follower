@@ -327,9 +327,9 @@ gap's impact could not be established; `unlinked` means no source location or ta
 The old `coverage.gaps` strings remain for compatibility. A gap link is static provenance, not
 proof that an event executed at runtime.
 
-Schema version 9 adds `component_boundaries`: the components on paths from configured roots that
-the model could not follow, most consequential first. Each names the JSX tag, where linkage
-stopped (`module` and `export` as written there), and a kind: `external_package` (an unparsed
+Schema version 9 adds `component_boundaries` and `unreached_callsites`. `component_boundaries`
+lists the components on paths from configured roots that the model could not follow, most
+consequential first. Each names the JSX tag, where linkage stopped (`module` and `export` as written there), and a kind: `external_package` (an unparsed
 package, such as one under `node_modules`), `unparsed_source` (a project file the text filter or
 an expansion budget left out), `unresolved_import`, `dynamic_value` (a linked value the model does
 not follow, such as an unknown higher-order component's result), `partially_modeled` (a parsed
@@ -343,6 +343,22 @@ invocation, render props, and component props inferred from the props seen at th
 component's behavior: check the component first. A contract on a parsed project component replaces
 its body in the model, so factory calls inside it are no longer explored. The text renderer prints
 the first ten boundaries with their suggestions, and the HTML report has a Boundaries tab.
+
+`unreached_callsites` explains each matching factory callsite that no exact or possible path
+reached. From the function containing the callsite, it walks static uses (calls, JSX, imports, and
+`import()`) back to the nearest user that exact exploration ran, and names the use inside it that
+was not followed. The `reason` is `callback` (inside a callback passed to a call, such as a modal
+opener or an effect, that was not invoked), `prop_callback` (inside a function passed as a JSX
+prop), `local_callback`, `lazy_import`, `render_budget` (the render visit budget stopped
+exploration at the use), `component_not_followed` (the element was rendered but its component's
+body was not explored, such as the result of an unknown lazy loader), `created_not_rendered`,
+`branch_not_taken`, or `no_explored_ancestor`, where `detail` names the code at which the use chain
+ends. `explored_ancestor` and `blocking_site` give that user and use, and `chain` the code between,
+innermost first. If the chain passes a module binding initialized by a loader call whose record
+argument returns a dynamic import, `suggested_contract` gives a `lazy_component_factories` entry
+for the loader. The walk is static and stops after 4,000 nodes, so it names a likely blocker rather
+than proving that no path exists. The text renderer groups callsites by reason and blocking use,
+and the HTML report has an Unreached tab.
 Snapshot reuse is not implemented yet.
 
 ## Current analysis fragment

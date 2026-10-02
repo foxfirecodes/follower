@@ -5,10 +5,11 @@
   app.innerHTML = `<main class="shell">
     <header class="top"><div><p class="eyebrow">Follower / Query report</p><h1 id="title"></h1><p class="sub" id="subtitle"></p></div><div class="snapshot mono" id="snapshot"></div></header>
     <div class="metrics" id="metrics"></div>
-    <nav class="tabs" aria-label="Report sections"><button class="tab active" data-tab="creations">Creations</button><button class="tab" data-tab="boundaries">Boundaries</button><button class="tab" data-tab="coverage">Coverage</button><button class="tab" data-tab="evidence">Evidence</button></nav>
+    <nav class="tabs" aria-label="Report sections"><button class="tab active" data-tab="creations">Creations</button><button class="tab" data-tab="boundaries">Boundaries</button><button class="tab" data-tab="unreached">Unreached</button><button class="tab" data-tab="coverage">Coverage</button><button class="tab" data-tab="evidence">Evidence</button></nav>
     <section id="creations" class="panel active"><div class="toolbar"><input class="search" id="creation-search" type="search" placeholder="Search creation, choice, value, or file" aria-label="Search creations"><select class="filter" id="creation-filter" aria-label="Filter creation status"><option value="all">All conclusions</option><option value="candidate_invocation">Invoked</option><option value="unresolved">Unresolved</option><option value="absent_within_model">No invocation</option></select><span class="count" id="creation-count"></span></div><div class="split"><div class="list"><div class="list-title">Creation contexts</div><div id="creation-list"></div></div><div class="detail" id="creation-detail"></div></div></section>
     <section id="coverage" class="panel"><div class="notice" id="coverage-notice"></div><div class="coverage-grid"><div class="coverage-card"><header><h2>Coverage gaps</h2><span class="count" id="gap-count"></span></header><div class="toolbar"><input class="search" id="gap-search" type="search" placeholder="Search gaps" aria-label="Search gaps"><select class="filter" id="gap-filter" aria-label="Filter gap assessment"><option value="all">All assessments</option><option value="direct">Direct</option><option value="may_affect">May affect</option><option value="unknown_relevance">Unknown relevance</option><option value="unlinked">Unlinked</option></select></div><div id="gap-list"></div></div><div class="coverage-card"><header><h2>Callsite inventory</h2><span class="count" id="inventory-count"></span></header><div class="toolbar"><input class="search" id="inventory-search" type="search" placeholder="Search file or reason" aria-label="Search callsites"><select class="filter" id="inventory-filter" aria-label="Filter callsite status"><option value="all">All callsites</option><option value="analyzed">Analyzed</option><option value="filtered">Filtered</option><option value="unresolved">Unresolved</option><option value="skipped">Skipped</option></select></div><div id="inventory-list"></div></div></div></section>
     <section id="boundaries" class="panel"><div class="notice" id="boundary-notice"></div><div class="evidence-card"><div class="toolbar"><input class="search" id="boundary-search" type="search" placeholder="Search component, module, or file" aria-label="Search boundaries"><span class="count" id="boundary-count"></span></div><div id="boundary-list" class="stack"></div></div></section>
+    <section id="unreached" class="panel"><div class="notice" id="unreached-notice"></div><div class="evidence-card"><div class="toolbar"><input class="search" id="unreached-search" type="search" placeholder="Search file, reason, or blocking site" aria-label="Search unreached callsites"><span class="count" id="unreached-count"></span></div><div id="unreached-list" class="stack"></div></div></section>
     <section id="evidence" class="panel"><div class="evidence-card"><div class="toolbar"><input class="search" id="evidence-search" type="search" placeholder="Search evidence ID, rule, summary" aria-label="Search evidence"><span class="count" id="evidence-count"></span></div><div id="evidence-list" class="evidence-list"></div></div></section>
     <p class="footer">Static analysis describes possible flow within configured roots and model limits. A candidate invocation does not prove runtime execution. This file is self-contained and stored locally.</p>
   </main>`;
@@ -78,6 +79,7 @@
     ['Candidate calls', report.creations.reduce((sum, creation) => sum + creation.invocations.length, 0)],
     ['Unresolved rows', unresolvedCount],
     ['Boundaries', (report.component_boundaries || []).length],
+    ['Unreached callsites', (report.unreached_callsites || []).length],
     ['Coverage gaps', report.gaps.length],
     ['Callsites', report.callsite_inventory.callsites.length],
   ];
@@ -262,6 +264,31 @@
     });
   }
   $('#boundary-search').addEventListener('input', renderBoundaries);
+  const unreached = report.unreached_callsites || [];
+  $('#unreached-notice').textContent = unreached.length
+    ? 'Factory callsites no exact or possible path from a configured root reached. Each names the nearest code explored exactly and why exploration did not follow the use inside it.'
+    : 'Every matching factory callsite was reached from a configured root.';
+  function renderUnreached() {
+    const search = $('#unreached-search').value.trim().toLowerCase();
+    const filtered = unreached.filter(item => !search || [item.reason, item.detail, item.enclosing, loc(item.location), item.blocking_site && loc(item.blocking_site)].join(' ').toLowerCase().includes(search));
+    $('#unreached-count').textContent = `${filtered.length} of ${unreached.length}`;
+    const list = $('#unreached-list'); list.replaceChildren();
+    if (!filtered.length) { list.append(node('p', 'empty', 'No matching callsites.')); return; }
+    filtered.forEach(item => {
+      const card = node('details', 'gap'); const summary = node('summary');
+      summary.append(badge(item.reason, 'unknown'), node('span', 'gap-kind', loc(item.location)));
+      card.append(summary);
+      const body = node('div', 'gap-body');
+      if (item.enclosing) body.append(node('div', 'mini', `In ${item.enclosing}`));
+      body.append(node('p', 'mini', item.detail));
+      if (item.explored_ancestor) body.append(node('div', 'mini', `Explored: ${item.explored_ancestor}`));
+      if (item.blocking_site) body.append(node('div', 'mini mono', `Blocking use: ${loc(item.blocking_site)}`));
+      item.chain.forEach(step => body.append(node('div', 'mini mono', `← ${step}`)));
+      if (item.suggested_contract) { body.append(node('h3', 'mini', 'Suggested contract')); body.append(node('pre', 'mono', item.suggested_contract)); }
+      card.append(body); list.append(card);
+    });
+  }
+  $('#unreached-search').addEventListener('input', renderUnreached);
   $('#gap-search').addEventListener('input', () => { gapLimit = 100; renderGaps(); });
   $('#gap-filter').addEventListener('change', () => { gapLimit = 100; renderGaps(); });
 
@@ -309,5 +336,5 @@
     $('#evidence-count').textContent = `${visited.size} nodes on selected path`;
   }
   $('#evidence-search').addEventListener('input', () => { evidenceLimit = 100; renderEvidence(); });
-  renderCreationList(); renderCreationDetail(); renderBoundaries(); renderGaps(); renderInventory(); renderEvidence();
+  renderCreationList(); renderCreationDetail(); renderBoundaries(); renderUnreached(); renderGaps(); renderInventory(); renderEvidence();
 })();

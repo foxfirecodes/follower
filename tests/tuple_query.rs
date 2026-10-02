@@ -5,8 +5,8 @@ use code_flow::{
     queries::Conclusion,
     query::{
         QueryBoundaryKind, QueryCallPathKind, QueryCallsiteStatus, QueryGapAssessment,
-        QueryGapTarget, QueryReverseImporterEvaluation, QueryScope, QueryValue, Reachability,
-        load_query,
+        QueryGapTarget, QueryReverseImporterEvaluation, QueryScope, QueryUnreachedReason,
+        QueryValue, Reachability, load_query,
     },
 };
 use support::TestProject;
@@ -548,6 +548,84 @@ fn component_boundaries_suggest_contracts_that_make_creations_reachable() {
     );
     assert_eq!(report.creations[0].invocations.len(), 2);
     assert!(report.component_boundaries.is_empty());
+}
+
+#[test]
+fn unreached_callsites_name_the_explored_use_that_stopped_exploration() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/leaves.tsx",
+            "import { useItemSelection } from './hook'; export function MenuLeaf() { const [, apply] = useItemSelection(['menu']); apply('menu'); return null; } export function ToastLeaf() { const [, apply] = useItemSelection(['toast']); apply('toast'); return null; } export function UnusedLeaf() { const [, apply] = useItemSelection(['unused']); apply('unused'); return null; }",
+        ),
+        (
+            "src/Page.tsx",
+            "import { useItemSelection } from './hook'; export default function Page() { const [, apply] = useItemSelection(['page']); apply('page'); return null; }",
+        ),
+        (
+            "src/Unused.tsx",
+            "import { UnusedLeaf } from './leaves'; export function Unused() { return <UnusedLeaf />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { load } from 'external-loader'; import { notify } from 'external-toasts'; import { MenuLeaf, ToastLeaf } from './leaves'; const Page = load({ promise: () => import('./Page') }); function Menu({ renderItem }) { return <ul />; } function Item() { return <MenuLeaf />; } export function App() { notify(() => <ToastLeaf />); return <div><Menu renderItem={() => <Item />} /><Page /></div>; }",
+        ),
+    ]);
+    let config = "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n";
+    fixture.write("flow.toml", config);
+    fixture.write("query.toml", TUPLE_QUERY);
+    let report = fixture.report();
+    let explained = report
+        .unreached_callsites
+        .iter()
+        .map(|callsite| {
+            let enclosing = callsite.enclosing.as_deref().unwrap_or_default();
+            let name = enclosing.split(' ').next().unwrap_or_default().to_owned();
+            (name, callsite)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        explained.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["MenuLeaf", "Page", "ToastLeaf", "UnusedLeaf"]
+    );
+    let menu = explained["MenuLeaf"];
+    assert_eq!(menu.reason, QueryUnreachedReason::PropCallback);
+    assert!(menu.detail.contains("renderItem"), "{}", menu.detail);
+    assert!(
+        menu.explored_ancestor
+            .as_deref()
+            .unwrap()
+            .starts_with("App ")
+    );
+    assert_eq!(menu.chain.len(), 2, "{:?}", menu.chain);
+    let toast = explained["ToastLeaf"];
+    assert_eq!(toast.reason, QueryUnreachedReason::Callback);
+    assert!(toast.detail.contains("notify"), "{}", toast.detail);
+    assert_eq!(
+        explained["UnusedLeaf"].reason,
+        QueryUnreachedReason::NoExploredAncestor
+    );
+    assert!(explained["UnusedLeaf"].detail.contains("ends at Unused"));
+    let page = explained["Page"];
+    assert_eq!(page.reason, QueryUnreachedReason::ComponentNotFollowed);
+    let contract = page.suggested_contract.as_deref().expect("lazy contract");
+    assert_eq!(
+        contract,
+        "[[lazy_component_factories]]\nmodule = \"external-loader\"\nexport = \"load\"\npromise_property = \"promise\"\n"
+    );
+    fixture.write("flow.toml", &format!("{config}\n{contract}"));
+    let report = fixture.report();
+    assert!(
+        report.creations.iter().any(|creation| {
+            creation.reachability == Reachability::Reachable
+                && creation
+                    .factory_location
+                    .as_ref()
+                    .is_some_and(|location| location.path.ends_with("Page.tsx"))
+        }),
+        "{:?}",
+        report.unreached_callsites
+    );
 }
 
 #[test]

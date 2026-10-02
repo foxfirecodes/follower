@@ -101,6 +101,7 @@ mod tests {
             evidence: Vec::new(),
             gaps: Vec::new(),
             component_boundaries: Vec::new(),
+            unreached_callsites: Vec::new(),
             coverage: Coverage {
                 scope: "test".into(),
                 roots: Vec::new(),

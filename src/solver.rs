@@ -29,7 +29,7 @@ use crate::{
         QueryBoundaryKind, QueryCallPathKind, QueryCallPathStep, QueryCallsiteInventory,
         QueryComponentBoundary, QueryCreation, QueryGap, QueryInvocation, QueryLocation,
         QueryReport, QueryReverseImporter, QueryReverseImporterEvaluation, QueryScope, QuerySpec,
-        QueryValue, Reachability,
+        QueryUnreachedCallsite, QueryUnreachedReason, QueryValue, Reachability,
     },
 };
 
@@ -158,6 +158,44 @@ enum Assumption {
     UnrenderedJsx,
 }
 
+/// A function or module binding in the use graph.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum UseNode {
+    Function(FunctionKey),
+    /// An index into the module bindings.
+    Global(usize),
+}
+
+/// How a use is reached when its containing code runs.
+#[derive(Clone, Debug)]
+enum UseContext {
+    /// Evaluated whenever the containing code is.
+    Direct,
+    /// Inside a callback passed to the named call.
+    CallArgument(String),
+    /// Inside a function passed as the named JSX prop.
+    PropCallback(String),
+    /// Inside a local function.
+    LocalCallback,
+    /// A dynamic `import()`.
+    LazyImport,
+}
+
+/// A reference found in the IR, at the call or JSX site that contains it.
+struct UseSite<'e> {
+    name: Option<&'e str>,
+    module: Option<&'e str>,
+    site: SourceSpan,
+    context: UseContext,
+}
+
+/// One use of a node: the code that uses it, the site, and how the site is reached.
+struct UseEdge {
+    user: UseNode,
+    site: SourceSpan,
+    context: UseContext,
+}
+
 /// A render being remembered: under an assumption only its key, and on an exact path also what
 /// it showed its ancestors.
 enum RenderMemo {
@@ -174,6 +212,21 @@ enum RenderMemo {
 struct RenderReplay {
     marks: Vec<RenderMark>,
     uncertainty: usize,
+}
+
+/// Code exact paths from configured roots reached.
+#[derive(Default)]
+struct ExactReach {
+    functions: BTreeSet<FunctionKey>,
+    closures: BTreeMap<FileId, BTreeSet<u32>>,
+    /// JSX and call sites evaluated, by file and start offset.
+    evaluated: std::collections::HashSet<(u32, u32)>,
+    /// Elements rendered.
+    rendered: std::collections::HashSet<(u32, u32)>,
+    /// Elements cut by the render visit budget.
+    cut: std::collections::HashSet<(u32, u32)>,
+    /// Components whose renders the budget cut somewhere.
+    cut_components: BTreeSet<FunctionKey>,
 }
 
 /// Something a render can reach: a JSX element or closure site, or a function component.
@@ -596,6 +649,14 @@ pub fn execute_query(
         solver.prepare_globals(None);
     } else if run_roots {
         solver.run()?;
+        let phase_start = Instant::now();
+        solver.unreached_callsites = solver.explain_unreached_callsites();
+        if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+            eprintln!(
+                "query unreached callsites: {} ms",
+                phase_start.elapsed().as_millis()
+            );
+        }
     } else {
         solver.prepare_globals(None);
     }
@@ -718,6 +779,8 @@ struct Solver<'a> {
     use_chain: BTreeSet<FunctionKey>,
     /// Components already explored under an assumption, keyed by choice, component, and props.
     assumed_component_renders: BTreeSet<(Option<String>, String, u64)>,
+    /// What exact paths from configured roots reached, for explaining unreached callsites.
+    reach: ExactReach,
     /// Exact renders already explored; an entry is empty while its render is still running.
     exact_renders:
         std::collections::HashMap<(Option<String>, String, u64), Option<Rc<RenderReplay>>>,
@@ -727,6 +790,8 @@ struct Solver<'a> {
     scanned_callback_values: Vec<Rc<ClosureValue>>,
     /// The returned value of each exact creation, by callsite, choice, and argument values.
     interned_creations: std::collections::HashMap<u64, TrackedValue>,
+    /// Factory callsites no exact or possible path reached, with the reason.
+    unreached_callsites: Vec<QueryUnreachedCallsite>,
     /// Components returned by a configured wrapper, which may add props when rendering them.
     wrapped_components: BTreeSet<FunctionKey>,
     /// Counts budget stops that may have cut a render short.
@@ -874,10 +939,12 @@ impl<'a> Solver<'a> {
             corridor_files: BTreeSet::new(),
             use_chain: BTreeSet::new(),
             assumed_component_renders: BTreeSet::new(),
+            reach: ExactReach::default(),
             interned_creations: std::collections::HashMap::new(),
             scanned_callbacks: std::collections::HashSet::new(),
             scanned_callback_values: Vec::new(),
             exact_renders: std::collections::HashMap::new(),
+            unreached_callsites: Vec::new(),
             wrapped_components: BTreeSet::new(),
             render_truncations: 0,
             render_log: Vec::new(),
@@ -1302,7 +1369,17 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// Records a JSX or call site evaluated on an exact path.
+    fn note_exact_site(&mut self, span: &SourceSpan) {
+        if self.current_reachability == Reachability::Reachable {
+            self.reach.evaluated.insert((span.file_id.0, span.start));
+        }
+    }
+
     fn call_function(&mut self, key: &FunctionKey, arguments: Vec<TrackedValue>) -> TrackedValue {
+        if self.current_reachability == Reachability::Reachable {
+            self.reach.functions.insert(key.clone());
+        }
         if self.call_depth >= MAX_CALL_DEPTH {
             self.render_truncations += 1;
             self.mark_values_unresolved(
@@ -2190,6 +2267,7 @@ impl<'a> Solver<'a> {
                 }
             }
             FlowExpressionKind::Call { callee, arguments } => {
+                self.note_exact_site(&expression.span);
                 if let Some(wrapper) = self
                     .symbol_linker
                     .file(file_id)
@@ -2471,6 +2549,7 @@ impl<'a> Solver<'a> {
                 }
             }
             FlowExpressionKind::JsxElement { tag, props } => {
+                self.note_exact_site(&expression.span);
                 self.create_element(tag, props, expression, environment, file_id)
             }
             FlowExpressionKind::DynamicImport { .. } => {
@@ -3688,6 +3767,11 @@ impl<'a> Solver<'a> {
             }
             _ => return,
         };
+        if self.current_reachability == Reachability::Reachable {
+            self.reach
+                .rendered
+                .insert((element.span.file_id.0, element.span.start));
+        }
         self.render_log
             .push(RenderMark::Site(element.span.file_id.0, element.span.start));
         if let AbstractValue::Function(key) = &element.component.value {
@@ -3852,6 +3936,14 @@ impl<'a> Solver<'a> {
         let visits = self.render_visits.entry(key).or_default();
         *visits += 1;
         if *visits > budget {
+            if self.current_reachability == Reachability::Reachable {
+                self.reach
+                    .cut
+                    .insert((element.span.file_id.0, element.span.start));
+                if let AbstractValue::Function(key) = &element.component.value {
+                    self.reach.cut_components.insert(key.clone());
+                }
+            }
             self.render_truncations += 1;
             match &memo {
                 Some(RenderMemo::Assumed(key, _)) => {
@@ -4109,6 +4201,374 @@ impl<'a> Solver<'a> {
             self.request_root_import(&path);
             self.requested_imports.insert(path);
         }
+    }
+
+    /// Builds, for every function and module binding, the code that uses it and where.
+    fn use_graph(&self) -> std::collections::HashMap<UseNode, Vec<UseEdge>> {
+        let mut graph = std::collections::HashMap::<UseNode, Vec<UseEdge>>::new();
+        let node_for = |symbol: &LinkedSymbol| {
+            let key = FunctionKey {
+                file_id: symbol.file_id,
+                name: symbol.name.clone(),
+            };
+            if self.functions.contains_key(&key) {
+                Some(UseNode::Function(key))
+            } else {
+                self.global_bindings
+                    .get(symbol)
+                    .map(|index| UseNode::Global(*index))
+            }
+        };
+        let mut nodes = Vec::new();
+        for file in &self.snapshot.files {
+            for function in &file.flow.functions {
+                let mut uses = Vec::new();
+                collect_uses_in_statements(&function.body, &UseContext::Direct, None, &mut uses);
+                nodes.push((
+                    file,
+                    UseNode::Function(FunctionKey {
+                        file_id: file.file_id,
+                        name: function.name.clone(),
+                    }),
+                    uses,
+                ));
+            }
+        }
+        for (index, (file_id, binding)) in self.globals_ir.iter().enumerate() {
+            let Some(file) = self.symbol_linker.file(*file_id) else {
+                continue;
+            };
+            let mut uses = Vec::new();
+            // A component defined as a function value runs its body when rendered.
+            match &binding.value.kind {
+                FlowExpressionKind::Arrow { body, .. } => {
+                    collect_uses_in_body(body, &UseContext::Direct, None, &mut uses);
+                }
+                _ => collect_uses(&binding.value, &UseContext::Direct, None, &mut uses),
+            }
+            nodes.push((file, UseNode::Global(index), uses));
+        }
+        for (file, user, uses) in nodes {
+            for usage in uses {
+                let target = if let Some(name) = usage.name {
+                    match self.symbol_linker.resolve_binding(file.file_id, name) {
+                        ValueResolution::Resolved(LinkedValue::Declaration(symbol)) => {
+                            node_for(&symbol)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    usage.module.and_then(|module| {
+                        let path = self
+                            .symbol_linker
+                            .import_resolutions(&file.path)
+                            .filter(|resolution| resolution.specifier == module)
+                            .find_map(|resolution| resolution.resolved_path.as_ref())?;
+                        let target = self.symbol_linker.file_at(path)?;
+                        match self
+                            .symbol_linker
+                            .resolve_exported_value(target.file_id, "default")
+                        {
+                            ValueResolution::Resolved(LinkedValue::Declaration(symbol)) => {
+                                node_for(&symbol)
+                            }
+                            _ => None,
+                        }
+                    })
+                };
+                if let Some(target) = target
+                    && target != user
+                {
+                    graph.entry(target).or_default().push(UseEdge {
+                        user: user.clone(),
+                        site: usage.site,
+                        context: usage.context,
+                    });
+                }
+            }
+        }
+        graph
+    }
+
+    /// For a module binding such as `const Page = load({ promise: () => import('./Page') })`, the
+    /// loader call and a `lazy_component_factories` entry that would follow it.
+    fn lazy_loader_contract(&self, node: &UseNode) -> Option<(String, String)> {
+        let UseNode::Global(index) = node else {
+            return None;
+        };
+        let (file_id, binding) = self.globals_ir[*index];
+        let FlowExpressionKind::Call { callee, arguments } = &binding.value.kind else {
+            return None;
+        };
+        let FlowExpressionKind::Record { fields } = &arguments.first()?.kind else {
+            return None;
+        };
+        let property = fields.iter().find_map(|field| {
+            let FlowExpressionKind::Arrow { body, .. } = &field.value.kind else {
+                return None;
+            };
+            let returned = match body {
+                FlowArrowBody::Expression { expression } => Some(expression.as_ref()),
+                FlowArrowBody::Statements { statements } => {
+                    statements.iter().find_map(|statement| match statement {
+                        FlowStatement::Return {
+                            value: Some(value), ..
+                        } => Some(value),
+                        _ => None,
+                    })
+                }
+            }?;
+            matches!(returned.kind, FlowExpressionKind::DynamicImport { .. })
+                .then(|| field.property.clone())
+        })?;
+        let local = imported_callee_local(callee)?;
+        let import = self
+            .symbol_linker
+            .file(file_id)?
+            .flow
+            .imports
+            .iter()
+            .find(|import| import.local == local && !import.type_only)?;
+        let quote =
+            |value: &str| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
+        Some((
+            callee_text(callee),
+            format!(
+                "[[lazy_component_factories]]\nmodule = {}\nexport = {}\npromise_property = {}\n",
+                quote(&import.module),
+                quote(&import.imported),
+                quote(&property)
+            ),
+        ))
+    }
+
+    /// Whether exact exploration ran a node: a function was called, or a closure defined in a
+    /// module binding was.
+    fn node_explored(&self, node: &UseNode) -> bool {
+        match node {
+            UseNode::Function(key) => self.reach.functions.contains(key),
+            UseNode::Global(index) => {
+                let (file_id, binding) = self.globals_ir[*index];
+                self.reach.closures.get(&file_id).is_some_and(|starts| {
+                    starts
+                        .range(binding.span.start..binding.span.end)
+                        .next()
+                        .is_some()
+                })
+            }
+        }
+    }
+
+    fn describe_node(&self, node: &UseNode) -> String {
+        let (name, span) = match node {
+            UseNode::Function(key) => (
+                key.name.clone(),
+                self.functions
+                    .get(key)
+                    .map(|function| function.span.clone()),
+            ),
+            UseNode::Global(index) => {
+                let (_, binding) = self.globals_ir[*index];
+                (
+                    pattern_names(&binding.pattern).join(", "),
+                    Some(binding.span.clone()),
+                )
+            }
+        };
+        span.and_then(|span| self.query_location(&span))
+            .map_or(name.clone(), |location| {
+                format!("{name} ({}:{})", location.path, location.start_line)
+            })
+    }
+
+    /// Why exact exploration did not follow a use inside explored code.
+    fn classify_unfollowed_use(
+        &self,
+        site: &SourceSpan,
+        context: &UseContext,
+    ) -> (QueryUnreachedReason, String) {
+        let key = (site.file_id.0, site.start);
+        if self.reach.cut.contains(&key) {
+            return (
+                QueryUnreachedReason::RenderBudget,
+                "the render visit budget stopped exact exploration at this use".to_owned(),
+            );
+        }
+        match context {
+            UseContext::CallArgument(callee) => (
+                QueryUnreachedReason::Callback,
+                format!("the use is inside a callback passed to {callee}, which was not invoked"),
+            ),
+            UseContext::PropCallback(prop) => (
+                QueryUnreachedReason::PropCallback,
+                format!("the use is inside a function passed as JSX prop {prop}, which was not invoked"),
+            ),
+            UseContext::LocalCallback => (
+                QueryUnreachedReason::LocalCallback,
+                "the use is inside a local function that was not called".to_owned(),
+            ),
+            UseContext::LazyImport => (
+                QueryUnreachedReason::LazyImport,
+                "the use is a dynamic import() that the model does not follow".to_owned(),
+            ),
+            UseContext::Direct if self.reach.rendered.contains(&key) => (
+                QueryUnreachedReason::ComponentNotFollowed,
+                "the element was rendered, but the component's body was not explored".to_owned(),
+            ),
+            UseContext::Direct if self.reach.evaluated.contains(&key) => (
+                QueryUnreachedReason::CreatedNotRendered,
+                "the use was evaluated, but the JSX was not rendered or the callee was not followed"
+                    .to_owned(),
+            ),
+            UseContext::Direct => (
+                QueryUnreachedReason::BranchNotTaken,
+                "the explored code did not evaluate this use".to_owned(),
+            ),
+        }
+    }
+
+    /// Explains each matching factory callsite that no exact or possible path reached: the
+    /// nearest user explored exactly and why exploration did not follow the use inside it.
+    fn explain_unreached_callsites(&self) -> Vec<QueryUnreachedCallsite> {
+        const SEARCH_LIMIT: usize = 4_000;
+        let candidates = self
+            .factory_candidates()
+            .into_iter()
+            .filter(|candidate| self.expression_matches_model(candidate.file_id, &candidate.callee))
+            .filter(|candidate| {
+                !self.capabilities.iter().any(|capability| {
+                    capability.callsite == candidate.span
+                        && capability.reachability != Reachability::Unknown
+                })
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let graph = self.use_graph();
+        let mut explained = Vec::new();
+        for candidate in candidates {
+            let start = candidate.enclosing_function.clone().map_or_else(
+                || {
+                    self.globals_ir
+                        .iter()
+                        .position(|(file_id, binding)| {
+                            *file_id == candidate.file_id
+                                && binding.span.start <= candidate.span.start
+                                && candidate.span.end <= binding.span.end
+                        })
+                        .map(UseNode::Global)
+                },
+                |key| Some(UseNode::Function(key)),
+            );
+            let mut result = QueryUnreachedCallsite {
+                location: self.query_location(&candidate.span),
+                enclosing: start.as_ref().map(|node| self.describe_node(node)),
+                reason: QueryUnreachedReason::NoExploredAncestor,
+                detail: "no user of this code was explored exactly within the parsed files"
+                    .to_owned(),
+                explored_ancestor: None,
+                blocking_site: None,
+                chain: Vec::new(),
+                suggested_contract: None,
+            };
+            let Some(start) = start else {
+                explained.push(result);
+                continue;
+            };
+            if self.node_explored(&start) {
+                // The callsite's own code ran; find how the callsite sits inside it.
+                let context = graph
+                    .values()
+                    .flatten()
+                    .find(|edge| edge.user == start && edge.site == candidate.span)
+                    .map_or(UseContext::Direct, |edge| edge.context.clone());
+                let (reason, detail) = self.classify_unfollowed_use(&candidate.span, &context);
+                result.reason = reason;
+                result.detail = detail;
+                result.explored_ancestor = Some(self.describe_node(&start));
+                result.blocking_site = self.query_location(&candidate.span);
+                explained.push(result);
+                continue;
+            }
+            let mut previous = std::collections::HashMap::<UseNode, Option<UseNode>>::new();
+            previous.insert(start.clone(), None);
+            let mut queue = VecDeque::from([start.clone()]);
+            let mut found = None;
+            let mut tops = Vec::new();
+            while let Some(node) = queue.pop_front() {
+                if previous.len() > SEARCH_LIMIT {
+                    break;
+                }
+                let edges = graph.get(&node).map_or(&[][..], Vec::as_slice);
+                if edges.is_empty() && tops.len() < 3 {
+                    tops.push(node.clone());
+                }
+                if let Some(edge) = edges.iter().find(|edge| self.node_explored(&edge.user)) {
+                    found = Some((node, edge));
+                    break;
+                }
+                for edge in edges {
+                    if !previous.contains_key(&edge.user) {
+                        previous.insert(edge.user.clone(), Some(node.clone()));
+                        queue.push_back(edge.user.clone());
+                    }
+                }
+            }
+            if let Some((node, edge)) = found {
+                let mut chain_nodes = Vec::new();
+                let mut current = Some(node.clone());
+                while let Some(step) = current {
+                    current = previous.get(&step).cloned().flatten();
+                    chain_nodes.push(step);
+                }
+                chain_nodes.reverse();
+                let chain = chain_nodes
+                    .iter()
+                    .map(|step| self.describe_node(step))
+                    .collect::<Vec<_>>();
+                let (reason, mut detail) = self.classify_unfollowed_use(&edge.site, &edge.context);
+                // An ancestor explored in one context may have been cut by the budget in the one
+                // that leads here.
+                let cut = std::iter::once(&edge.user)
+                    .chain(&chain_nodes)
+                    .filter_map(|node| match node {
+                        UseNode::Function(key) if self.reach.cut_components.contains(key) => {
+                            Some(key.name.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                if !cut.is_empty() {
+                    detail = format!(
+                        "{detail}; the render visit budget also stopped some renders of {}, which may be the path that leads here",
+                        cut.into_iter().collect::<Vec<_>>().join(", ")
+                    );
+                }
+                if let Some((callee, contract)) = self.lazy_loader_contract(&node) {
+                    detail = format!(
+                        "{detail}; the component comes from a lazy loader call to {callee}, which a \
+                         lazy_component_factories entry would follow"
+                    );
+                    result.suggested_contract = Some(contract);
+                }
+                result.reason = reason;
+                result.detail = detail;
+                result.explored_ancestor = Some(self.describe_node(&edge.user));
+                result.blocking_site = self.query_location(&edge.site);
+                result.chain = chain;
+            } else if !tops.is_empty() {
+                result.detail = format!(
+                    "no user of this code was explored exactly within the parsed files; the use chain ends at {}",
+                    tops.iter()
+                        .map(|node| self.describe_node(node))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            explained.push(result);
+        }
+        explained
     }
 
     /// Records one site of a boundary and returns its key.
@@ -4673,6 +5133,13 @@ impl<'a> Solver<'a> {
         closure: &ClosureValue,
         arguments: Vec<TrackedValue>,
     ) -> TrackedValue {
+        if self.current_reachability == Reachability::Reachable {
+            self.reach
+                .closures
+                .entry(closure.span.file_id)
+                .or_default()
+                .insert(closure.span.start);
+        }
         self.render_log
             .push(RenderMark::Site(closure.span.file_id.0, closure.span.start));
         let trace_len = self.trace.len();
@@ -6116,6 +6583,7 @@ impl<'a> Solver<'a> {
             evidence: self.evidence,
             gaps,
             component_boundaries,
+            unreached_callsites: self.unreached_callsites,
             coverage: Coverage {
                 scope: match query.scope {
                     QueryScope::Reachable => {
@@ -7019,6 +7487,225 @@ fn flatten_children(value: &TrackedValue, children: &mut Vec<TrackedValue>) -> b
             children.push(value.clone());
             true
         }
+    }
+}
+
+/// Calls that run a callback argument while the caller renders, so uses inside it are direct.
+fn callee_runs_callback_now(callee: &str) -> bool {
+    let method = callee.rsplit('.').next().unwrap_or(callee);
+    matches!(
+        method,
+        "useMemo"
+            | "useState"
+            | "memo"
+            | "forwardRef"
+            | "map"
+            | "flatMap"
+            | "filter"
+            | "forEach"
+            | "reduce"
+            | "find"
+            | "some"
+            | "every"
+            | "only"
+            | "toArray"
+    )
+}
+
+fn callee_text(callee: &FlowExpression) -> String {
+    match &callee.kind {
+        FlowExpressionKind::Identifier { name, .. } => name.clone(),
+        FlowExpressionKind::StaticMember { object, property } => {
+            format!("{}.{property}", callee_text(object))
+        }
+        _ => "call".to_owned(),
+    }
+}
+
+/// The context for code nested in `inner`: the outermost non-direct context wins, since that is
+/// where exploration has to enter.
+fn nested_context(outer: &UseContext, inner: UseContext) -> UseContext {
+    if matches!(outer, UseContext::Direct) {
+        inner
+    } else {
+        outer.clone()
+    }
+}
+
+fn collect_uses_in_statements<'e>(
+    statements: &'e [FlowStatement],
+    context: &UseContext,
+    site: Option<&SourceSpan>,
+    uses: &mut Vec<UseSite<'e>>,
+) {
+    for statement in statements {
+        match statement {
+            FlowStatement::Bind(binding) => collect_uses(&binding.value, context, site, uses),
+            FlowStatement::Expression { value, .. }
+            | FlowStatement::Throw { value, .. }
+            | FlowStatement::Assign { value, .. }
+            | FlowStatement::Return {
+                value: Some(value), ..
+            } => collect_uses(value, context, site, uses),
+            FlowStatement::If {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                collect_uses(test, context, site, uses);
+                collect_uses_in_statements(consequent, context, site, uses);
+                collect_uses_in_statements(alternate, context, site, uses);
+            }
+            FlowStatement::Return { value: None, .. } | FlowStatement::Unsupported(_) => {}
+        }
+    }
+}
+
+fn collect_uses_in_body<'e>(
+    body: &'e FlowArrowBody,
+    context: &UseContext,
+    site: Option<&SourceSpan>,
+    uses: &mut Vec<UseSite<'e>>,
+) {
+    match body {
+        FlowArrowBody::Expression { expression } => collect_uses(expression, context, site, uses),
+        FlowArrowBody::Statements { statements } => {
+            collect_uses_in_statements(statements, context, site, uses);
+        }
+    }
+}
+
+/// Collects references to bindings, attributed to the nearest enclosing call or JSX site.
+fn collect_uses<'e>(
+    expression: &'e FlowExpression,
+    context: &UseContext,
+    site: Option<&SourceSpan>,
+    uses: &mut Vec<UseSite<'e>>,
+) {
+    let at = site.unwrap_or(&expression.span);
+    let record = |name: &'e str, site: &SourceSpan, uses: &mut Vec<UseSite<'e>>| {
+        uses.push(UseSite {
+            name: Some(name),
+            module: None,
+            site: site.clone(),
+            context: context.clone(),
+        });
+    };
+    match &expression.kind {
+        FlowExpressionKind::Identifier { name, .. } => record(name, at, uses),
+        FlowExpressionKind::Call { callee, arguments } => {
+            let call = &expression.span;
+            match &callee.kind {
+                FlowExpressionKind::Identifier { name, .. } => record(name, call, uses),
+                FlowExpressionKind::StaticMember { object, .. } => {
+                    collect_uses(object, context, Some(call), uses);
+                }
+                _ => collect_uses(callee, context, Some(call), uses),
+            }
+            let callee = callee_text(callee);
+            for argument in arguments {
+                if let FlowExpressionKind::Arrow { body, .. } = &argument.kind {
+                    let inner = if callee_runs_callback_now(&callee) {
+                        context.clone()
+                    } else {
+                        nested_context(context, UseContext::CallArgument(callee.clone()))
+                    };
+                    collect_uses_in_body(body, &inner, None, uses);
+                } else {
+                    collect_uses(argument, context, Some(call), uses);
+                }
+            }
+        }
+        FlowExpressionKind::JsxElement { tag, props } => {
+            let element = &expression.span;
+            match tag {
+                FlowJsxTag::Identifier {
+                    name,
+                    intrinsic: false,
+                    ..
+                }
+                | FlowJsxTag::Member { object: name, .. } => record(name, element, uses),
+                _ => {}
+            }
+            for prop in props {
+                match prop {
+                    FlowJsxProp::Property { name, value, .. } => {
+                        if let FlowExpressionKind::Arrow { body, .. } = &value.kind {
+                            let inner =
+                                nested_context(context, UseContext::PropCallback(name.clone()));
+                            collect_uses_in_body(body, &inner, None, uses);
+                        } else {
+                            collect_uses(value, context, Some(element), uses);
+                        }
+                    }
+                    FlowJsxProp::Spread { value, .. } => {
+                        collect_uses(value, context, Some(element), uses);
+                    }
+                    FlowJsxProp::Unsupported(_) => {}
+                }
+            }
+        }
+        FlowExpressionKind::Arrow { body, .. } => {
+            collect_uses_in_body(
+                body,
+                &nested_context(context, UseContext::LocalCallback),
+                None,
+                uses,
+            );
+        }
+        FlowExpressionKind::DynamicImport { module } => uses.push(UseSite {
+            name: None,
+            module: Some(module),
+            site: at.clone(),
+            context: nested_context(context, UseContext::LazyImport),
+        }),
+        FlowExpressionKind::Record { fields } => {
+            for field in fields {
+                collect_uses(&field.value, context, site, uses);
+            }
+        }
+        FlowExpressionKind::Array { elements } => {
+            for element in elements {
+                collect_uses(element, context, site, uses);
+            }
+        }
+        FlowExpressionKind::Spread { value }
+        | FlowExpressionKind::LogicalNot { value }
+        | FlowExpressionKind::LooseNullEquality { value, .. } => {
+            collect_uses(value, context, site, uses);
+        }
+        FlowExpressionKind::StaticMember { object, .. } => {
+            collect_uses(object, context, site, uses);
+        }
+        FlowExpressionKind::ComputedMember { object, property } => {
+            collect_uses(object, context, site, uses);
+            collect_uses(property, context, site, uses);
+        }
+        FlowExpressionKind::StrictEquality { left, right, .. }
+        | FlowExpressionKind::Logical { left, right, .. } => {
+            collect_uses(left, context, site, uses);
+            collect_uses(right, context, site, uses);
+        }
+        FlowExpressionKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            collect_uses(test, context, site, uses);
+            collect_uses(consequent, context, site, uses);
+            collect_uses(alternate, context, site, uses);
+        }
+        FlowExpressionKind::Unsupported { references, .. } => {
+            for name in references {
+                record(name, at, uses);
+            }
+        }
+        FlowExpressionKind::Null
+        | FlowExpressionKind::String { .. }
+        | FlowExpressionKind::Number { .. }
+        | FlowExpressionKind::NumericEnumMember { .. }
+        | FlowExpressionKind::Boolean { .. } => {}
     }
 }
 

@@ -357,8 +357,56 @@ pub struct QueryReport {
     /// can turn possible creations into reachable ones.
     #[serde(default)]
     pub component_boundaries: Vec<QueryComponentBoundary>,
+    /// Factory callsites no exact or possible path from a configured root reached, with where
+    /// the nearest explored code stopped short of them.
+    #[serde(default)]
+    pub unreached_callsites: Vec<QueryUnreachedCallsite>,
     pub coverage: Coverage,
     pub diagnostics: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryUnreachedReason {
+    /// The use that leads to the callsite is inside a callback passed to a call, such as a modal
+    /// opener or an effect, which exact exploration did not invoke.
+    Callback,
+    /// The use is inside a function passed as a JSX prop, such as an event handler or render
+    /// prop, that exact exploration did not invoke.
+    PropCallback,
+    /// The use is inside a local function that exact exploration did not call.
+    LocalCallback,
+    /// The use is a dynamic `import()` the model does not follow.
+    LazyImport,
+    /// The render visit budget stopped exact exploration at the use.
+    RenderBudget,
+    /// The use was rendered, but the component's body was not explored, for example because a
+    /// contract models it or its value is unknown.
+    ComponentNotFollowed,
+    /// The JSX at the use was created but never rendered.
+    CreatedNotRendered,
+    /// The explored function did not evaluate the use: a decided condition, an early return,
+    /// or a path cut short.
+    BranchNotTaken,
+    /// No user of the callsite's code was explored exactly within the parsed files.
+    NoExploredAncestor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryUnreachedCallsite {
+    pub location: Option<QueryLocation>,
+    /// The function or module binding that contains the callsite.
+    pub enclosing: Option<String>,
+    pub reason: QueryUnreachedReason,
+    pub detail: String,
+    /// The nearest user explored exactly, and the use inside it that was not followed.
+    pub explored_ancestor: Option<String>,
+    pub blocking_site: Option<QueryLocation>,
+    /// Code between the callsite and the explored ancestor, innermost first.
+    pub chain: Vec<String>,
+    /// A project contract that would let exploration follow the use, when one applies.
+    #[serde(default)]
+    pub suggested_contract: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

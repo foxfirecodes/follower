@@ -211,6 +211,46 @@ fn print_query_report(report: &QueryReport) {
             }
         }
     }
+    if !report.unreached_callsites.is_empty() {
+        let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+        let mut blockers =
+            std::collections::BTreeMap::<(String, String), (usize, String, Option<String>)>::new();
+        for unreached in &report.unreached_callsites {
+            let reason = format!("{:?}", unreached.reason);
+            *reasons.entry(reason.clone()).or_default() += 1;
+            let site = unreached.blocking_site.as_ref().map_or_else(
+                || unreached.detail.clone(),
+                |site| format!("{}:{}", site.path, site.start_line),
+            );
+            let entry = blockers.entry((reason, site)).or_insert_with(|| {
+                (
+                    0,
+                    unreached.detail.clone(),
+                    unreached.suggested_contract.clone(),
+                )
+            });
+            entry.0 += 1;
+        }
+        println!(
+            "unreached callsites: {} ({})",
+            report.unreached_callsites.len(),
+            reasons
+                .iter()
+                .map(|(reason, count)| format!("{count} {reason}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut blockers = blockers.into_iter().collect::<Vec<_>>();
+        blockers.sort_by(|left, right| right.1.0.cmp(&left.1.0).then_with(|| left.0.cmp(&right.0)));
+        for ((reason, site), (count, detail, contract)) in blockers.iter().take(10) {
+            println!("  {count} behind {reason} at {site}: {detail}");
+            if let Some(contract) = contract {
+                for line in contract.lines() {
+                    println!("    {line}");
+                }
+            }
+        }
+    }
     println!(
         "coverage: {} ({} creations, {} processed files)",
         if report.coverage.complete {
