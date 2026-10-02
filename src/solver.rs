@@ -3946,7 +3946,7 @@ impl<'a> Solver<'a> {
     }
 
     /// Requests the module of the call that initializes a rendered component, as in
-    /// `const Scroller = createList(...)`, so a parsed factory can model the component.
+    /// `const Panel = createPanel(...)`, so a parsed factory can model the component.
     fn request_component_factory(&mut self, tag: &TagOrigin) {
         let ValueResolution::Resolved(LinkedValue::Declaration(symbol)) =
             self.symbol_linker.resolve_binding(tag.file_id, &tag.local)

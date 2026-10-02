@@ -248,7 +248,7 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   render that component with the element's props. When a root path renders such a value, the
   root phase requests the callee's module, so a parsed higher-order component can replace the
   assumption on the next round. The same applies to a rendered component whose declaration is
-  initialized by a call, such as `const Scroller = createList(...)`. Under an assumption, a component is explored
+  initialized by a call, such as `const Panel = createPanel(...)`. Under an assumption, a component is explored
   only if the backward use walk found it on a use chain toward a factory callsite (or, when no walk
   ran, if its file is on the entry corridor), or if it receives JSX or callbacks. If the walk stops
   at its budget, components it did not reach can be skipped; the stop is reported as a gap. A
