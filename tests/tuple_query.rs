@@ -4,9 +4,9 @@ use code_flow::{
     Project,
     queries::Conclusion,
     query::{
-        QueryBoundaryKind, QueryCallPathKind, QueryCallsiteStatus, QueryGapAssessment,
-        QueryGapTarget, QueryReverseImporterEvaluation, QueryScope, QueryUnreachedReason,
-        QueryValue, Reachability, load_query,
+        QueryBoundaryKind, QueryCallPathKind, QueryCallsiteStatus, QueryCapabilityStatus,
+        QueryGapAssessment, QueryGapTarget, QueryReverseImporterEvaluation, QueryScope,
+        QueryUnreachedReason, QueryValue, Reachability, load_query,
     },
 };
 use support::TestProject;
@@ -582,7 +582,7 @@ fn component_boundaries_suggest_contracts_that_make_creations_reachable() {
     fixture.write("flow.toml", config);
     fixture.write("query.toml", TUPLE_QUERY);
     let report = fixture.report();
-    assert_eq!(report.schema_version, 9);
+    assert_eq!(report.schema_version, 10);
     assert!(
         report
             .creations
@@ -705,6 +705,133 @@ fn unreached_callsites_name_the_explored_use_that_stopped_exploration() {
         }),
         "{:?}",
         report.unreached_callsites
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn callsite_values_follow_the_result_to_every_call_in_the_source() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        ("src/kinds.ts", "export enum Kind { CLOSE = 1, OPEN = 2 }"),
+        (
+            "src/Lazy.tsx",
+            "export default function LazyChild({ onDone }) { return <button onClick={() => onDone('lazy')} />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import * as React from 'react'; import { lazy } from 'react'; import { Kind } from './kinds'; import { useItemSelection } from './hook'; import { report } from 'external-report'; const LazyChild = lazy(() => import('./Lazy')); function Child({ onClose }) { return <button onMouseEnter={() => onClose?.('child')} />; } class Legacy extends React.Component { handle() { this.props.onClose('class'); } render() { return <button onClick={() => this.handle()} />; } } function Quiet({ onClose }) { return null; } function Direct({ enabled = false }) { const [, apply] = useItemSelection(['direct']); apply('now'); if (enabled) { apply(Kind.OPEN); } return null; } function Props() { const [, apply] = useItemSelection(['props']); const wrapped = React.useCallback(apply, []); const handlers = React.useMemo(() => ({ close: apply }), [apply]); return <div><Child onClose={wrapped} /><Legacy onClose={handlers.close} /><LazyChild onDone={apply} /></div>; } function useNotice() { const [visible, apply] = useItemSelection(['notice']); return [visible, apply]; } function Banner() { const [, close] = useNotice(); return <button onClick={() => close(Kind.CLOSE)} />; } export function useOrphan() { return useItemSelection(['orphan']); } function Unused() { const [visible] = useItemSelection(['unused']); const [, _ignored] = useItemSelection(['ignored']); return visible; } function Ignored() { const [, apply] = useItemSelection(['ignoring']); return <Quiet onClose={apply} />; } function Escaped() { const [, apply] = useItemSelection(['escaped']); report(apply); return null; } export function App() { return <div><Direct /><Props /><Banner /><Unused /><Ignored /><Escaped /></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let by_items = report
+        .callsites
+        .iter()
+        .map(|callsite| {
+            let QueryValue::Array { elements } = &callsite.factory_arguments["items"][0] else {
+                panic!("{:?}", callsite.factory_arguments);
+            };
+            let QueryValue::String { value } = &elements[0] else {
+                panic!("{elements:?}");
+            };
+            (value.clone(), callsite)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let calls = |items: &str| {
+        let mut calls = by_items[items]
+            .capability
+            .calls
+            .iter()
+            .map(|call| {
+                let action = call.arguments["action"]
+                    .iter()
+                    .map(|value| match value {
+                        QueryValue::String { value } => value.clone(),
+                        QueryValue::EnumMember { member_name, .. } => member_name.clone(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|");
+                (action, call.explored, call.via.clone())
+            })
+            .collect::<Vec<_>>();
+        calls.sort();
+        calls
+    };
+    // A guarded call no explored path runs is still found, with its context-free argument.
+    assert_eq!(
+        calls("direct"),
+        [
+            ("OPEN".to_owned(), false, vec![]),
+            ("now".to_owned(), true, vec![])
+        ]
+    );
+    assert_eq!(
+        by_items["direct"].capability.status,
+        QueryCapabilityStatus::Called
+    );
+    let props = calls("props");
+    assert_eq!(
+        props
+            .iter()
+            .map(|(action, _, via)| (action.as_str(), via.join(" / ")))
+            .collect::<Vec<_>>(),
+        [
+            ("child", "prop onClose of <Child>".to_owned()),
+            ("class", "prop onClose of <Legacy>".to_owned()),
+            ("lazy", "prop onDone of <LazyChild>".to_owned()),
+        ]
+    );
+    assert_eq!(
+        calls("notice"),
+        [(
+            "CLOSE".to_owned(),
+            true,
+            vec!["returned by useNotice to Banner".to_owned()]
+        )]
+    );
+    assert_eq!(
+        by_items["orphan"].capability.status,
+        QueryCapabilityStatus::Escapes
+    );
+    assert!(
+        by_items["orphan"].capability.escapes[0]
+            .detail
+            .contains("callers are not in the parsed files")
+    );
+    assert_eq!(
+        by_items["unused"].capability.status,
+        QueryCapabilityStatus::Unused
+    );
+    assert_eq!(
+        by_items["ignored"].capability.status,
+        QueryCapabilityStatus::Unused
+    );
+    assert_eq!(
+        by_items["ignoring"].capability.status,
+        QueryCapabilityStatus::NotCalled
+    );
+    assert_eq!(
+        by_items["escaped"].capability.status,
+        QueryCapabilityStatus::Escapes
+    );
+    assert!(
+        by_items["escaped"].capability.escapes[0]
+            .detail
+            .contains("passed to report")
+    );
+    assert!(
+        by_items
+            .values()
+            .all(|callsite| callsite.factory_arguments_resolved)
     );
 }
 

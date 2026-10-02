@@ -10,6 +10,10 @@
 The query is independent of names such as `useWidgetActions`, `runAction`, or `ACTION_KIND`.
 Those are matcher paths, argument indexes, and output labels in TOML.
 
+The report answers these per callsite in `callsites`, whether or not a path from a configured root
+reaches the callsite; reachability is a separate label on each entry. The text output and the HTML
+report's first tab lead with this view, and `creations` keeps the per-context detail.
+
 ```toml
 schema_version = 1
 id = "widget-actions"
@@ -365,6 +369,31 @@ argument returns a dynamic import, `suggested_contract` gives a `lazy_component_
 for the loader. The walk is static and stops after 4,000 nodes, so it names a likely blocker rather
 than proving that no path exists. The text renderer groups callsites by reason and blocking use,
 and the HTML report has an Unreached tab.
+
+Schema version 10 adds `callsites`, one entry per matching factory callsite. `factory_arguments`
+lists the distinct values of each projected argument across the callsite's explored contexts; a
+callsite no context explored reports the arguments it writes when they do not depend on local
+values. `reachability` is the strongest tier among its creations, `unknown` with an
+`unreached_reason` when no path reached it. `capability` describes what became of the selected
+result. The walk follows it through the source from the factory call: through destructuring and
+aliases, `useCallback` and `useMemo`, record and array fields, JSX props into function and class
+components (including components loaded by `lazy(() => import(...))` or a loader whose record
+argument returns `import(...)`), arguments to project functions, and `return` to each caller of
+a hook. Each call made with the result is in `calls`, with the functions it sits in (`context`,
+such as `the onClose prop of <Panel>`), how the result reached it (`via`, such as `prop onClose of
+<Panel>` or `returned by useNotice to Banner`), and the values of each projected invocation
+argument. An argument that reads no local values, such as an enum member or a literal, is
+evaluated from module bindings, so it is known even if no explored path executed the call;
+otherwise the values come from explored invocations at the same call, or are unknown with the
+reason, such as a parameter of the enclosing function. `explored` says whether an explored path
+executed the call. Passing the result as an intrinsic element's event handler is a call with an
+unknown event argument. `escapes` lists where the result went that the walk does not follow,
+such as an unknown function, a store, a property write, a component it cannot resolve, or a hook
+whose callers are not in the parsed files. `status` is `called`, `called_with_unknown_arguments`,
+`escapes`, `not_called` (used, for example passed to code that ignores it, but never called), or
+`unused` (not bound, or bound and never used). The walk visits at most 400 scope and target pairs
+and 8 scope changes per callsite, and does not follow a result through a function that forwards
+its own parameter to it, so calls of such a wrapper report the parameter as unknown.
 Snapshot reuse is not implemented yet.
 
 ## Current analysis fragment

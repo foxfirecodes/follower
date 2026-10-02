@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn report_is_private_and_embedded_json_cannot_close_script() {
         let report = QueryReport {
-            schema_version: 9,
+            schema_version: 10,
             snapshot_id: "snapshot".into(),
             config_hash: "config".into(),
             query_hash: "query".into(),
@@ -102,6 +102,7 @@ mod tests {
             gaps: Vec::new(),
             component_boundaries: Vec::new(),
             unreached_callsites: Vec::new(),
+            callsites: Vec::new(),
             coverage: Coverage {
                 scope: "test".into(),
                 roots: Vec::new(),

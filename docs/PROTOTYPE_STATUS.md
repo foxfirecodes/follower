@@ -50,6 +50,10 @@ dependency-management costs without isolating meaningful change.
 - The query solver reuses resolved import links and module environments within each pass. Module
   environments are cleared when globals initialize, and profiling reports phase timings without
   source names. Cross-run cache and incremental solver reuse remain future work.
+- Query report schema 10 leads with `callsites`: per factory callsite, the values it was called
+  with and every call made with the selected result, found by a walk over the source through
+  aliases, props, lazy components, and hook returns. Reachability from configured roots is a
+  separate label, so values are reported for callsites no explored path reaches.
 - Query report schema 4 includes an independent syntactic inventory of potential factory calls.
   It scans all configured sources for the factory export name and follows re-export importers to
   catch renamed uses, then labels candidate callsites as analyzed, filtered, unresolved, or

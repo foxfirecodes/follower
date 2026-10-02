@@ -350,6 +350,10 @@ pub struct QueryReport {
     pub query_id: String,
     pub kind: QueryKind,
     pub scope: QueryScope,
+    /// One entry per matching factory callsite: the values it was called with and the calls
+    /// made with its result, whether or not a path from a configured root reaches it.
+    #[serde(default)]
+    pub callsites: Vec<QueryCallsiteValues>,
     pub creations: Vec<QueryCreation>,
     pub callsite_inventory: QueryCallsiteInventory,
     pub evidence: Vec<Evidence>,
@@ -366,6 +370,77 @@ pub struct QueryReport {
     pub unreached_callsites: Vec<QueryUnreachedCallsite>,
     pub coverage: Coverage,
     pub diagnostics: Vec<String>,
+}
+
+/// A factory callsite with the values it was called with and what its result was called with.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryCallsiteValues {
+    pub location: Option<QueryLocation>,
+    /// The function or module binding that contains the callsite.
+    pub enclosing: Option<String>,
+    /// The strongest reachability among the callsite's creations; a callsite no path from a
+    /// configured root reached is `unknown`. Values are reported either way.
+    pub reachability: Reachability,
+    /// Why no path reached the callsite, when none did.
+    #[serde(default)]
+    pub unreached_reason: Option<QueryUnreachedReason>,
+    /// Explored creation contexts at the callsite.
+    pub contexts: usize,
+    /// The distinct values of each projected factory argument across contexts.
+    pub factory_arguments: BTreeMap<String, Vec<QueryValue>>,
+    pub factory_arguments_resolved: bool,
+    pub capability: QueryCapabilityUse,
+}
+
+/// What became of the selected factory result: the calls made with it and where it went that
+/// the walk could not follow.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryCapabilityUse {
+    pub status: QueryCapabilityStatus,
+    pub calls: Vec<QueryCapabilityCall>,
+    pub escapes: Vec<QueryCapabilityEscape>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryCapabilityStatus {
+    /// Calls were found, and every projected argument at them is known.
+    Called,
+    /// Calls were found, but some projected arguments are unknown.
+    CalledWithUnknownArguments,
+    /// No call was found, and the result leaves code the walk follows; see `escapes`.
+    Escapes,
+    /// The result is used, for example compared or checked, but never called.
+    NotCalled,
+    /// The callsite does not bind the result, or binds it and never uses it.
+    Unused,
+}
+
+/// A call made with the factory result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryCapabilityCall {
+    pub location: Option<QueryLocation>,
+    /// The functions the call sits in, innermost first, such as `the onClose prop of <Panel>`.
+    /// Empty when the call is directly in the code the result reached.
+    pub context: Vec<String>,
+    /// How the result reached the call from the factory callsite, such as `prop onClose of
+    /// <Panel>` or `returned by useNotice to Banner`.
+    pub via: Vec<String>,
+    /// The distinct values of each projected invocation argument.
+    pub arguments: BTreeMap<String, Vec<QueryValue>>,
+    pub arguments_resolved: bool,
+    /// Whether an explored path executed this call. A call no path executed may be behind a
+    /// condition, a handler, or a component no path rendered; its arguments are still reported.
+    pub explored: bool,
+}
+
+/// Somewhere the factory result went that the walk could not follow.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryCapabilityEscape {
+    pub location: Option<QueryLocation>,
+    pub detail: String,
+    pub context: Vec<String>,
+    pub via: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

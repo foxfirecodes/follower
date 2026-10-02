@@ -27,11 +27,14 @@ use crate::{
     queries::{AuditFinding, AuditReport, Conclusion, Coverage, FindingRef},
     query::{
         QueryBoundaryKind, QueryCallPathKind, QueryCallPathStep, QueryCallsiteInventory,
-        QueryComponentBoundary, QueryCreation, QueryGap, QueryInvocation, QueryLocation,
-        QueryReport, QueryReverseImporter, QueryReverseImporterEvaluation, QueryScope, QuerySpec,
-        QueryUnreachedCallsite, QueryUnreachedReason, QueryValue, Reachability,
+        QueryCallsiteValues, QueryComponentBoundary, QueryCreation, QueryGap, QueryInvocation,
+        QueryLocation, QueryReport, QueryReverseImporter, QueryReverseImporterEvaluation,
+        QueryScope, QuerySpec, QueryUnreachedCallsite, QueryUnreachedReason, QueryValue,
+        Reachability,
     },
 };
+
+mod callback_uses;
 
 const MAX_CALL_DEPTH: usize = 128;
 /// Nested calls of one function. Recursion over known data, such as a menu tree, ends sooner;
@@ -728,6 +731,14 @@ pub fn execute_query(
         Vec::new()
     };
     let phase_start = Instant::now();
+    solver.callsite_values = solver.callsite_values(query);
+    if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
+        eprintln!(
+            "query callsite values: {} ms",
+            phase_start.elapsed().as_millis()
+        );
+    }
+    let phase_start = Instant::now();
     let report = solver.query_report(query, query_hash);
     if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
         eprintln!(
@@ -802,6 +813,8 @@ struct Solver<'a> {
     interned_creations: std::collections::HashMap<u64, TrackedValue>,
     /// Factory callsites no exact or possible path reached, with the reason.
     unreached_callsites: Vec<QueryUnreachedCallsite>,
+    /// Each factory callsite's values and the calls made with its result.
+    callsite_values: Vec<QueryCallsiteValues>,
     /// Calls of each function in progress.
     active_functions: std::collections::HashMap<FunctionKey, usize>,
     /// Closures carrying a factory result, in creation order, until the render that created
@@ -963,6 +976,7 @@ impl<'a> Solver<'a> {
             scanned_callback_values: Vec::new(),
             exact_renders: std::collections::HashMap::new(),
             unreached_callsites: Vec::new(),
+            callsite_values: Vec::new(),
             active_functions: std::collections::HashMap::new(),
             pending_callbacks: Vec::new(),
             uncalled_runs: std::collections::HashSet::new(),
@@ -6698,13 +6712,14 @@ impl<'a> Solver<'a> {
             .collect();
         let component_boundaries = self.component_boundaries(query);
         QueryReport {
-            schema_version: 9,
+            schema_version: 10,
             snapshot_id: self.snapshot.snapshot_id.clone(),
             config_hash: self.snapshot.config_hash.clone(),
             query_hash: query_hash.to_owned(),
             query_id: query.id.clone(),
             kind: query.kind,
             scope: query.scope,
+            callsites: self.callsite_values,
             creations,
             callsite_inventory: QueryCallsiteInventory {
                 configured_files: 0,

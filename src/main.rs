@@ -140,6 +140,10 @@ fn print_query_report(report: &QueryReport) {
         "query {} in snapshot {} ({:?})",
         report.query_id, report.snapshot_id, report.scope
     );
+    print_callsite_values(report);
+    if !report.creations.is_empty() {
+        println!("creations: {}", report.creations.len());
+    }
     for creation in &report.creations {
         println!(
             "{} [{}] {:?} @ {}",
@@ -285,6 +289,93 @@ fn print_query_report(report: &QueryReport) {
         report.callsite_inventory.skipped_candidate_files,
         report.callsite_inventory.round_limit_hit,
     );
+}
+
+/// The values at each callsite and the calls made with its result, before the per-creation
+/// detail.
+fn print_callsite_values(report: &QueryReport) {
+    if report.callsites.is_empty() {
+        return;
+    }
+    let mut statuses = std::collections::BTreeMap::<String, usize>::new();
+    for callsite in &report.callsites {
+        *statuses
+            .entry(format!("{:?}", callsite.capability.status))
+            .or_default() += 1;
+    }
+    println!(
+        "callsites: {} ({})",
+        report.callsites.len(),
+        statuses
+            .iter()
+            .map(|(status, count)| format!("{count} {status}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let place = |location: Option<&code_flow::query::QueryLocation>| {
+        location.map_or_else(
+            || "<unknown location>".to_owned(),
+            |location| format!("{}:{}", location.path, location.start_line),
+        )
+    };
+    let values = |values: &[QueryValue]| {
+        values
+            .iter()
+            .map(render_query_value)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    for callsite in &report.callsites {
+        println!(
+            "  {} in {} [{:?}, {} contexts{}]",
+            place(callsite.location.as_ref()),
+            callsite.enclosing.as_deref().unwrap_or("<module>"),
+            callsite.reachability,
+            callsite.contexts,
+            callsite
+                .unreached_reason
+                .map(|reason| format!(", unreached: {reason:?}"))
+                .unwrap_or_default()
+        );
+        for (label, value) in &callsite.factory_arguments {
+            println!("    factory {label} = {}", values(value));
+        }
+        println!("    result {:?}", callsite.capability.status);
+        for call in &callsite.capability.calls {
+            let arguments = call
+                .arguments
+                .iter()
+                .map(|(label, value)| format!("{label} = {}", values(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut notes = Vec::new();
+            if let Some(context) = call.context.first() {
+                notes.push(format!("in {context}"));
+            }
+            if !call.via.is_empty() {
+                notes.push(format!("via {}", call.via.join(", ")));
+            }
+            if !call.explored {
+                notes.push("not executed by an explored path".to_owned());
+            }
+            println!(
+                "      call {arguments} at {}{}",
+                place(call.location.as_ref()),
+                if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", notes.join("; "))
+                }
+            );
+        }
+        for escape in &callsite.capability.escapes {
+            println!(
+                "      escape at {}: {}",
+                place(escape.location.as_ref()),
+                escape.detail
+            );
+        }
+    }
 }
 
 fn render_location(

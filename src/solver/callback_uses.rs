@@ -1,0 +1,1550 @@
+//! Follows the selected factory result from each callsite to the calls made with it. The walk is
+//! over the source, not over explored paths, so a call is reported with its arguments whether or
+//! not an explored path executed it; explored invocations fill in arguments that depend on
+//! context.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+use crate::{
+    ids::FileId,
+    ir::{
+        FlowArrowBody, FlowAssignmentTarget, FlowExpression, FlowExpressionKind, FlowJsxProp,
+        FlowJsxTag, FlowPattern, FlowPatternKind, FlowStatement, SourceSpan,
+    },
+    link::{LinkedSymbol, LinkedValue, ValueResolution, pattern_names},
+    query::{
+        QueryCallsiteValues, QueryCapabilityCall, QueryCapabilityEscape, QueryCapabilityStatus,
+        QueryCapabilityUse, QuerySpec, QueryValue, Reachability,
+    },
+};
+
+use super::{
+    Environment, FactoryCallCandidate, FunctionKey, Solver, UseEdge, UseNode, callee_text,
+    query_value,
+};
+
+/// Scopes and targets one callsite's walk may visit.
+const WALK_LIMIT: usize = 400;
+/// Scope changes from the callsite to a call.
+const MAX_HOPS: usize = 8;
+
+/// A property name, or `[index]` for an array element, on the way from a value to the factory
+/// result inside it.
+type Step = String;
+
+/// What the walk follows in one scope.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum Target {
+    /// A binding, with the steps from its value to the factory result.
+    Name(String, Vec<Step>),
+    /// The expression at this span in the scope's file, with the steps from its value to the
+    /// factory result. With a callee name, only a call to that name matches, since a use site
+    /// can also be a call that receives the name as an argument.
+    Site(u32, u32, Option<String>, Vec<Step>),
+}
+
+/// How an expression is used by the expression or statement that contains it.
+#[derive(Clone)]
+enum Role<'e> {
+    /// A condition, an operand, or a discarded value.
+    Other,
+    Bind(&'e FlowPattern),
+    Return,
+    Assign(&'e FlowAssignmentTarget),
+    Callee,
+    Argument(usize),
+    Prop(&'e str),
+    PropSpread,
+    Field(&'e str),
+    FieldSpread,
+    Element(usize),
+    /// The object of a property read with this key, if the key is known.
+    Member(Option<Step>),
+    /// A value the parent passes on, such as a branch of `?:` or an operand of `??`.
+    Through,
+    /// The expression body of an arrow.
+    ArrowBody,
+}
+
+#[derive(Clone)]
+struct Frame<'e> {
+    expression: &'e FlowExpression,
+    role: Role<'e>,
+}
+
+/// What an occurrence of the followed value leads to.
+enum Lead<'e> {
+    Call {
+        call: &'e FlowExpression,
+        arguments: &'e [FlowExpression],
+        context: Vec<String>,
+        /// Parameters of the innermost function around the call.
+        parameters: Vec<String>,
+    },
+    /// Passed as an event handler to an intrinsic element, which calls it with an event.
+    Handler {
+        span: SourceSpan,
+        prop: String,
+        context: Vec<String>,
+    },
+    Same(Target),
+    Enter {
+        scopes: Vec<UseNode>,
+        parameter: usize,
+        steps: Vec<Step>,
+        hop: String,
+    },
+    Callers(Vec<Step>),
+    Escape {
+        span: SourceSpan,
+        detail: String,
+        context: Vec<String>,
+    },
+    /// A use that is not a call, such as a comparison.
+    Used,
+    /// A read of something else in the value that holds the result.
+    Unrelated,
+}
+
+/// A call found by the walk, before its arguments are evaluated.
+struct FoundCall {
+    file_id: FileId,
+    span: SourceSpan,
+    arguments: Option<Vec<FlowExpression>>,
+    context: Vec<String>,
+    via: Vec<String>,
+    /// Names bound in the scope that holds the call; arguments that read them depend on context.
+    locals: std::rc::Rc<BTreeSet<String>>,
+    /// Parameters of the innermost function around the call.
+    parameters: Vec<String>,
+}
+
+struct Walk {
+    calls: Vec<FoundCall>,
+    escapes: Vec<(SourceSpan, String, Vec<String>, Vec<String>)>,
+    /// Whether the result was used anywhere after the factory callsite binds it.
+    used: bool,
+}
+
+/// The parameters and body of a scope the walk can enter.
+struct ScopeCode<'a> {
+    file_id: FileId,
+    params: &'a [FlowPattern],
+    body: ScopeBody<'a>,
+    name: String,
+    /// Whether the scope is a function; a module binding may hold another value.
+    callable: bool,
+}
+
+enum ScopeBody<'a> {
+    Statements(&'a [FlowStatement]),
+    Expression(&'a FlowExpression),
+}
+
+/// Hooks whose later arguments are dependency lists rather than values they use.
+fn takes_dependencies(callee: &str) -> bool {
+    let name = callee.rsplit('.').next().unwrap_or(callee);
+    matches!(
+        name,
+        "useEffect"
+            | "useLayoutEffect"
+            | "useInsertionEffect"
+            | "useCallback"
+            | "useMemo"
+            | "useImperativeHandle"
+    )
+}
+
+/// Calls that return their first argument.
+fn returns_first_argument(callee: &str) -> bool {
+    let name = callee.rsplit('.').next().unwrap_or(callee);
+    matches!(name, "useCallback" | "useEvent" | "useEffectEvent")
+}
+
+/// Calls that return what their first argument, a function, returns.
+fn returns_callback_result(callee: &str) -> bool {
+    let name = callee.rsplit('.').next().unwrap_or(callee);
+    name == "useMemo"
+}
+
+/// The steps from the factory call's value to the selected result.
+fn initial_steps(query: &QuerySpec) -> Vec<Step> {
+    query.capability.returned_index.map_or_else(
+        || query.capability.returned_property.clone(),
+        |index| vec![format!("[{index}]")],
+    )
+}
+
+/// The targets a pattern binds for a value whose result is at `steps`.
+fn bind_targets(pattern: &FlowPattern, steps: &[Step], targets: &mut Vec<Target>) {
+    match &pattern.kind {
+        FlowPatternKind::Identifier { name } => {
+            targets.push(Target::Name(name.clone(), steps.to_vec()));
+        }
+        FlowPatternKind::Default { target, .. } => bind_targets(target, steps, targets),
+        FlowPatternKind::Object { fields, rest } => {
+            let Some(first) = steps.first() else {
+                return;
+            };
+            if let Some(field) = fields.iter().find(|field| &field.source_property == first) {
+                bind_targets(&field.target, &steps[1..], targets);
+            } else if let Some(rest) = rest {
+                bind_targets(rest, steps, targets);
+            }
+        }
+        FlowPatternKind::Array { elements } => {
+            let Some(index) = steps
+                .first()
+                .and_then(|step| step.strip_prefix('['))
+                .and_then(|step| step.strip_suffix(']'))
+                .and_then(|index| index.parse::<usize>().ok())
+            else {
+                return;
+            };
+            if let Some(Some(element)) = elements.get(index) {
+                bind_targets(element, &steps[1..], targets);
+            }
+        }
+        FlowPatternKind::Unsupported { .. } => {}
+    }
+}
+
+fn collect_pattern_locals(pattern: &FlowPattern, locals: &mut BTreeSet<String>) {
+    locals.extend(pattern_names(pattern).into_iter().map(str::to_owned));
+}
+
+fn collect_statement_locals(statements: &[FlowStatement], locals: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement {
+            FlowStatement::Bind(binding) => {
+                collect_pattern_locals(&binding.pattern, locals);
+                collect_expression_locals(&binding.value, locals);
+            }
+            FlowStatement::Return {
+                value: Some(value), ..
+            }
+            | FlowStatement::Expression { value, .. }
+            | FlowStatement::Assign { value, .. }
+            | FlowStatement::Throw { value, .. } => collect_expression_locals(value, locals),
+            FlowStatement::If {
+                consequent,
+                alternate,
+                ..
+            } => {
+                collect_statement_locals(consequent, locals);
+                collect_statement_locals(alternate, locals);
+            }
+            FlowStatement::Return { value: None, .. } | FlowStatement::Unsupported(_) => {}
+        }
+    }
+}
+
+/// Names bound by arrows nested in an expression, such as handler parameters.
+fn collect_expression_locals(expression: &FlowExpression, locals: &mut BTreeSet<String>) {
+    let mut children = Vec::new();
+    expression_children(expression, &mut children);
+    if let FlowExpressionKind::Arrow { params, body } = &expression.kind {
+        for param in params {
+            collect_pattern_locals(param, locals);
+        }
+        if let FlowArrowBody::Statements { statements } = body {
+            collect_statement_locals(statements, locals);
+        }
+    }
+    for child in children {
+        collect_expression_locals(child, locals);
+    }
+}
+
+/// The direct subexpressions of an expression, except an arrow's statements.
+fn expression_children<'e>(expression: &'e FlowExpression, children: &mut Vec<&'e FlowExpression>) {
+    match &expression.kind {
+        FlowExpressionKind::Record { fields } => {
+            children.extend(fields.iter().map(|field| &field.value));
+        }
+        FlowExpressionKind::Array { elements } => children.extend(elements),
+        FlowExpressionKind::Spread { value }
+        | FlowExpressionKind::LogicalNot { value }
+        | FlowExpressionKind::LooseNullEquality { value, .. } => children.push(value),
+        FlowExpressionKind::StaticMember { object, .. } => children.push(object),
+        FlowExpressionKind::ComputedMember { object, property } => {
+            children.push(object);
+            children.push(property);
+        }
+        FlowExpressionKind::Call { callee, arguments } => {
+            children.push(callee);
+            children.extend(arguments);
+        }
+        FlowExpressionKind::StrictEquality { left, right, .. }
+        | FlowExpressionKind::Logical { left, right, .. } => {
+            children.push(left);
+            children.push(right);
+        }
+        FlowExpressionKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            children.push(test);
+            children.push(consequent);
+            children.push(alternate);
+        }
+        FlowExpressionKind::Arrow {
+            body: FlowArrowBody::Expression { expression },
+            ..
+        } => children.push(expression),
+        FlowExpressionKind::JsxElement { props, .. } => {
+            for prop in props {
+                match prop {
+                    FlowJsxProp::Property { value, .. } | FlowJsxProp::Spread { value, .. } => {
+                        children.push(value);
+                    }
+                    FlowJsxProp::Unsupported(_) => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether evaluating an expression without its local scope gives its value: it has no calls,
+/// functions, or JSX, and reads no local names.
+fn is_context_free(expression: &FlowExpression, locals: &BTreeSet<String>) -> bool {
+    match &expression.kind {
+        FlowExpressionKind::Identifier { name, .. } => !locals.contains(name),
+        FlowExpressionKind::Call { .. }
+        | FlowExpressionKind::Arrow { .. }
+        | FlowExpressionKind::JsxElement { .. }
+        | FlowExpressionKind::DynamicImport { .. }
+        | FlowExpressionKind::Unsupported { .. } => false,
+        _ => {
+            let mut children = Vec::new();
+            expression_children(expression, &mut children);
+            children
+                .into_iter()
+                .all(|child| is_context_free(child, locals))
+        }
+    }
+}
+
+fn tag_text(tag: &FlowJsxTag) -> String {
+    match tag {
+        FlowJsxTag::Identifier { name, .. } => name.clone(),
+        FlowJsxTag::Member {
+            object, property, ..
+        } => format!("{object}.{property}"),
+        FlowJsxTag::Unsupported { syntax } => syntax.clone(),
+    }
+}
+
+/// Describes the function an arrow frame starts, from how its parent uses it.
+fn describe_arrow(frames: &[Frame<'_>], index: usize) -> String {
+    let parent = index.checked_sub(1).map(|parent| frames[parent].expression);
+    match (&frames[index].role, parent.map(|parent| &parent.kind)) {
+        (Role::Prop(name), Some(FlowExpressionKind::JsxElement { tag, .. })) => {
+            format!("the {name} prop of <{}>", tag_text(tag))
+        }
+        (Role::Argument(_), Some(FlowExpressionKind::Call { callee, .. })) => {
+            format!("the callback passed to {}", callee_text(callee))
+        }
+        (Role::Field(name), _) => format!("the {name} property"),
+        (Role::Bind(pattern), _) => pattern_names(pattern)
+            .first()
+            .map_or_else(|| "a local function".to_owned(), |name| (*name).to_owned()),
+        _ => "a nested function".to_owned(),
+    }
+}
+
+/// The parameter names of the innermost function around frame `index`.
+fn innermost_parameters(frames: &[Frame<'_>], index: usize) -> Vec<String> {
+    (0..index)
+        .rev()
+        .find_map(|frame| match &frames[frame].expression.kind {
+            FlowExpressionKind::Arrow { params, .. } => Some(
+                params
+                    .iter()
+                    .flat_map(pattern_names)
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The functions enclosing frame `index`, innermost first.
+fn context_of(frames: &[Frame<'_>], index: usize) -> Vec<String> {
+    (0..index)
+        .rev()
+        .filter(|&frame| {
+            matches!(
+                frames[frame].expression.kind,
+                FlowExpressionKind::Arrow { .. }
+            )
+        })
+        .map(|frame| describe_arrow(frames, frame))
+        .collect()
+}
+
+/// Calls `found` for every expression in statements, with the frames from the statement down.
+fn visit_statements<'e>(
+    statements: &'e [FlowStatement],
+    frames: &mut Vec<Frame<'e>>,
+    found: &mut dyn FnMut(&[Frame<'e>]),
+) {
+    for statement in statements {
+        match statement {
+            FlowStatement::Bind(binding) => {
+                visit(&binding.value, Role::Bind(&binding.pattern), frames, found);
+            }
+            FlowStatement::Return {
+                value: Some(value), ..
+            } => visit(value, Role::Return, frames, found),
+            FlowStatement::Expression { value, .. } | FlowStatement::Throw { value, .. } => {
+                visit(value, Role::Other, frames, found);
+            }
+            FlowStatement::Assign { target, value, .. } => {
+                visit(value, Role::Assign(target), frames, found);
+                match target {
+                    FlowAssignmentTarget::StaticMember { object, .. } => {
+                        visit(object, Role::Other, frames, found);
+                    }
+                    FlowAssignmentTarget::ComputedMember { object, property } => {
+                        visit(object, Role::Other, frames, found);
+                        visit(property, Role::Other, frames, found);
+                    }
+                    FlowAssignmentTarget::Identifier { .. }
+                    | FlowAssignmentTarget::Unsupported { .. } => {}
+                }
+            }
+            FlowStatement::If {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                visit(test, Role::Other, frames, found);
+                visit_statements(consequent, frames, found);
+                visit_statements(alternate, frames, found);
+            }
+            FlowStatement::Return { value: None, .. } | FlowStatement::Unsupported(_) => {}
+        }
+    }
+}
+
+fn visit<'e>(
+    expression: &'e FlowExpression,
+    role: Role<'e>,
+    frames: &mut Vec<Frame<'e>>,
+    found: &mut dyn FnMut(&[Frame<'e>]),
+) {
+    frames.push(Frame { expression, role });
+    found(frames);
+    match &expression.kind {
+        FlowExpressionKind::Record { fields } => {
+            for field in fields {
+                let role = if field.spread {
+                    Role::FieldSpread
+                } else {
+                    Role::Field(&field.property)
+                };
+                visit(&field.value, role, frames, found);
+            }
+        }
+        FlowExpressionKind::Array { elements } => {
+            for (index, element) in elements.iter().enumerate() {
+                visit(element, Role::Element(index), frames, found);
+            }
+        }
+        FlowExpressionKind::Spread { value } => visit(value, Role::Through, frames, found),
+        FlowExpressionKind::LogicalNot { value }
+        | FlowExpressionKind::LooseNullEquality { value, .. } => {
+            visit(value, Role::Other, frames, found);
+        }
+        FlowExpressionKind::StaticMember { object, property } => {
+            visit(object, Role::Member(Some(property.clone())), frames, found);
+        }
+        FlowExpressionKind::ComputedMember { object, property } => {
+            let key = match &property.kind {
+                FlowExpressionKind::Number { value } => Some(format!("[{value}]")),
+                FlowExpressionKind::String { value } => Some(value.clone()),
+                _ => None,
+            };
+            visit(object, Role::Member(key), frames, found);
+            visit(property, Role::Other, frames, found);
+        }
+        FlowExpressionKind::Call { callee, arguments } => {
+            visit(callee, Role::Callee, frames, found);
+            for (index, argument) in arguments.iter().enumerate() {
+                visit(argument, Role::Argument(index), frames, found);
+            }
+        }
+        FlowExpressionKind::StrictEquality { left, right, .. } => {
+            visit(left, Role::Other, frames, found);
+            visit(right, Role::Other, frames, found);
+        }
+        FlowExpressionKind::Logical { left, right, .. } => {
+            visit(left, Role::Through, frames, found);
+            visit(right, Role::Through, frames, found);
+        }
+        FlowExpressionKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            visit(test, Role::Other, frames, found);
+            visit(consequent, Role::Through, frames, found);
+            visit(alternate, Role::Through, frames, found);
+        }
+        FlowExpressionKind::Arrow { body, .. } => match body {
+            FlowArrowBody::Expression { expression } => {
+                visit(expression, Role::ArrowBody, frames, found);
+            }
+            FlowArrowBody::Statements { statements } => visit_statements(statements, frames, found),
+        },
+        FlowExpressionKind::JsxElement { props, .. } => {
+            for prop in props {
+                match prop {
+                    FlowJsxProp::Property { name, value, .. } => {
+                        visit(value, Role::Prop(name), frames, found);
+                    }
+                    FlowJsxProp::Spread { value, .. } => {
+                        visit(value, Role::PropSpread, frames, found);
+                    }
+                    FlowJsxProp::Unsupported(_) => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    frames.pop();
+}
+
+impl Solver<'_> {
+    /// For each matching factory callsite, the values it was called with and the calls made with
+    /// its selected result.
+    pub(super) fn callsite_values(&mut self, query: &QuerySpec) -> Vec<QueryCallsiteValues> {
+        let candidates = self
+            .factory_candidates()
+            .into_iter()
+            .filter(|candidate| self.expression_matches_model(candidate.file_id, &candidate.callee))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let graph = self.use_graph();
+        let mut results = Vec::new();
+        for candidate in &candidates {
+            let walk = self.walk_capability(candidate, query, &graph);
+            results.push(self.summarize_callsite(candidate, query, walk));
+        }
+        results
+    }
+
+    /// The scope that holds a factory callsite.
+    fn candidate_scope(&self, candidate: &FactoryCallCandidate) -> Option<UseNode> {
+        candidate.enclosing_function.clone().map_or_else(
+            || {
+                self.globals_ir
+                    .iter()
+                    .position(|(file_id, binding)| {
+                        *file_id == candidate.file_id
+                            && binding.span.start <= candidate.span.start
+                            && candidate.span.end <= binding.span.end
+                    })
+                    .map(UseNode::Global)
+            },
+            |key| Some(UseNode::Function(key)),
+        )
+    }
+
+    fn scope_code(&self, scope: &UseNode) -> Option<ScopeCode<'_>> {
+        match scope {
+            UseNode::Function(key) => {
+                let function = self.functions.get(key)?;
+                Some(ScopeCode {
+                    file_id: key.file_id,
+                    params: &function.params,
+                    body: ScopeBody::Statements(&function.body),
+                    name: key.name.clone(),
+                    callable: true,
+                })
+            }
+            UseNode::Global(index) => {
+                let (file_id, binding) = self.globals_ir.get(*index)?;
+                let name = pattern_names(&binding.pattern)
+                    .first()
+                    .map_or_else(String::new, |name| (*name).to_owned());
+                let mut value = &binding.value;
+                // A component wrapped by `memo`, `forwardRef`, or a similar call.
+                if let FlowExpressionKind::Call { arguments, .. } = &value.kind
+                    && let Some(first) = arguments.first()
+                    && matches!(first.kind, FlowExpressionKind::Arrow { .. })
+                {
+                    value = first;
+                }
+                match &value.kind {
+                    FlowExpressionKind::Arrow { params, body } => Some(ScopeCode {
+                        file_id: *file_id,
+                        params,
+                        body: match body {
+                            FlowArrowBody::Statements { statements } => {
+                                ScopeBody::Statements(statements)
+                            }
+                            FlowArrowBody::Expression { expression } => {
+                                ScopeBody::Expression(expression)
+                            }
+                        },
+                        name,
+                        callable: true,
+                    }),
+                    _ => Some(ScopeCode {
+                        file_id: *file_id,
+                        params: &[],
+                        body: ScopeBody::Expression(value),
+                        name,
+                        callable: false,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// The scopes a linked declaration runs as: a function with any class methods that share
+    /// its props, or a module binding.
+    fn declaration_scopes(&self, symbol: &LinkedSymbol) -> Vec<UseNode> {
+        let key = FunctionKey {
+            file_id: symbol.file_id,
+            name: symbol.name.clone(),
+        };
+        if self.functions.contains_key(&key) {
+            let prefix = format!("{}.", key.name);
+            let mut scopes = vec![UseNode::Function(key)];
+            scopes.extend(
+                self.functions
+                    .keys()
+                    .filter(|other| {
+                        other.file_id == symbol.file_id && other.name.starts_with(&prefix)
+                    })
+                    .cloned()
+                    .map(UseNode::Function),
+            );
+            return scopes;
+        }
+        let Some(&index) = self.global_bindings.get(symbol) else {
+            return Vec::new();
+        };
+        self.lazy_scopes(index)
+            .unwrap_or_else(|| vec![UseNode::Global(index)])
+    }
+
+    /// For a module binding built by a loader, such as `lazy(() => import('./Panel'))` or
+    /// `load({ promise: () => import('./Panel') })`, the scopes of the component it loads.
+    fn lazy_scopes(&self, index: usize) -> Option<Vec<UseNode>> {
+        let (file_id, binding) = self.globals_ir.get(index)?;
+        let FlowExpressionKind::Call { arguments, .. } = &binding.value.kind else {
+            return None;
+        };
+        let (module, export) = arguments.iter().find_map(|argument| match &argument.kind {
+            FlowExpressionKind::Arrow { .. } => loaded_module(argument),
+            FlowExpressionKind::Record { fields } => {
+                fields.iter().find_map(|field| loaded_module(&field.value))
+            }
+            _ => None,
+        })?;
+        let file = self.symbol_linker.file(*file_id)?;
+        let path = self
+            .symbol_linker
+            .import_resolutions(&file.path)
+            .filter(|resolution| resolution.specifier == module)
+            .find_map(|resolution| resolution.resolved_path.as_ref())?;
+        let target = self.symbol_linker.file_at(path)?;
+        match self
+            .symbol_linker
+            .resolve_exported_value(target.file_id, &export)
+        {
+            ValueResolution::Resolved(LinkedValue::Declaration(symbol)) => {
+                let scopes = self.declaration_scopes(&symbol);
+                (!scopes.is_empty()).then_some(scopes)
+            }
+            _ => None,
+        }
+    }
+
+    /// The scopes a name, or a namespace member, refers to from a file.
+    fn resolve_scopes(&self, file_id: FileId, name: &str, member: Option<&str>) -> Vec<UseNode> {
+        match (self.symbol_linker.resolve_binding(file_id, name), member) {
+            (ValueResolution::Resolved(LinkedValue::Declaration(symbol)), None) => {
+                self.declaration_scopes(&symbol)
+            }
+            (ValueResolution::Resolved(LinkedValue::Namespace(namespace)), Some(member)) => {
+                match self.symbol_linker.resolve_exported_value(namespace, member) {
+                    ValueResolution::Resolved(LinkedValue::Declaration(symbol)) => {
+                        self.declaration_scopes(&symbol)
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Follows an occurrence of the result at `frames[index]`, whose value holds the result at
+    /// `steps`.
+    fn follow<'e>(
+        &self,
+        file_id: FileId,
+        frames: &[Frame<'e>],
+        index: usize,
+        steps: Vec<Step>,
+    ) -> Lead<'e> {
+        let frame = &frames[index];
+        let parent = index.checked_sub(1).map(|parent| frames[parent].expression);
+        match &frame.role {
+            Role::Member(key) => match (steps.first(), key) {
+                (Some(first), Some(key)) if first == key => {
+                    self.follow(file_id, frames, index - 1, steps[1..].to_vec())
+                }
+                (Some(_), Some(_)) => Lead::Unrelated,
+                _ => Lead::Used,
+            },
+            Role::Callee => match parent {
+                Some(
+                    call @ FlowExpression {
+                        kind: FlowExpressionKind::Call { arguments, .. },
+                        ..
+                    },
+                ) if steps.is_empty() => Lead::Call {
+                    call,
+                    arguments,
+                    context: context_of(frames, index),
+                    parameters: innermost_parameters(frames, index),
+                },
+                _ => Lead::Unrelated,
+            },
+            Role::Argument(position) => {
+                let Some(FlowExpression {
+                    kind: FlowExpressionKind::Call { callee, .. },
+                    span,
+                }) = parent
+                else {
+                    return Lead::Used;
+                };
+                let text = callee_text(callee);
+                if *position > 0 && takes_dependencies(&text) {
+                    return Lead::Used;
+                }
+                if *position == 0 && returns_first_argument(&text) {
+                    return self.follow(file_id, frames, index - 1, steps);
+                }
+                let scopes = match &callee.kind {
+                    FlowExpressionKind::Identifier { name, .. } => {
+                        self.resolve_scopes(file_id, name, None)
+                    }
+                    FlowExpressionKind::StaticMember { object, property } => match &object.kind {
+                        FlowExpressionKind::Identifier { name, .. } => {
+                            self.resolve_scopes(file_id, name, Some(property))
+                        }
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
+                if scopes.is_empty() {
+                    Lead::Escape {
+                        span: span.clone(),
+                        detail: format!("passed to {text}, which the walk does not follow"),
+                        context: context_of(frames, index),
+                    }
+                } else {
+                    Lead::Enter {
+                        scopes,
+                        parameter: *position,
+                        steps,
+                        hop: format!("argument {} of {text}", position + 1),
+                    }
+                }
+            }
+            Role::Prop(_) | Role::PropSpread => {
+                let Some(FlowExpression {
+                    kind: FlowExpressionKind::JsxElement { tag, .. },
+                    span,
+                }) = parent
+                else {
+                    return Lead::Used;
+                };
+                let prop = match &frame.role {
+                    Role::Prop(name) => Some(*name),
+                    _ => None,
+                };
+                let steps = prop.map_or(steps.clone(), |prop| {
+                    std::iter::once(prop.to_owned())
+                        .chain(steps.iter().cloned())
+                        .collect()
+                });
+                let (scopes, intrinsic) = match tag {
+                    FlowJsxTag::Identifier {
+                        name,
+                        intrinsic: true,
+                        ..
+                    } => (Vec::new(), Some(name.clone())),
+                    FlowJsxTag::Identifier { name, .. } => {
+                        (self.resolve_scopes(file_id, name, None), None)
+                    }
+                    FlowJsxTag::Member {
+                        object, property, ..
+                    } => (self.resolve_scopes(file_id, object, Some(property)), None),
+                    FlowJsxTag::Unsupported { .. } => (Vec::new(), None),
+                };
+                if intrinsic.is_some() {
+                    // An explored handler invocation is at the element, so the call is too.
+                    return match (prop, steps.len()) {
+                        (Some(prop), 1) if prop.starts_with("on") => Lead::Handler {
+                            span: span.clone(),
+                            prop: prop.to_owned(),
+                            context: context_of(frames, index),
+                        },
+                        _ => Lead::Used,
+                    };
+                }
+                let shown = prop.map_or_else(
+                    || format!("spread props of <{}>", tag_text(tag)),
+                    |prop| format!("prop {prop} of <{}>", tag_text(tag)),
+                );
+                if scopes.is_empty() {
+                    Lead::Escape {
+                        span: span.clone(),
+                        detail: format!("{shown}, whose component the walk does not follow"),
+                        context: context_of(frames, index),
+                    }
+                } else {
+                    Lead::Enter {
+                        scopes,
+                        parameter: 0,
+                        steps,
+                        hop: shown,
+                    }
+                }
+            }
+            Role::Field(name) => self.follow(
+                file_id,
+                frames,
+                index - 1,
+                std::iter::once((*name).to_owned()).chain(steps).collect(),
+            ),
+            Role::Element(position) => self.follow(
+                file_id,
+                frames,
+                index - 1,
+                std::iter::once(format!("[{position}]"))
+                    .chain(steps)
+                    .collect(),
+            ),
+            Role::FieldSpread | Role::Through => self.follow(file_id, frames, index - 1, steps),
+            Role::ArrowBody => self.follow_arrow_result(file_id, frames, index - 1, steps),
+            Role::Return => {
+                let arrow = (0..index).rev().find(|&frame| {
+                    matches!(
+                        frames[frame].expression.kind,
+                        FlowExpressionKind::Arrow { .. }
+                    )
+                });
+                match arrow {
+                    Some(arrow) => self.follow_arrow_result(file_id, frames, arrow, steps),
+                    None => Lead::Callers(steps),
+                }
+            }
+            Role::Bind(pattern) => {
+                // A pattern binds at most one name to the value at one step path.
+                let mut targets = Vec::new();
+                bind_targets(pattern, &steps, &mut targets);
+                targets.pop().map_or(Lead::Unrelated, Lead::Same)
+            }
+            Role::Assign(target) => match target {
+                FlowAssignmentTarget::Identifier { name } => {
+                    Lead::Same(Target::Name(name.clone(), steps))
+                }
+                _ => Lead::Escape {
+                    span: frame.expression.span.clone(),
+                    detail: "stored in a property, which the walk does not follow".to_owned(),
+                    context: context_of(frames, index),
+                },
+            },
+            Role::Other => Lead::Used,
+        }
+    }
+
+    /// Follows the value an arrow returns: only `useMemo` hands it on.
+    fn follow_arrow_result<'e>(
+        &self,
+        file_id: FileId,
+        frames: &[Frame<'e>],
+        arrow: usize,
+        steps: Vec<Step>,
+    ) -> Lead<'e> {
+        match (
+            &frames[arrow].role,
+            arrow
+                .checked_sub(1)
+                .map(|call| &frames[call].expression.kind),
+        ) {
+            (Role::Argument(0), Some(FlowExpressionKind::Call { callee, .. }))
+                if returns_callback_result(&callee_text(callee)) =>
+            {
+                self.follow(file_id, frames, arrow - 1, steps)
+            }
+            _ => Lead::Used,
+        }
+    }
+
+    /// Walks from a factory callsite to the calls made with its selected result.
+    fn walk_capability(
+        &self,
+        candidate: &FactoryCallCandidate,
+        query: &QuerySpec,
+        graph: &HashMap<UseNode, Vec<UseEdge>>,
+    ) -> Walk {
+        let mut walk = Walk {
+            calls: Vec::new(),
+            escapes: Vec::new(),
+            used: false,
+        };
+        let Some(start) = self.candidate_scope(candidate) else {
+            return walk;
+        };
+        let mut queue = VecDeque::from([(
+            start,
+            Target::Site(
+                candidate.span.start,
+                candidate.span.end,
+                None,
+                initial_steps(query),
+            ),
+            Vec::<String>::new(),
+        )]);
+        let mut seen = HashSet::new();
+        let mut locals_cache = HashMap::<UseNode, std::rc::Rc<BTreeSet<String>>>::new();
+        let mut handlers = HashSet::new();
+        while let Some((scope, target, via)) = queue.pop_front() {
+            if seen.len() >= WALK_LIMIT || !seen.insert((scope.clone(), target.clone())) {
+                continue;
+            }
+            let Some(code) = self.scope_code(&scope) else {
+                continue;
+            };
+            let locals = locals_cache
+                .entry(scope.clone())
+                .or_insert_with(|| std::rc::Rc::new(self.scope_locals(&scope).unwrap_or_default()))
+                .clone();
+            let mut leads = Vec::new();
+            let file_id = code.file_id;
+            let mut found = |frames: &[Frame<'_>]| {
+                let frame = frames.last().expect("visited frame");
+                let expression = frame.expression;
+                let steps = match (&target, &expression.kind) {
+                    (
+                        Target::Name(name, steps),
+                        FlowExpressionKind::Identifier { name: seen, .. },
+                    ) if seen == name => steps.clone(),
+                    (Target::Site(start, end, callee, steps), kind)
+                        if expression.span.start == *start
+                            && expression.span.end == *end
+                            && callee.as_ref().is_none_or(|callee| {
+                                matches!(kind, FlowExpressionKind::Call { callee: called, .. }
+                                    if callee_text(called).rsplit('.').next() == Some(callee))
+                            }) =>
+                    {
+                        steps.clone()
+                    }
+                    _ => return,
+                };
+                let lead = self.follow(file_id, frames, frames.len() - 1, steps);
+                leads.push(match lead {
+                    Lead::Call {
+                        call,
+                        arguments,
+                        context,
+                        parameters,
+                    } => (
+                        Some((
+                            call.span.clone(),
+                            Some(arguments.to_vec()),
+                            context,
+                            parameters,
+                        )),
+                        None,
+                    ),
+                    Lead::Handler {
+                        span,
+                        prop,
+                        context,
+                    } => {
+                        let mut context = context;
+                        context.insert(0, format!("the {prop} handler of an intrinsic element"));
+                        (Some((span, None, context, Vec::new())), None)
+                    }
+                    other => (None, Some(other.into_owned())),
+                });
+            };
+            let mut frames = Vec::new();
+            match code.body {
+                ScopeBody::Statements(statements) => {
+                    visit_statements(statements, &mut frames, &mut found);
+                }
+                ScopeBody::Expression(expression) => {
+                    visit(expression, Role::Return, &mut frames, &mut found);
+                }
+            }
+            let is_start = via.is_empty() && matches!(target, Target::Site(_, _, None, _));
+            for (call, lead) in leads {
+                if let Some((span, arguments, context, parameters)) = call {
+                    walk.used = true;
+                    if arguments.is_none() && !handlers.insert(span.clone()) {
+                        continue;
+                    }
+                    walk.calls.push(FoundCall {
+                        file_id,
+                        span,
+                        arguments,
+                        context,
+                        via: via.clone(),
+                        locals: locals.clone(),
+                        parameters,
+                    });
+                    continue;
+                }
+                match lead.expect("a lead") {
+                    OwnedLead::Same(next) => {
+                        walk.used |= !is_start;
+                        queue.push_back((scope.clone(), next, via.clone()));
+                    }
+                    OwnedLead::Enter {
+                        scopes,
+                        parameter,
+                        steps,
+                        hop,
+                    } => {
+                        walk.used = true;
+                        if via.len() >= MAX_HOPS {
+                            continue;
+                        }
+                        let mut next_via = via.clone();
+                        next_via.push(hop);
+                        for next in scopes {
+                            let Some(code) = self.scope_code(&next) else {
+                                continue;
+                            };
+                            if !code.callable {
+                                walk.escapes.push((
+                                    self.scope_span(&next),
+                                    format!(
+                                        "{}, whose value {} is not a function the walk follows",
+                                        next_via.last().map_or("", String::as_str),
+                                        code.name
+                                    ),
+                                    Vec::new(),
+                                    via.clone(),
+                                ));
+                                continue;
+                            }
+                            // A function without the parameter cannot read the result.
+                            let Some(param) = code.params.get(parameter) else {
+                                continue;
+                            };
+                            let mut targets = Vec::new();
+                            bind_targets(param, &steps, &mut targets);
+                            for target in targets {
+                                queue.push_back((next.clone(), target, next_via.clone()));
+                            }
+                        }
+                    }
+                    OwnedLead::Callers(steps) => {
+                        walk.used = true;
+                        if via.len() >= MAX_HOPS {
+                            continue;
+                        }
+                        let callee = code.name.rsplit('.').next().map(str::to_owned);
+                        let edges = graph.get(&scope).map_or(&[][..], Vec::as_slice);
+                        if edges.is_empty() {
+                            walk.escapes.push((
+                                self.scope_span(&scope),
+                                format!(
+                                    "returned by {}, whose callers are not in the parsed files",
+                                    code.name
+                                ),
+                                Vec::new(),
+                                via.clone(),
+                            ));
+                        }
+                        for edge in edges {
+                            let mut next_via = via.clone();
+                            next_via.push(format!(
+                                "returned by {} to {}",
+                                code.name,
+                                self.scope_code(&edge.user)
+                                    .map_or_else(String::new, |user| user.name)
+                            ));
+                            queue.push_back((
+                                edge.user.clone(),
+                                Target::Site(
+                                    edge.site.start,
+                                    edge.site.end,
+                                    callee.clone(),
+                                    steps.clone(),
+                                ),
+                                next_via,
+                            ));
+                        }
+                    }
+                    OwnedLead::Escape {
+                        span,
+                        detail,
+                        context,
+                    } => {
+                        walk.used = true;
+                        walk.escapes.push((span, detail, context, via.clone()));
+                    }
+                    OwnedLead::Used => walk.used |= !is_start,
+                    OwnedLead::Unrelated => {}
+                }
+            }
+        }
+        walk
+    }
+
+    fn scope_span(&self, scope: &UseNode) -> SourceSpan {
+        match scope {
+            UseNode::Function(key) => self.functions[key].span.clone(),
+            UseNode::Global(index) => self.globals_ir[*index].1.span.clone(),
+        }
+    }
+
+    /// Names a scope binds: its parameters and every binding in its body, nested functions
+    /// included.
+    fn scope_locals(&self, scope: &UseNode) -> Option<BTreeSet<String>> {
+        let code = self.scope_code(scope)?;
+        let mut locals = BTreeSet::new();
+        for param in code.params {
+            collect_pattern_locals(param, &mut locals);
+        }
+        match code.body {
+            ScopeBody::Statements(statements) => collect_statement_locals(statements, &mut locals),
+            ScopeBody::Expression(expression) => collect_expression_locals(expression, &mut locals),
+        }
+        Some(locals)
+    }
+
+    /// Evaluates a context-free argument with only module bindings, without keeping the gaps
+    /// the evaluation records.
+    fn evaluate_context_free(
+        &mut self,
+        file_id: FileId,
+        expression: &FlowExpression,
+    ) -> QueryValue {
+        let gaps = self.coverage_gaps.len();
+        let query_gaps = self.query_gaps.len();
+        let environment: Environment = self.module_environment(file_id);
+        let value = self.eval(expression, &environment, file_id);
+        for gap in self.coverage_gaps.drain(gaps..) {
+            self.coverage_gap_keys.remove(&gap);
+        }
+        for (gap, _, _, choice) in self.query_gaps.drain(query_gaps..) {
+            self.query_gap_keys.remove(&(gap, choice));
+        }
+        query_value(&value)
+    }
+
+    fn summarize_callsite(
+        &mut self,
+        candidate: &FactoryCallCandidate,
+        query: &QuerySpec,
+        walk: Walk,
+    ) -> QueryCallsiteValues {
+        // What exploration found at the callsite, copied out so arguments can be evaluated.
+        let mut reachability = Reachability::Unknown;
+        let mut contexts = 0;
+        let mut explored_factory_arguments = Vec::new();
+        let mut explored =
+            BTreeMap::<(u32, u32), (SourceSpan, Vec<BTreeMap<String, QueryValue>>)>::new();
+        for capability in self
+            .capabilities
+            .iter()
+            .filter(|capability| capability.callsite == candidate.span)
+        {
+            contexts += 1;
+            if rank(capability.reachability) < rank(reachability) {
+                reachability = capability.reachability;
+            }
+            explored_factory_arguments.push(
+                query
+                    .factory_arguments
+                    .iter()
+                    .map(|projection| {
+                        capability
+                            .factory_arguments
+                            .get(projection.index)
+                            .map_or_else(
+                                || QueryValue::Unknown {
+                                    reason: "missing_argument".to_owned(),
+                                },
+                                query_value,
+                            )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            for invocation in &capability.invocations {
+                let span = &self.evidence[invocation.evidence.0 as usize].span;
+                let arguments = query
+                    .capability
+                    .invocation_arguments
+                    .iter()
+                    .map(|projection| {
+                        (
+                            projection.label.clone(),
+                            invocation
+                                .arguments
+                                .get(projection.index)
+                                .map_or(QueryValue::Undefined, query_value),
+                        )
+                    })
+                    .collect();
+                explored
+                    .entry((span.file_id.0, span.start))
+                    .or_insert_with(|| (span.clone(), Vec::new()))
+                    .1
+                    .push(arguments);
+            }
+        }
+        let mut factory_arguments = BTreeMap::<String, Vec<QueryValue>>::new();
+        let candidate_locals = if contexts == 0 {
+            self.candidate_scope(candidate)
+                .and_then(|scope| self.scope_locals(&scope))
+                .unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
+        for (position, projection) in query.factory_arguments.iter().enumerate() {
+            let mut values = Vec::new();
+            if contexts == 0 {
+                // No context explored the callsite; what it writes may still be known.
+                values.push(match candidate.arguments.get(projection.index) {
+                    Some(argument) if is_context_free(argument, &candidate_locals) => {
+                        self.evaluate_context_free(candidate.file_id, argument)
+                    }
+                    Some(_) => QueryValue::Unknown {
+                        reason: "callsite_not_explored".to_owned(),
+                    },
+                    None => QueryValue::Undefined,
+                });
+            }
+            for arguments in &explored_factory_arguments {
+                if !values.contains(&arguments[position]) {
+                    values.push(arguments[position].clone());
+                }
+            }
+            factory_arguments.insert(projection.label.clone(), values);
+        }
+        let mut calls = Vec::new();
+        let mut covered = BTreeSet::new();
+        for call in walk.calls {
+            let key = (call.span.file_id.0, call.span.start);
+            let explored_arguments = explored.get(&key).map(|(_, arguments)| arguments);
+            if explored_arguments.is_some() {
+                covered.insert(key);
+            }
+            let mut arguments = BTreeMap::<String, Vec<QueryValue>>::new();
+            for projection in &query.capability.invocation_arguments {
+                let mut values = Vec::new();
+                let written = call
+                    .arguments
+                    .as_ref()
+                    .map(|arguments| arguments.get(projection.index));
+                match written {
+                    Some(Some(expression)) if is_context_free(expression, &call.locals) => {
+                        values.push(self.evaluate_context_free(call.file_id, expression));
+                    }
+                    Some(None) => values.push(QueryValue::Undefined),
+                    _ => {}
+                }
+                if values.iter().all(value_is_known) {
+                    // A context-free value holds on every path.
+                } else {
+                    values.clear();
+                }
+                if values.is_empty() {
+                    for explored in explored_arguments.into_iter().flatten() {
+                        if let Some(value) = explored.get(&projection.label)
+                            && !values.contains(value)
+                        {
+                            values.push(value.clone());
+                        }
+                    }
+                }
+                if values.is_empty() {
+                    values.push(QueryValue::Unknown {
+                        reason: if call.arguments.is_none() {
+                            "event_from_intrinsic_element".to_owned()
+                        } else if written_parameter(
+                            call.arguments.as_deref(),
+                            projection.index,
+                            &call.parameters,
+                        ) {
+                            "argument_is_a_parameter_of_the_enclosing_function".to_owned()
+                        } else {
+                            "argument_depends_on_unexplored_context".to_owned()
+                        },
+                    });
+                }
+                arguments.insert(projection.label.clone(), values);
+            }
+            let arguments_resolved = arguments.values().flatten().all(value_is_known);
+            calls.push(QueryCapabilityCall {
+                location: self.query_location(&call.span),
+                context: call.context,
+                via: call.via,
+                arguments,
+                arguments_resolved,
+                explored: explored_arguments.is_some(),
+            });
+        }
+        // Explored invocations the walk did not reach, such as through a value it lost.
+        for (key, (span, invocations)) in &explored {
+            if covered.contains(key) {
+                continue;
+            }
+            let mut arguments = BTreeMap::<String, Vec<QueryValue>>::new();
+            for invocation in invocations {
+                for (label, value) in invocation {
+                    let values = arguments.entry(label.clone()).or_default();
+                    if !values.contains(value) {
+                        values.push(value.clone());
+                    }
+                }
+            }
+            let arguments_resolved = arguments.values().flatten().all(value_is_known);
+            calls.push(QueryCapabilityCall {
+                location: self.query_location(span),
+                context: Vec::new(),
+                via: vec!["found by exploration".to_owned()],
+                arguments,
+                arguments_resolved,
+                explored: true,
+            });
+        }
+        calls.sort_by(|left, right| {
+            location_key(left.location.as_ref()).cmp(&location_key(right.location.as_ref()))
+        });
+        let escapes = walk
+            .escapes
+            .into_iter()
+            .map(|(span, detail, context, via)| QueryCapabilityEscape {
+                location: self.query_location(&span),
+                detail,
+                context,
+                via,
+            })
+            .collect::<Vec<_>>();
+        let status = if !calls.is_empty() {
+            if calls.iter().all(|call| call.arguments_resolved) {
+                QueryCapabilityStatus::Called
+            } else {
+                QueryCapabilityStatus::CalledWithUnknownArguments
+            }
+        } else if !escapes.is_empty() {
+            QueryCapabilityStatus::Escapes
+        } else if walk.used {
+            QueryCapabilityStatus::NotCalled
+        } else {
+            QueryCapabilityStatus::Unused
+        };
+        let location = self.query_location(&candidate.span);
+        let unreached_reason = self
+            .unreached_callsites
+            .iter()
+            .find(|unreached| unreached.location == location)
+            .map(|unreached| unreached.reason);
+        let enclosing = self
+            .candidate_scope(candidate)
+            .map(|scope| self.describe_node(&scope));
+        let factory_arguments_resolved = factory_arguments.values().flatten().all(value_is_known);
+        QueryCallsiteValues {
+            location,
+            enclosing,
+            reachability,
+            unreached_reason,
+            contexts,
+            factory_arguments,
+            factory_arguments_resolved,
+            capability: QueryCapabilityUse {
+                status,
+                calls,
+                escapes,
+            },
+        }
+    }
+}
+
+/// A lead without borrowed IR, for the walk queue.
+enum OwnedLead {
+    Same(Target),
+    Enter {
+        scopes: Vec<UseNode>,
+        parameter: usize,
+        steps: Vec<Step>,
+        hop: String,
+    },
+    Callers(Vec<Step>),
+    Escape {
+        span: SourceSpan,
+        detail: String,
+        context: Vec<String>,
+    },
+    Used,
+    Unrelated,
+}
+
+impl Lead<'_> {
+    fn into_owned(self) -> OwnedLead {
+        match self {
+            Lead::Same(target) => OwnedLead::Same(target),
+            Lead::Enter {
+                scopes,
+                parameter,
+                steps,
+                hop,
+            } => OwnedLead::Enter {
+                scopes,
+                parameter,
+                steps,
+                hop,
+            },
+            Lead::Callers(steps) => OwnedLead::Callers(steps),
+            Lead::Escape {
+                span,
+                detail,
+                context,
+            } => OwnedLead::Escape {
+                span,
+                detail,
+                context,
+            },
+            Lead::Call { .. } | Lead::Handler { .. } | Lead::Used => OwnedLead::Used,
+            Lead::Unrelated => OwnedLead::Unrelated,
+        }
+    }
+}
+
+/// The module and export a loader callback imports: `() => import('./Panel')` loads the default
+/// export, and `() => import('./Panel').then((module) => module.Panel)` a named one.
+fn loaded_module(callback: &FlowExpression) -> Option<(String, String)> {
+    let FlowExpressionKind::Arrow { body, .. } = &callback.kind else {
+        return None;
+    };
+    let returned = match body {
+        FlowArrowBody::Expression { expression } => expression.as_ref(),
+        FlowArrowBody::Statements { statements } => {
+            statements.iter().find_map(|statement| match statement {
+                FlowStatement::Return {
+                    value: Some(value), ..
+                } => Some(value),
+                _ => None,
+            })?
+        }
+    };
+    match &returned.kind {
+        FlowExpressionKind::DynamicImport { module } => {
+            Some((module.clone(), "default".to_owned()))
+        }
+        FlowExpressionKind::Call { callee, arguments } => {
+            let FlowExpressionKind::StaticMember { object, property } = &callee.kind else {
+                return None;
+            };
+            let FlowExpressionKind::DynamicImport { module } = &object.kind else {
+                return None;
+            };
+            if property != "then" {
+                return None;
+            }
+            let FlowExpressionKind::Arrow {
+                params,
+                body: FlowArrowBody::Expression { expression },
+            } = &arguments.first()?.kind
+            else {
+                return None;
+            };
+            let [
+                FlowPattern {
+                    kind: FlowPatternKind::Identifier { name: module_name },
+                    ..
+                },
+            ] = params.as_slice()
+            else {
+                return None;
+            };
+            // `(module) => module.Panel` or `(module) => ({ default: module.Panel })`.
+            let read = match &expression.kind {
+                FlowExpressionKind::Record { fields } => {
+                    &fields
+                        .iter()
+                        .find(|field| field.property == "default")?
+                        .value
+                }
+                _ => expression.as_ref(),
+            };
+            match &read.kind {
+                FlowExpressionKind::StaticMember { object, property } => match &object.kind {
+                    FlowExpressionKind::Identifier { name, .. } if name == module_name => {
+                        Some((module.clone(), property.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether the argument at `index` is one of the enclosing function's parameters, so its value
+/// comes from that function's callers.
+fn written_parameter(
+    arguments: Option<&[FlowExpression]>,
+    index: usize,
+    parameters: &[String],
+) -> bool {
+    matches!(
+        arguments.and_then(|arguments| arguments.get(index)).map(|argument| &argument.kind),
+        Some(FlowExpressionKind::Identifier { name, .. }) if parameters.contains(name)
+    )
+}
+
+/// Orders reachability from strongest to weakest.
+fn rank(reachability: Reachability) -> u8 {
+    match reachability {
+        Reachability::Reachable => 0,
+        Reachability::Possible => 1,
+        Reachability::Unknown => 2,
+    }
+}
+
+fn value_is_known(value: &QueryValue) -> bool {
+    match value {
+        QueryValue::Unknown { .. } => false,
+        QueryValue::Alternatives { values } | QueryValue::Array { elements: values } => {
+            values.iter().all(value_is_known)
+        }
+        _ => true,
+    }
+}
+
+fn location_key(location: Option<&crate::query::QueryLocation>) -> (String, u32, u32) {
+    location.map_or_else(
+        || (String::new(), 0, 0),
+        |location| {
+            (
+                location.path.clone(),
+                location.start_line,
+                location.start_column,
+            )
+        },
+    )
+}
