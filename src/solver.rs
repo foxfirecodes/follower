@@ -200,6 +200,10 @@ struct UseEdge {
     context: UseContext,
 }
 
+/// An uncalled callback run: closure file and start, reachability, choice, and the factory
+/// results it carries.
+type UncalledRun = (u32, u32, Reachability, Option<String>, Vec<usize>);
+
 /// A render being remembered: under an assumption only its key, and on an exact path also what
 /// it showed its ancestors.
 enum RenderMemo {
@@ -254,6 +258,8 @@ struct ClosureValue {
     environment: Environment,
     file_id: FileId,
     span: SourceSpan,
+    /// Whether anything in the model called this closure.
+    called: std::cell::Cell<bool>,
 }
 
 /// Known properties of a record. A closed record, such as an object literal or JSX props, has
@@ -798,6 +804,12 @@ struct Solver<'a> {
     unreached_callsites: Vec<QueryUnreachedCallsite>,
     /// Calls of each function in progress.
     active_functions: std::collections::HashMap<FunctionKey, usize>,
+    /// Closures carrying a factory result, in creation order, until the render that created
+    /// them ends.
+    pending_callbacks: Vec<Rc<ClosureValue>>,
+    /// Uncalled callbacks already run, by closure site, reachability, choice, and the factory
+    /// results they carry.
+    uncalled_runs: std::collections::HashSet<UncalledRun>,
     /// Components returned by a configured wrapper, which may add props when rendering them.
     wrapped_components: BTreeSet<FunctionKey>,
     /// Counts budget stops that may have cut a render short.
@@ -952,6 +964,8 @@ impl<'a> Solver<'a> {
             exact_renders: std::collections::HashMap::new(),
             unreached_callsites: Vec::new(),
             active_functions: std::collections::HashMap::new(),
+            pending_callbacks: Vec::new(),
+            uncalled_runs: std::collections::HashSet::new(),
             wrapped_components: BTreeSet::new(),
             render_truncations: 0,
             render_log: Vec::new(),
@@ -1063,8 +1077,10 @@ impl<'a> Solver<'a> {
                     kind: QueryCallPathKind::Entry,
                     span: entry_span.clone(),
                 }];
+                let pending = self.pending_callbacks.len();
                 let returned = self.call_function(&entry_key, arguments);
                 self.render(returned);
+                self.run_uncalled_callbacks(pending);
                 self.trace.clear();
             }
         }
@@ -2558,18 +2574,24 @@ impl<'a> Solver<'a> {
                         "inline wrapper captures tracked callback state",
                     )
                 });
-                TrackedValue {
-                    value: AbstractValue::Closure(Rc::new(ClosureValue {
-                        body: body.clone(),
-                        params: params.clone(),
-                        environment: captured,
-                        file_id,
-                        span: expression.span.clone(),
-                    })),
+                let closure = Rc::new(ClosureValue {
+                    body: body.clone(),
+                    params: params.clone(),
+                    environment: captured,
+                    file_id,
+                    span: expression.span.clone(),
+                    called: std::cell::Cell::new(false),
+                });
+                let value = TrackedValue {
+                    value: AbstractValue::Closure(Rc::clone(&closure)),
                     evidence,
                     choice: self.current_choice.clone(),
                     heap_id: None,
+                };
+                if self.model.scan_callback_bodies && contains_capability(&value) {
+                    self.pending_callbacks.push(closure);
                 }
+                value
             }
             FlowExpressionKind::JsxElement { tag, props } => {
                 self.note_exact_site(&expression.span);
@@ -3193,6 +3215,57 @@ impl<'a> Solver<'a> {
         };
         self.trace.truncate(trace_len);
         result
+    }
+
+    /// Runs the closures created since `start` that carry a factory result and that nothing in
+    /// the model called, such as event handlers in props, with unknown
+    /// arguments. Whether they run at all is not known, so an exact path continues as possible.
+    fn run_uncalled_callbacks(&mut self, start: usize) {
+        if !self.model.scan_callback_bodies {
+            self.pending_callbacks.truncate(start);
+            return;
+        }
+        let reachability = self.current_reachability;
+        if reachability == Reachability::Reachable {
+            self.current_reachability = Reachability::Possible;
+        }
+        let mut index = start;
+        while index < self.pending_callbacks.len() {
+            let closure = Rc::clone(&self.pending_callbacks[index]);
+            index += 1;
+            if closure.called.get() {
+                continue;
+            }
+            let value = TrackedValue::plain(AbstractValue::Closure(Rc::clone(&closure)));
+            let key = (
+                closure.span.file_id.0,
+                closure.span.start,
+                self.current_reachability,
+                self.current_choice.clone(),
+                self.value_capability_ids(&value),
+            );
+            if !self.uncalled_runs.insert(key) {
+                continue;
+            }
+            let trace_len = self.trace.len();
+            self.trace.push(TraceStep {
+                kind: QueryCallPathKind::UncalledCallback,
+                span: closure.span.clone(),
+            });
+            let arguments = closure
+                .params
+                .iter()
+                .map(|_| TrackedValue::unknown("uncalled_callback_argument"))
+                .collect();
+            let returned = self.call_closure(&closure, arguments);
+            // A render callback may hand the factory result to the JSX it returns.
+            if contains_capability(&returned) {
+                self.render(returned);
+            }
+            self.trace.truncate(trace_len);
+        }
+        self.pending_callbacks.truncate(start);
+        self.current_reachability = reachability;
     }
 
     fn scan_callback_bodies(&mut self, value: &TrackedValue, span: &SourceSpan, depth: usize) {
@@ -3988,6 +4061,7 @@ impl<'a> Solver<'a> {
         }
         match &element.component.value {
             AbstractValue::Function(key) => {
+                let pending = self.pending_callbacks.len();
                 let props = element.props.clone();
                 let tracking = self.begin_render_tracking(&props);
                 let mut received = element.props;
@@ -4015,8 +4089,10 @@ impl<'a> Solver<'a> {
                         self.scan_callback_bodies(prop, &element.span, 0);
                     }
                 }
+                self.run_uncalled_callbacks(pending);
             }
             AbstractValue::Closure(closure) => {
+                let pending = self.pending_callbacks.len();
                 let props = element.props.clone();
                 let tracking = self.begin_render_tracking(&props);
                 let argument = TrackedValue::plain(AbstractValue::Record(Rc::new(element.props)));
@@ -4038,6 +4114,7 @@ impl<'a> Solver<'a> {
                         self.scan_callback_bodies(prop, &element.span, 0);
                     }
                 }
+                self.run_uncalled_callbacks(pending);
             }
             AbstractValue::Intrinsic(name) => {
                 for (prop_name, handler) in element.props {
@@ -5156,6 +5233,7 @@ impl<'a> Solver<'a> {
         closure: &ClosureValue,
         arguments: Vec<TrackedValue>,
     ) -> TrackedValue {
+        let stops = self.budget_stops();
         if self.current_reachability == Reachability::Reachable {
             self.reach
                 .closures
@@ -5209,7 +5287,23 @@ impl<'a> Solver<'a> {
         };
         self.active_captures.pop();
         self.trace.truncate(trace_len);
+        // A call a budget cut short may not have reached what the closure does.
+        if self.budget_stops() == stops {
+            closure.called.set(true);
+        }
         returned
+    }
+
+    /// Grows whenever a budget stops an evaluation or render, so a caller can tell whether a
+    /// call ran to completion.
+    fn budget_stops(&self) -> usize {
+        self.render_truncations
+            + self
+                .unreached_render_evaluations
+                .saturating_sub(MAX_UNREACHED_RENDER_EVALUATIONS)
+            + self
+                .reverse_evaluations
+                .saturating_sub(MAX_REVERSE_IMPORTER_EVALUATIONS)
     }
 
     fn call_model(&mut self, arguments: &[TrackedValue], span: SourceSpan) -> TrackedValue {
@@ -5696,8 +5790,10 @@ impl<'a> Solver<'a> {
                 let arguments = (0..parameter_count)
                     .map(|_| TrackedValue::unknown("unreached_function_parameter"))
                     .collect();
+                let pending = self.pending_callbacks.len();
                 let returned = self.call_function(key, arguments);
                 self.render_unreached(returned, &candidate.span);
+                self.run_unreached_callbacks(pending, &candidate.span);
             } else if let Some(binding) = self
                 .symbol_linker
                 .file(candidate.file_id)
@@ -5724,11 +5820,13 @@ impl<'a> Solver<'a> {
                     let arguments = (0..closure.params.len())
                         .map(|_| TrackedValue::unknown("unreached_function_parameter"))
                         .collect();
+                    let pending = self.pending_callbacks.len();
                     let returned = self.invoke_value(callable, arguments, candidate.span.clone());
                     if exported && returns_capability_data(&returned) {
                         self.capability_producer_files.insert(candidate.file_id);
                     }
                     self.render_unreached(returned, &candidate.span);
+                    self.run_unreached_callbacks(pending, &candidate.span);
                 }
             }
             if !self
@@ -5784,6 +5882,18 @@ impl<'a> Solver<'a> {
         }
         self.current_choice = None;
         self.current_reachability = Reachability::Reachable;
+    }
+
+    /// Runs an unreached callsite's uncalled callbacks with their own render budget, so a large
+    /// subtree rendered first does not leave none for the callsite's own handlers.
+    fn run_unreached_callbacks(&mut self, pending: usize, span: &SourceSpan) {
+        self.unreached_render_evaluations = 0;
+        self.unreached_render_budget_reported = false;
+        self.unreached_render_seed_span = Some(span.clone());
+        self.unreached_render_budget_active = true;
+        self.run_uncalled_callbacks(pending);
+        self.unreached_render_budget_active = false;
+        self.unreached_render_seed_span = None;
     }
 
     fn render_unreached(&mut self, value: TrackedValue, span: &SourceSpan) {

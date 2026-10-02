@@ -49,7 +49,13 @@ For a hook that returns `[selectedItem, applyAction]`, select the second element
 `returned_index = 1` instead of `returned_property`. These selectors are mutually exclusive.
 Use `scan_callback_bodies = true` at the top level of the query when you want calls inside
 callbacks handed to opaque libraries or component props. Those calls are candidates: the report
-keeps a coverage gap because the consumer might never invoke the callback.
+keeps a coverage gap because the consumer might never invoke the callback. The option also runs,
+after each component renders, the callbacks created during the render that carry the factory
+result and that nothing in the model called, such as handlers in intrinsic props other than
+`onClick` or in records passed elsewhere. They run with unknown arguments and at most possible
+reachability, and invocation paths mark the step as `uncalled_callback`. A call that a budget cut
+short does not count as a call, and an unreached callsite's callbacks get their own render
+budget, so a large subtree cannot use it all first.
 
 The synthetic tuple fixture in `tests/tuple_query.rs` uses this query shape:
 
@@ -302,10 +308,10 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
 
 Query report schema version 8 includes both stable source byte spans and file paths with one-based
 line/column locations for factory calls and invocations. Each invocation now includes
-`call_path`: ordered entry, call, render, modeled render, assumed render, factory, and invocation
-locations from the explored path. Version 8 adds `possible` reachability and `assumed_render` path
-steps. An invocation is reported once per callsite and projected argument values; `call_path` is
-the first explored path and `other_paths` counts the rest. The `evidence` array keeps what the
+`call_path`: ordered entry, call, render, modeled render, assumed render, uncalled callback,
+factory, and invocation locations from the explored path. Version 8 adds `possible` reachability
+and `assumed_render` path steps. An invocation is reported once per callsite and projected
+argument values; `call_path` is the first explored path and `other_paths` counts the rest. The `evidence` array keeps what the
 report refers to (factory and invocation arguments, registrations, unresolved references, and gap
 evidence paths) with ancestors up to 64 steps and every mutation step, so the evidence graph stays
 navigable without every intermediate evaluation. The HTML view shows file transitions by default and can expand every same-file

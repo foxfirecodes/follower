@@ -148,7 +148,7 @@
     }
     const prefix = sharedDirectory(full.map(step => step.location));
     if (prefix) section.append(node('p', 'call-root mono muted', `Relative to ${prefix}`));
-    const compact = full.filter((step, index) => index === 0 || index === full.length - 1 || step.location.path !== full[index + 1].location.path || step.kind === 'factory' || step.kind === 'invocation' || step.kind === 'assumed_render');
+    const compact = full.filter((step, index) => index === 0 || index === full.length - 1 || step.location.path !== full[index + 1].location.path || step.kind === 'factory' || step.kind === 'invocation' || step.kind === 'assumed_render' || step.kind === 'uncalled_callback');
     const chain = node('ol', 'call-chain');
     let expanded = false;
     const toggle = button('', () => { expanded = !expanded; renderSteps(); });

@@ -222,6 +222,9 @@ pub enum QueryCallPathKind {
     ModeledRender,
     /// A render through a component whose behavior is not modeled.
     AssumedRender,
+    /// A callback that carries the factory result and that nothing in the model called, such as
+    /// an event handler, run because it may be.
+    UncalledCallback,
     Factory,
     Invocation,
 }

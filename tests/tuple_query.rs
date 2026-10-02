@@ -454,6 +454,52 @@ fn recursion_over_unknown_data_stops_at_the_recursion_budget() {
 }
 
 #[test]
+fn uncalled_callbacks_carrying_the_result_run_as_possible_handlers() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/App.tsx",
+            "import { useItemSelection } from './hook'; function Notice() { const [, apply] = useItemSelection(['alpha']); return <div onMouseLeave={() => apply('left')} onClick={() => apply('clicked')} />; } export function App() { return <Notice />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        &TUPLE_QUERY.replace(
+            "scope = 'reachable'\n",
+            "scope = 'reachable'\nscan_callback_bodies = true\n",
+        ),
+    );
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 1);
+    assert_eq!(report.creations[0].reachability, Reachability::Reachable);
+    let mut actions = report.creations[0]
+        .invocations
+        .iter()
+        .map(|invocation| {
+            let QueryValue::String { value } = &invocation.arguments["action"] else {
+                panic!("{:?}", invocation.arguments);
+            };
+            let uncalled = invocation
+                .call_path
+                .iter()
+                .any(|step| step.kind == QueryCallPathKind::UncalledCallback);
+            (value.clone(), uncalled)
+        })
+        .collect::<Vec<_>>();
+    actions.sort();
+    // The click handler is modeled; nothing in the model calls the other handler, so it runs as
+    // one that may, and its path says so.
+    assert_eq!(
+        actions,
+        [("clicked".to_owned(), false), ("left".to_owned(), true)]
+    );
+}
+
+#[test]
 fn class_property_methods_are_bound_to_instance_props() {
     let (exact, other) = exact_actions(&[(
         "src/App.tsx",
