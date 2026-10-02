@@ -380,6 +380,16 @@ fn default_props_fill_missing_class_and_function_component_props() {
 }
 
 #[test]
+fn class_property_methods_are_bound_to_instance_props() {
+    let (exact, other) = exact_actions(&[(
+        "src/App.tsx",
+        "import * as React from 'react'; import { Leaf } from './Leaf'; function Wrapper({ render }) { return render('bound'); } class Panel extends React.Component { handleRender = (label) => <Leaf action={label} />; renderBody() { return <Leaf action={this.props.mode} />; } render() { return <div><Wrapper render={this.handleRender} />{this.renderBody()}</div>; } } export function App() { return <Panel mode='method' />; }",
+    )]);
+    assert_eq!(exact, ["bound", "method"], "{other:?}");
+    assert!(other.is_empty(), "{other:?}");
+}
+
+#[test]
 fn react_element_and_children_apis_keep_paths_exact() {
     let (exact, other) = exact_actions(&[(
         "src/App.tsx",

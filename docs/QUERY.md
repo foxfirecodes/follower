@@ -262,6 +262,9 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   `jsx_dropped_by_a_partially_modeled_component` gap if its body reached anything the model could
   not follow. A fully modeled body that does not render a prop, such as one that returns `null`,
   keeps it unrendered.
+- Class components: methods and function-valued class properties (`handleClick = () => {...}`)
+  are modeled as methods. Reading one as a value, as in `onClick={this.handleClick}` or a render
+  function child, gives a function bound to the instance's props.
 - Records built from object literals and JSX props are closed: they have exactly the listed
   properties, so reading a missing one gives `undefined`, as in JavaScript, and a guard such as
   `onClose != null` on a prop that was not passed is decided. Defaults in destructuring and
@@ -293,7 +296,11 @@ Query report schema version 8 includes both stable source byte spans and file pa
 line/column locations for factory calls and invocations. Each invocation now includes
 `call_path`: ordered entry, call, render, modeled render, assumed render, factory, and invocation
 locations from the explored path. Version 8 adds `possible` reachability and `assumed_render` path
-steps. The HTML view shows file transitions by default and can expand every same-file
+steps. An invocation is reported once per callsite and projected argument values; `call_path` is
+the first explored path and `other_paths` counts the rest. The `evidence` array keeps what the
+report refers to (factory and invocation arguments, registrations, unresolved references, and gap
+evidence paths) with ancestors up to 64 steps and every mutation step, so the evidence graph stays
+navigable without every intermediate evaluation. The HTML view shows file transitions by default and can expand every same-file
 step. The path is a modeled possibility; a factory call and later callback invocation need not
 occur in one runtime stack. JSON also includes
 `callsite_inventory`: syntactic calls found in parsed candidate files, labeled `analyzed`,

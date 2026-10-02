@@ -138,6 +138,7 @@
   function callPath(invocation, reachability) {
     const section = node('div', 'call-path');
     section.append(node('h4', '', reachability === 'reachable' ? 'Path to this invocation' : reachability === 'possible' ? 'Assumed path to this invocation' : 'Local path to this invocation'));
+    if (invocation.other_paths) section.append(node('p', 'aside', `${invocation.other_paths} other explored path${invocation.other_paths === 1 ? '' : 's'} reach this invocation with the same values; this is the first.`));
     const full = invocation.call_path || [];
     if (!full.length) {
       section.append(node('p', 'muted', 'No path was recorded. Rerun the query with the current engine.'));

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use oxc::{
     ast::ast::{
@@ -35,6 +35,7 @@ pub fn lower(
         output: FlowFileIr::default(),
         scoping,
         current_class: None,
+        class_members: BTreeMap::new(),
     };
     for statement in &program.body {
         lowerer.lower_top_level(statement);
@@ -62,6 +63,8 @@ struct Lowerer<'s> {
     output: FlowFileIr,
     scoping: &'s Scoping,
     current_class: Option<String>,
+    /// Methods and function-valued properties of the current class, with their arity.
+    class_members: BTreeMap<String, usize>,
 }
 
 impl Lowerer<'_> {
@@ -389,7 +392,80 @@ impl Lowerer<'_> {
         };
         let class_name = identifier.name.to_string();
         self.current_class = Some(class_name.clone());
+        self.class_members = class
+            .body
+            .body
+            .iter()
+            .filter_map(|element| match element {
+                ClassElement::MethodDefinition(method)
+                    if !method.r#static
+                        && !method.computed
+                        && method.kind == oxc::ast::ast::MethodDefinitionKind::Method =>
+                {
+                    let name = method.key.static_name()?;
+                    (name != "render").then(|| (name.into_owned(), method.value.params.items.len()))
+                }
+                ClassElement::PropertyDefinition(property)
+                    if !property.r#static && !property.computed =>
+                {
+                    let arity = match property.value.as_ref()? {
+                        Expression::ArrowFunctionExpression(function) => {
+                            function.params.items.len()
+                        }
+                        Expression::FunctionExpression(function) => function.params.items.len(),
+                        _ => return None,
+                    };
+                    Some((property.key.static_name()?.into_owned(), arity))
+                }
+                _ => None,
+            })
+            .collect();
         for element in &class.body.body {
+            // A function-valued class property is a method bound to the instance.
+            if let ClassElement::PropertyDefinition(property) = element
+                && !property.r#static
+                && !property.computed
+                && let Some(name) = property.key.static_name()
+                && let Some(value) = &property.value
+            {
+                let lowered = match value {
+                    Expression::ArrowFunctionExpression(function) => Some((
+                        self.lower_params(&function.params),
+                        match &function.body {
+                            ArrowFunctionBody::FunctionBody(body) => {
+                                self.lower_statements(&body.statements)
+                            }
+                            body => vec![FlowStatement::Return {
+                                value: Some(self.lower_expression(body.to_expression())),
+                                span: self.span(function.span),
+                            }],
+                        },
+                    )),
+                    Expression::FunctionExpression(function) => Some((
+                        self.lower_params(&function.params),
+                        function
+                            .body
+                            .as_ref()
+                            .map_or_else(Vec::new, |body| self.lower_statements(&body.statements)),
+                    )),
+                    _ => None,
+                };
+                if let Some((params, body)) = lowered {
+                    let mut all = vec![FlowPattern {
+                        kind: FlowPatternKind::Identifier {
+                            name: "props".to_owned(),
+                        },
+                        span: self.span(property.span),
+                    }];
+                    all.extend(params);
+                    self.output.functions.push(FlowFunction {
+                        name: format!("{class_name}.{name}"),
+                        params: all,
+                        body,
+                        span: self.span(property.span),
+                    });
+                }
+            }
             if let ClassElement::PropertyDefinition(property) = element
                 && property.r#static
                 && property.key.static_name().as_deref() == Some("defaultProps")
@@ -436,6 +512,7 @@ impl Lowerer<'_> {
             });
         }
         self.current_class = None;
+        self.class_members.clear();
     }
 
     fn lower_params(&self, params: &FormalParameters<'_>) -> Vec<FlowPattern> {
@@ -751,16 +828,54 @@ impl Lowerer<'_> {
                     && self.current_class.is_some() =>
             {
                 let property = member.property.name.as_str();
+                let name = if property == "props" {
+                    "props".to_owned()
+                } else {
+                    format!(
+                        "{}.{}",
+                        self.current_class.as_deref().unwrap_or_default(),
+                        property
+                    )
+                };
+                // A method read as a value is bound to the instance, so calling it later passes
+                // the instance's props like a direct `this.method()` call.
+                if let Some(arity) = self.class_members.get(property).copied() {
+                    let span = self.span(member.span);
+                    let identifier = |name: String| FlowExpression {
+                        kind: FlowExpressionKind::Identifier {
+                            name,
+                            module_binding: false,
+                        },
+                        span: span.clone(),
+                    };
+                    let parameters = (0..arity).map(|index| format!("__bound_argument_{index}"));
+                    return FlowExpression {
+                        kind: FlowExpressionKind::Arrow {
+                            params: parameters
+                                .clone()
+                                .map(|name| FlowPattern {
+                                    kind: FlowPatternKind::Identifier { name },
+                                    span: span.clone(),
+                                })
+                                .collect(),
+                            body: FlowArrowBody::Expression {
+                                expression: Box::new(FlowExpression {
+                                    kind: FlowExpressionKind::Call {
+                                        callee: Box::new(identifier(name)),
+                                        arguments: std::iter::once("props".to_owned())
+                                            .chain(parameters)
+                                            .map(identifier)
+                                            .collect(),
+                                    },
+                                    span: span.clone(),
+                                }),
+                            },
+                        },
+                        span,
+                    };
+                }
                 FlowExpressionKind::Identifier {
-                    name: if property == "props" {
-                        "props".to_owned()
-                    } else {
-                        format!(
-                            "{}.{}",
-                            self.current_class.as_deref().unwrap_or_default(),
-                            property
-                        )
-                    },
+                    name,
                     module_binding: false,
                 }
             }
@@ -785,7 +900,7 @@ impl Lowerer<'_> {
                     .collect();
                 if let Expression::StaticMemberExpression(member) = &call.callee
                     && matches!(&member.object, Expression::ThisExpression(_))
-                    && self.current_class.is_some()
+                    && let Some(class) = &self.current_class
                 {
                     arguments.insert(
                         0,
@@ -797,6 +912,19 @@ impl Lowerer<'_> {
                             span: self.span(call.span),
                         },
                     );
+                    return FlowExpression {
+                        kind: FlowExpressionKind::Call {
+                            callee: Box::new(FlowExpression {
+                                kind: FlowExpressionKind::Identifier {
+                                    name: format!("{class}.{}", member.property.name),
+                                    module_binding: false,
+                                },
+                                span: self.span(member.span),
+                            }),
+                            arguments,
+                        },
+                        span: self.span(call.span),
+                    };
                 }
                 FlowExpressionKind::Call {
                     callee: Box::new(self.lower_expression(&call.callee)),

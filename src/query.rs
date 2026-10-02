@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::Path,
 };
@@ -154,7 +154,7 @@ pub enum Reachability {
     Unknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QueryValue {
     Null,
@@ -203,9 +203,13 @@ pub struct QueryInvocation {
     pub arguments: BTreeMap<String, QueryValue>,
     #[serde(default)]
     pub argument_evidence: BTreeMap<String, Option<String>>,
+    /// Other explored paths that reach the same invocation with the same argument values;
+    /// `call_path` shows the first.
+    #[serde(default)]
+    pub other_paths: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryCallPathKind {
     Entry,
@@ -427,6 +431,71 @@ impl QueryGap {
 }
 
 impl QueryReport {
+    /// Keeps the evidence the report refers to and its ancestors up to the evidence path limit,
+    /// within an overall bound. The rest of the solver's evaluation steps are dropped so the
+    /// report stays a usable size.
+    pub fn prune_evidence(&mut self) {
+        let mut referenced = Vec::<u32>::new();
+        let mut add = |id: &str| referenced.extend(evidence_number(id));
+        for creation in &self.creations {
+            creation
+                .factory_argument_evidence
+                .values()
+                .flatten()
+                .for_each(|id| add(id));
+            creation
+                .registrations
+                .iter()
+                .for_each(|finding| add(&finding.finding_id));
+            creation
+                .unresolved
+                .iter()
+                .for_each(|finding| add(&finding.finding_id));
+            creation
+                .all_unresolved_evidence_ids
+                .iter()
+                .for_each(|id| add(id));
+            for invocation in &creation.invocations {
+                add(&invocation.evidence_id);
+                invocation
+                    .argument_evidence
+                    .values()
+                    .flatten()
+                    .for_each(|id| add(id));
+            }
+        }
+        for gap in &self.gaps {
+            for link in &gap.links {
+                link.evidence_path.iter().for_each(|id| add(id));
+                link.invocation_evidence_id.iter().for_each(|id| add(id));
+            }
+        }
+        // Mutations explain aliasing that provenance links do not always reach, and are rare.
+        referenced.extend(
+            self.evidence
+                .iter()
+                .filter(|node| node.relation == crate::evidence::RelationKind::Mutation)
+                .map(|node| node.id.0),
+        );
+        // Ancestors within the evidence path limit, nearest first, up to an overall bound.
+        let mut keep = BTreeSet::new();
+        let mut frontier = referenced
+            .into_iter()
+            .map(|number| (number, 0))
+            .collect::<VecDeque<_>>();
+        while let Some((number, depth)) = frontier.pop_front() {
+            if keep.len() >= KEPT_EVIDENCE_LIMIT || !keep.insert(number) {
+                continue;
+            }
+            if depth < EVIDENCE_PATH_LIMIT
+                && let Some(node) = evidence_by_number(&self.evidence, number)
+            {
+                frontier.extend(node.parents.iter().map(|parent| (parent.0, depth + 1)));
+            }
+        }
+        self.evidence.retain(|node| keep.contains(&node.id.0));
+    }
+
     pub fn finish_gaps(&mut self) {
         let mut seen_summaries = self
             .gaps
@@ -617,24 +686,36 @@ fn span_key(span: &SourceSpan) -> (u32, u32, u32) {
 
 fn evidence_path(evidence: &[Evidence], id: &str) -> Vec<String> {
     let mut path = Vec::new();
-    let mut current = id
-        .strip_prefix('E')
-        .and_then(|digits| digits.parse::<usize>().ok());
-    while let Some(index) = current {
-        let Some(node) = evidence.get(index) else {
+    let mut current = evidence_number(id);
+    while let Some(number) = current {
+        let Some(node) = evidence_by_number(evidence, number) else {
             break;
         };
         path.push(format!("E{}", node.id.0));
-        if path.len() >= 64 {
+        if path.len() >= EVIDENCE_PATH_LIMIT {
             break;
         }
-        current = node.parents.first().map(|parent| parent.0 as usize);
+        current = node.parents.first().map(|parent| parent.0);
     }
     path
 }
 
-fn evidence_for_id<'a>(evidence: &'a [Evidence], id: &str) -> Option<&'a Evidence> {
+const EVIDENCE_PATH_LIMIT: usize = 64;
+const KEPT_EVIDENCE_LIMIT: usize = 250_000;
+
+fn evidence_number(id: &str) -> Option<u32> {
     id.strip_prefix('E')
-        .and_then(|digits| digits.parse::<usize>().ok())
-        .and_then(|index| evidence.get(index))
+        .and_then(|digits| digits.parse::<u32>().ok())
+}
+
+/// Evidence is kept in ID order, including after pruning.
+fn evidence_by_number(evidence: &[Evidence], number: u32) -> Option<&Evidence> {
+    evidence
+        .binary_search_by_key(&number, |node| node.id.0)
+        .ok()
+        .map(|index| &evidence[index])
+}
+
+fn evidence_for_id<'a>(evidence: &'a [Evidence], id: &str) -> Option<&'a Evidence> {
+    evidence_number(id).and_then(|number| evidence_by_number(evidence, number))
 }

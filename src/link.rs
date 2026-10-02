@@ -162,6 +162,7 @@ pub struct SymbolLinker<'a> {
     may_export: RefCell<HashMap<(PathBuf, String), bool>>,
     /// Linkage walks of local bindings, which cannot change while the snapshot is fixed.
     links: RefCell<HashMap<(FileId, String), Rc<LinkOutcome>>>,
+    exported: RefCell<HashMap<(FileId, String), ValueResolution>>,
 }
 
 /// The result of linking one local binding.
@@ -230,6 +231,7 @@ impl<'a> SymbolLinker<'a> {
             unparsed_sources: RefCell::new(HashMap::new()),
             may_export: RefCell::new(HashMap::new()),
             links: RefCell::new(HashMap::new()),
+            exported: RefCell::new(HashMap::new()),
         }
     }
 
@@ -391,10 +393,17 @@ impl<'a> SymbolLinker<'a> {
     }
 
     pub fn resolve_exported_value(&self, file_id: FileId, name: &str) -> ValueResolution {
-        let Some(file) = self.file(file_id) else {
-            return ValueResolution::Unresolved;
-        };
-        self.resolve_export(&file.path, name, &mut LinkWalk::default())
+        let key = (file_id, name.to_owned());
+        if let Some(resolution) = self.exported.borrow().get(&key) {
+            return resolution.clone();
+        }
+        let resolution = self
+            .file(file_id)
+            .map_or(ValueResolution::Unresolved, |file| {
+                self.resolve_export(&file.path, name, &mut LinkWalk::default())
+            });
+        self.exported.borrow_mut().insert(key, resolution.clone());
+        resolution
     }
 
     fn resolve_local_binding(

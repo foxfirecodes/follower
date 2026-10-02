@@ -357,6 +357,8 @@ struct CapabilityState {
     assumptions: Vec<String>,
     /// Boundaries the creation was reached through.
     boundaries: Vec<Rc<str>>,
+    /// Recorded invocations by a hash of their site and projected arguments.
+    invocation_keys: std::collections::HashMap<u64, usize>,
 }
 
 #[derive(Clone)]
@@ -371,9 +373,11 @@ struct InvocationState {
     evidence: EvidenceId,
     arguments: Vec<TrackedValue>,
     call_path: Vec<TraceStep>,
+    /// Further paths reaching this invocation with the same projected arguments.
+    other_paths: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct TraceStep {
     kind: QueryCallPathKind,
     span: SourceSpan,
@@ -384,7 +388,24 @@ struct LocationSource {
     line_starts: Vec<usize>,
 }
 
+thread_local! {
+    /// Sources read for locations, shared by every solver pass on this thread. A file's content
+    /// hash is part of the key, so a rewritten file is read again.
+    static LOCATION_SOURCES: RefCell<std::collections::HashMap<(std::path::PathBuf, String), Rc<LocationSource>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
 impl LocationSource {
+    fn shared(path: &Path, content_hash: &str) -> Option<Rc<Self>> {
+        let key = (path.to_path_buf(), content_hash.to_owned());
+        if let Some(source) = LOCATION_SOURCES.with(|sources| sources.borrow().get(&key).cloned()) {
+            return Some(source);
+        }
+        let source = Rc::new(Self::new(fs::read_to_string(path).ok()?));
+        LOCATION_SOURCES.with(|sources| sources.borrow_mut().insert(key, Rc::clone(&source)));
+        Some(source)
+    }
+
     fn new(text: String) -> Self {
         let mut line_starts = vec![0];
         line_starts.extend(
@@ -656,7 +677,10 @@ struct Solver<'a> {
     coverage_gap_keys: BTreeSet<String>,
     query_gaps: Vec<(String, String, SourceSpan, Option<String>)>,
     query_gap_keys: BTreeSet<(String, Option<String>)>,
-    location_sources: RefCell<BTreeMap<FileId, LocationSource>>,
+    location_sources: RefCell<BTreeMap<FileId, Rc<LocationSource>>>,
+    /// Names each closure body references, by the closure's source span.
+    closure_references: RefCell<std::collections::HashMap<SourceSpan, Rc<ClosureReferences>>>,
+    locations: RefCell<std::collections::HashMap<SourceSpan, Option<QueryLocation>>>,
     requested_imports: BTreeSet<std::path::PathBuf>,
     root_requested_imports: Vec<std::path::PathBuf>,
     root_requested_paths: BTreeSet<std::path::PathBuf>,
@@ -675,6 +699,9 @@ struct Solver<'a> {
     render_log: Vec<RenderMark>,
     /// Counts operations the model could not follow.
     uncertainty_events: usize,
+    /// The most recent of those operations, by event number, for explaining partial models.
+    recent_uncertainty: VecDeque<(usize, Rc<str>, SourceSpan)>,
+    uncertainty_reasons: std::collections::HashMap<String, Rc<str>>,
     assumed_evaluations: usize,
     assumed_budget_reported: bool,
     capability_producer_files: BTreeSet<FileId>,
@@ -800,6 +827,8 @@ impl<'a> Solver<'a> {
             query_gaps: Vec::new(),
             query_gap_keys: BTreeSet::new(),
             location_sources: RefCell::new(BTreeMap::new()),
+            closure_references: RefCell::new(std::collections::HashMap::new()),
+            locations: RefCell::new(std::collections::HashMap::new()),
             requested_imports: BTreeSet::new(),
             root_requested_imports: Vec::new(),
             root_requested_paths: BTreeSet::new(),
@@ -811,6 +840,8 @@ impl<'a> Solver<'a> {
             render_truncations: 0,
             render_log: Vec::new(),
             uncertainty_events: 0,
+            recent_uncertainty: VecDeque::new(),
+            uncertainty_reasons: std::collections::HashMap::new(),
             assumed_evaluations: 0,
             assumed_budget_reported: false,
             capability_producer_files: BTreeSet::new(),
@@ -1162,8 +1193,39 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn record_coverage_gap(&mut self, reason: &str, span: &SourceSpan) {
+    /// Counts one operation the model could not follow and remembers it briefly.
+    fn note_uncertainty(&mut self, reason: &str, span: &SourceSpan) {
+        const RECENT: usize = 4096;
         self.uncertainty_events += 1;
+        let reason = if let Some(reason) = self.uncertainty_reasons.get(reason) {
+            Rc::clone(reason)
+        } else {
+            let interned: Rc<str> = Rc::from(reason);
+            self.uncertainty_reasons
+                .insert(reason.to_owned(), Rc::clone(&interned));
+            interned
+        };
+        if self.recent_uncertainty.len() == RECENT {
+            self.recent_uncertainty.pop_front();
+        }
+        self.recent_uncertainty
+            .push_back((self.uncertainty_events, reason, span.clone()));
+    }
+
+    /// Up to three distinct operations the model could not follow since event `start`.
+    fn uncertainty_since(&self, start: usize) -> Vec<(Rc<str>, SourceSpan)> {
+        let mut seen = BTreeSet::new();
+        self.recent_uncertainty
+            .iter()
+            .filter(|(index, ..)| *index > start)
+            .filter(|(_, reason, _)| seen.insert(Rc::clone(reason)))
+            .take(3)
+            .map(|(_, reason, span)| (Rc::clone(reason), span.clone()))
+            .collect()
+    }
+
+    fn record_coverage_gap(&mut self, reason: &str, span: &SourceSpan) {
+        self.note_uncertainty(reason, span);
         let gap = format!(
             "{reason} at file {} bytes {}..{}",
             span.file_id.0, span.start, span.end
@@ -2248,9 +2310,7 @@ impl<'a> Solver<'a> {
                     .map(|argument| self.eval(argument, environment, file_id))
                     .collect::<Vec<_>>();
                 if matches!(&callee_value.value, AbstractValue::Unknown(_))
-                    && arguments
-                        .iter()
-                        .any(|argument| !capability_ids(argument).is_empty())
+                    && arguments.iter().any(contains_capability)
                 {
                     self.request_imported_callee(file_id, callee);
                 }
@@ -2264,11 +2324,23 @@ impl<'a> Solver<'a> {
                 result
             }
             FlowExpressionKind::Arrow { params, body } => {
-                let mut references = ClosureReferences::default();
-                for param in params {
-                    collect_pattern_references(param, &mut references);
-                }
-                collect_body_references(body, &mut references);
+                let body_references = self.body_references(&expression.span, body);
+                let references = if params.iter().any(|param| {
+                    matches!(
+                        param.kind,
+                        FlowPatternKind::Default { .. }
+                            | FlowPatternKind::Object { .. }
+                            | FlowPatternKind::Array { .. }
+                    )
+                }) {
+                    let mut references = (*body_references).clone();
+                    for param in params {
+                        collect_pattern_references(param, &mut references);
+                    }
+                    Rc::new(references)
+                } else {
+                    body_references
+                };
                 let mut captured = environment
                     .iter()
                     .filter(|(name, _)| {
@@ -2281,7 +2353,7 @@ impl<'a> Solver<'a> {
                         captured.remove(name);
                     }
                 }
-                for name in references.modules {
+                for name in references.modules.iter().cloned() {
                     if let std::collections::btree_map::Entry::Vacant(entry) = captured.entry(name)
                     {
                         let resolution = self.symbol_linker.resolve_binding(file_id, entry.key());
@@ -2844,22 +2916,22 @@ impl<'a> Solver<'a> {
             AbstractValue::ModelFunction => self.call_model(&arguments, span),
             AbstractValue::Capability(capability) => {
                 let projected_arguments = arguments.iter().map(query_value).collect::<Vec<_>>();
-                let call_path = self.trace_at(QueryCallPathKind::Invocation, &span);
-                if self.capabilities.get(capability).is_some_and(|state| {
-                    state.invocations.iter().any(|invocation| {
-                        self.evidence[invocation.evidence.0 as usize].span == span
-                            && invocation.call_path == call_path
-                            && invocation
-                                .arguments
-                                .iter()
-                                .map(query_value)
-                                .collect::<Vec<_>>()
-                                == projected_arguments
-                    })
-                }) {
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    (&span, &projected_arguments).hash(&mut hasher);
+                    hasher.finish()
+                };
+                // Another path to the same invocation with the same values adds nothing new
+                // beyond its count; the first path stays as the example.
+                if let Some(state) = self.capabilities.get_mut(capability)
+                    && let Some(&index) = state.invocation_keys.get(&key)
+                {
+                    state.invocations[index].other_paths += 1;
                     self.trace.truncate(trace_len);
                     return TrackedValue::plain(AbstractValue::Undefined);
                 }
+                let call_path = self.trace_at(QueryCallPathKind::Invocation, &span);
                 let evidence = self.push_evidence(
                     RelationKind::Invocation,
                     "invoke_capability",
@@ -2869,10 +2941,12 @@ impl<'a> Solver<'a> {
                     "matching callback capability is invoked",
                 );
                 if let Some(state) = self.capabilities.get_mut(capability) {
+                    state.invocation_keys.insert(key, state.invocations.len());
                     state.invocations.push(InvocationState {
                         evidence,
                         arguments: arguments.clone(),
                         call_path,
+                        other_paths: 0,
                     });
                 }
                 self.emit_modeled_effects(capability, evidence, span);
@@ -2946,7 +3020,7 @@ impl<'a> Solver<'a> {
     }
 
     fn scan_callback_bodies(&mut self, value: &TrackedValue, span: &SourceSpan, depth: usize) {
-        if depth >= 16 || capability_ids(value).is_empty() {
+        if depth >= 16 || !contains_capability(value) {
             return;
         }
         match &value.value {
@@ -3371,9 +3445,7 @@ impl<'a> Solver<'a> {
                 || values.contains_key("component");
             if let Some(local) = local {
                 if matches!(tag, FlowJsxTag::Identifier { .. })
-                    && values
-                        .values()
-                        .any(|value| !capability_ids(value).is_empty())
+                    && values.values().any(contains_capability)
                 {
                     self.request_import_for_local(file_id, local);
                 } else if renders_content || self.current_reachability != Reachability::Unknown {
@@ -3547,7 +3619,7 @@ impl<'a> Solver<'a> {
             if let AbstractValue::Function(key) = &element.component.value
                 && !self.leads_toward_factory(key)
                 && !element.props.values().any(|value| {
-                    self.carries_render_content(value, 0) || !capability_ids(value).is_empty()
+                    self.carries_render_content(value, 0) || contains_capability(value)
                 })
             {
                 return;
@@ -4171,23 +4243,41 @@ impl<'a> Solver<'a> {
         }
         let previous = self.current_reachability;
         let (module, export) = tag.map_or((None, None), |tag| self.tag_import(tag));
-        let boundary = self.register_boundary(
-            format!("partial:{component}"),
-            span,
-            previous == Reachability::Reachable,
-            || {
+        let key = format!("partial:{component}");
+        let operations = if self.boundaries.contains_key(key.as_str()) {
+            Vec::new()
+        } else {
+            self.uncertainty_since(tracking.uncertainty)
+        };
+        let operations = operations
+            .into_iter()
+            .map(|(reason, span)| {
+                let location = self.query_location(&span).map_or_else(
+                    || format!("file {} bytes {}", span.file_id.0, span.start),
+                    |location| format!("{}:{}", location.path, location.start_line),
+                );
+                format!("{reason} at {location}")
+            })
+            .collect::<Vec<_>>();
+        let boundary =
+            self.register_boundary(key, span, previous == Reachability::Reachable, || {
                 BoundaryState::new(
-                QueryBoundaryKind::PartiallyModeled,
-                tag.map_or_else(|| component.to_owned(), TagOrigin::text),
-                module,
-                export,
-                "component body reached an unmodeled operation and did not render JSX it received; \
-                 a contract would replace the body in the model, so factory calls inside it would \
-                 no longer be explored"
-                    .to_owned(),
-            )
-            },
-        );
+                    QueryBoundaryKind::PartiallyModeled,
+                    tag.map_or_else(|| component.to_owned(), TagOrigin::text),
+                    module,
+                    export,
+                    format!(
+                        "component body reached an unmodeled operation and did not render JSX it \
+                     received{}; a contract would replace the body in the model, so factory calls \
+                     inside it would no longer be explored",
+                        if operations.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (first: {})", operations.join("; "))
+                        }
+                    ),
+                )
+            });
         let shape = contract_shape(props, |value| self.is_component_like(value));
         if let Some(state) = self.boundaries.get_mut(&boundary) {
             state.forward_children |= shape.0;
@@ -4418,6 +4508,7 @@ impl<'a> Solver<'a> {
                         evidence,
                         arguments: Vec::new(),
                         call_path,
+                        other_paths: 0,
                     });
                 }
                 self.emit_modeled_effects(*capability, evidence, element_span.clone());
@@ -4449,9 +4540,10 @@ impl<'a> Solver<'a> {
             });
         }
         let mut environment = closure.environment.clone();
-        let mut references = ClosureReferences::default();
-        collect_body_references(&closure.body, &mut references);
-        let mut captures = references.names;
+        let mut captures = self
+            .body_references(&closure.span, &closure.body)
+            .names
+            .clone();
         captures.retain(|name| closure.environment.contains_key(name));
         for (index, pattern) in closure.params.iter().enumerate() {
             for name in pattern_names(pattern) {
@@ -4634,6 +4726,7 @@ impl<'a> Solver<'a> {
                 ),
                 arguments: Vec::new(),
                 call_path: self.trace_at(QueryCallPathKind::Invocation, &span),
+                other_paths: 0,
             }),
             None => unresolved.push(self.push_evidence(
                 RelationKind::UnresolvedEscape,
@@ -4665,6 +4758,7 @@ impl<'a> Solver<'a> {
             } else {
                 Vec::new()
             },
+            invocation_keys: std::collections::HashMap::new(),
         });
         let creation_invocations = self.capabilities[capability_id]
             .invocations
@@ -5449,7 +5543,7 @@ impl<'a> Solver<'a> {
         reason: &str,
         span: SourceSpan,
     ) {
-        self.uncertainty_events += 1;
+        self.note_uncertainty(reason, &span);
         let ids = self.values_capability_ids(values);
         for capability in ids {
             let origin = self.capabilities[capability].origin;
@@ -5482,11 +5576,14 @@ impl<'a> Solver<'a> {
         &self,
         values: impl Iterator<Item = &'b TrackedValue>,
     ) -> Vec<usize> {
+        if self.capabilities.is_empty() {
+            return Vec::new();
+        }
         let mut ids = Vec::new();
         let mut namespaces = BTreeSet::new();
+        let mut visited = std::collections::HashSet::new();
         for value in values {
-            collect_capability_ids(value, &mut ids);
-            collect_namespace_ids(value, &mut namespaces);
+            collect_capability_ids_once(value, &mut ids, &mut namespaces, &mut visited);
         }
         if !namespaces.is_empty() {
             let mut modules = BTreeSet::new();
@@ -5757,6 +5854,7 @@ impl<'a> Solver<'a> {
                                     )
                                 })
                                 .collect(),
+                            other_paths: invocation.other_paths,
                         })
                         .collect();
                     Some(QueryCreation {
@@ -5877,10 +5975,36 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// Names a closure body references. A source span identifies one closure, and the IR does not
+    /// change during a pass, so the walk is done once per closure.
+    fn body_references(&self, span: &SourceSpan, body: &FlowArrowBody) -> Rc<ClosureReferences> {
+        if let Some(references) = self.closure_references.borrow().get(span) {
+            return Rc::clone(references);
+        }
+        let mut references = ClosureReferences::default();
+        collect_body_references(body, &mut references);
+        let references = Rc::new(references);
+        self.closure_references
+            .borrow_mut()
+            .insert(span.clone(), Rc::clone(&references));
+        references
+    }
+
     fn query_location(&self, span: &SourceSpan) -> Option<QueryLocation> {
+        if let Some(location) = self.locations.borrow().get(span) {
+            return location.clone();
+        }
+        let location = self.compute_location(span);
+        self.locations
+            .borrow_mut()
+            .insert(span.clone(), location.clone());
+        location
+    }
+
+    fn compute_location(&self, span: &SourceSpan) -> Option<QueryLocation> {
         let file = self.symbol_linker.file(span.file_id)?;
         if !self.location_sources.borrow().contains_key(&span.file_id) {
-            let source = LocationSource::new(fs::read_to_string(&file.path).ok()?);
+            let source = LocationSource::shared(&file.path, &file.content_hash)?;
             self.location_sources
                 .borrow_mut()
                 .insert(span.file_id, source);
@@ -6189,36 +6313,6 @@ fn object_values_order_is_unknown(value: &AbstractValue) -> bool {
     }
 }
 
-fn collect_namespace_ids(value: &TrackedValue, ids: &mut BTreeSet<FileId>) {
-    match &value.value {
-        AbstractValue::Namespace(file_id) => {
-            ids.insert(*file_id);
-        }
-        AbstractValue::Record(fields) => {
-            for value in fields.values() {
-                collect_namespace_ids(value, ids);
-            }
-        }
-        AbstractValue::Array(values) | AbstractValue::Union(values) => {
-            for value in values.iter() {
-                collect_namespace_ids(value, ids);
-            }
-        }
-        AbstractValue::Closure(closure) => {
-            for value in closure.environment.values() {
-                collect_namespace_ids(value, ids);
-            }
-        }
-        AbstractValue::Element(element) => {
-            collect_namespace_ids(&element.component, ids);
-            for value in element.props.values() {
-                collect_namespace_ids(value, ids);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn captures_binding(value: &TrackedValue, name: &str) -> bool {
     match &value.value {
         AbstractValue::Closure(closure) => {
@@ -6246,7 +6340,7 @@ fn captures_binding(value: &TrackedValue, name: &str) -> bool {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ClosureReferences {
     names: BTreeSet<String>,
     modules: BTreeSet<String>,
@@ -6484,28 +6578,80 @@ fn extend_binding_dependencies(statements: &[FlowStatement], names: &mut BTreeSe
     }
 }
 
+/// Whether a value holds any capability, stopping at the first one.
+fn contains_capability(value: &TrackedValue) -> bool {
+    fn walk(value: &TrackedValue, visited: &mut std::collections::HashSet<usize>) -> bool {
+        match &value.value {
+            AbstractValue::Capability(_) => true,
+            AbstractValue::Record(fields) => {
+                visited.insert(Rc::as_ptr(fields).addr())
+                    && fields.values().any(|field| walk(field, visited))
+            }
+            AbstractValue::Array(elements) | AbstractValue::Union(elements) => {
+                visited.insert(Rc::as_ptr(elements).addr())
+                    && elements.iter().any(|element| walk(element, visited))
+            }
+            AbstractValue::Closure(closure) => {
+                visited.insert(Rc::as_ptr(closure).addr())
+                    && closure
+                        .environment
+                        .values()
+                        .any(|captured| walk(captured, visited))
+            }
+            AbstractValue::Element(element) => {
+                visited.insert(Rc::as_ptr(element).addr())
+                    && (walk(&element.component, visited)
+                        || element.props.values().any(|prop| walk(prop, visited)))
+            }
+            _ => false,
+        }
+    }
+    walk(value, &mut std::collections::HashSet::new())
+}
+
 fn collect_capability_ids(value: &TrackedValue, ids: &mut Vec<usize>) {
+    collect_capability_ids_once(
+        value,
+        ids,
+        &mut BTreeSet::new(),
+        &mut std::collections::HashSet::new(),
+    );
+}
+
+/// Walks shared records, arrays, closures, and elements once each, since environments and
+/// props often reference the same values many times.
+fn collect_capability_ids_once(
+    value: &TrackedValue,
+    ids: &mut Vec<usize>,
+    namespaces: &mut BTreeSet<FileId>,
+    visited: &mut std::collections::HashSet<usize>,
+) {
     match &value.value {
         AbstractValue::Capability(id) => ids.push(*id),
-        AbstractValue::Record(fields) => {
+        AbstractValue::Namespace(file_id) => {
+            namespaces.insert(*file_id);
+        }
+        AbstractValue::Record(fields) if visited.insert(Rc::as_ptr(fields).addr()) => {
             for field in fields.values() {
-                collect_capability_ids(field, ids);
+                collect_capability_ids_once(field, ids, namespaces, visited);
             }
         }
-        AbstractValue::Array(elements) | AbstractValue::Union(elements) => {
+        AbstractValue::Array(elements) | AbstractValue::Union(elements)
+            if visited.insert(Rc::as_ptr(elements).addr()) =>
+        {
             for element in elements.iter() {
-                collect_capability_ids(element, ids);
+                collect_capability_ids_once(element, ids, namespaces, visited);
             }
         }
-        AbstractValue::Closure(closure) => {
+        AbstractValue::Closure(closure) if visited.insert(Rc::as_ptr(closure).addr()) => {
             for captured in closure.environment.values() {
-                collect_capability_ids(captured, ids);
+                collect_capability_ids_once(captured, ids, namespaces, visited);
             }
         }
-        AbstractValue::Element(element) => {
-            collect_capability_ids(&element.component, ids);
+        AbstractValue::Element(element) if visited.insert(Rc::as_ptr(element).addr()) => {
+            collect_capability_ids_once(&element.component, ids, namespaces, visited);
             for prop in element.props.values() {
-                collect_capability_ids(prop, ids);
+                collect_capability_ids_once(prop, ids, namespaces, visited);
             }
         }
         _ => {}
@@ -6514,9 +6660,7 @@ fn collect_capability_ids(value: &TrackedValue, ids: &mut Vec<usize>) {
 
 fn returns_capability_data(value: &TrackedValue) -> bool {
     match &value.value {
-        AbstractValue::Capability(_) | AbstractValue::Closure(_) => {
-            !capability_ids(value).is_empty()
-        }
+        AbstractValue::Capability(_) | AbstractValue::Closure(_) => contains_capability(value),
         AbstractValue::Record(fields) => fields.values().any(returns_capability_data),
         AbstractValue::Array(values) | AbstractValue::Union(values) => {
             values.iter().any(returns_capability_data)

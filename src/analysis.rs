@@ -957,6 +957,7 @@ impl Analyzer {
             .report;
             self.attach_callsite_inventory(&linker, &mut report, &snapshot, query, None)?;
             report.finish_gaps();
+            report.prune_evidence();
             return Ok(report);
         }
         let catalog = catalog
@@ -1278,6 +1279,7 @@ impl Analyzer {
             );
         }
         report.finish_gaps();
+        report.prune_evidence();
         Ok(report)
     }
 

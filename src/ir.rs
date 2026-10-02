@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{BlockId, FileId, FunctionId, SymbolId};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct SourceSpan {
     pub file_id: FileId,
     pub start: u32,
