@@ -1408,7 +1408,21 @@ impl<'a> Solver<'a> {
                                 self.execute_branch(alternate, &mut alternate_environment, file_id);
                             let right_heap = self.rewind_heap_branch(mark);
                             self.join_heap_branches(left_heap, right_heap, span);
+                            // A branch that throws renders nothing and does not continue, so the
+                            // other branch decides how the code goes on.
                             match (left, right) {
+                                (Some(left), Some(right)) if is_thrown(&left) => {
+                                    return Some(right);
+                                }
+                                (Some(left), Some(right)) if is_thrown(&right) => {
+                                    return Some(left);
+                                }
+                                (Some(left), None) if is_thrown(&left) => {
+                                    *environment = alternate_environment;
+                                }
+                                (None, Some(right)) if is_thrown(&right) => {
+                                    *environment = consequent_environment;
+                                }
                                 (Some(left), Some(right)) => {
                                     return Some(TrackedValue::plain(AbstractValue::union(vec![
                                         left, right,
@@ -1464,6 +1478,10 @@ impl<'a> Solver<'a> {
                             }
                         }
                     }
+                }
+                FlowStatement::Throw { value, .. } => {
+                    self.eval(value, environment, file_id);
+                    return Some(TrackedValue::unknown(THROWN_EXCEPTION));
                 }
                 FlowStatement::Unsupported(unsupported) => {
                     if unsupported.syntax == "switch_fallthrough_not_modeled" {
@@ -5442,6 +5460,7 @@ impl<'a> Solver<'a> {
                         (span, !branch_references.names.is_disjoint(&needed))
                     }
                     FlowStatement::Return { span, .. }
+                    | FlowStatement::Throw { span, .. }
                     | FlowStatement::Unsupported(crate::ir::UnsupportedIr { span, .. }) => {
                         (span, false)
                     }
@@ -6500,6 +6519,7 @@ fn collect_statement_references(statement: &FlowStatement, references: &mut Clos
             collect_expression_references(&binding.value, references);
         }
         FlowStatement::Expression { value, .. }
+        | FlowStatement::Throw { value, .. }
         | FlowStatement::Return {
             value: Some(value), ..
         } => collect_expression_references(value, references),
@@ -6866,6 +6886,13 @@ fn contract_shape(
     (forward, invoke, render_props, component_props)
 }
 
+/// The value a path that throws returns.
+const THROWN_EXCEPTION: &str = "thrown_exception";
+
+fn is_thrown(value: &TrackedValue) -> bool {
+    matches!(&value.value, AbstractValue::Unknown(reason) if reason == THROWN_EXCEPTION)
+}
+
 /// The local binding a call goes through: `name(...)` or `name.member(...)`.
 fn imported_callee_local(callee: &FlowExpression) -> Option<&str> {
     match &callee.kind {
@@ -7222,19 +7249,16 @@ fn collect_import_uses_statement(
     uses: &mut Vec<FlowExpression>,
 ) {
     match statement {
-        FlowStatement::Bind(binding) => {
-            collect_import_uses(&binding.value, imported_names, uses);
+        FlowStatement::Bind(FlowBinding { value, .. })
+        | FlowStatement::Expression { value, .. }
+        | FlowStatement::Throw { value, .. }
+        | FlowStatement::Assign { value, .. } => {
+            collect_import_uses(value, imported_names, uses);
         }
         FlowStatement::Return { value, .. } => {
             if let Some(value) = value {
                 collect_import_uses(value, imported_names, uses);
             }
-        }
-        FlowStatement::Expression { value, .. } => {
-            collect_import_uses(value, imported_names, uses);
-        }
-        FlowStatement::Assign { value, .. } => {
-            collect_import_uses(value, imported_names, uses);
         }
         FlowStatement::If {
             test,
@@ -7359,7 +7383,7 @@ fn collect_factory_calls_statement(
                 collect_factory_calls(value, file_id, enclosing_function, candidates);
             }
         }
-        FlowStatement::Expression { value, .. } => {
+        FlowStatement::Expression { value, .. } | FlowStatement::Throw { value, .. } => {
             collect_factory_calls(value, file_id, enclosing_function, candidates);
         }
         FlowStatement::Assign { target, value, .. } => {

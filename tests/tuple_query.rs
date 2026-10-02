@@ -412,6 +412,23 @@ fn assumed_render_steps_bound_possible_exploration() {
 }
 
 #[test]
+fn blocks_loops_try_and_throw_keep_paths_exact() {
+    let (exact, other) = exact_actions(&[(
+        "src/App.tsx",
+        "import { Leaf } from './Leaf'; import { strict } from 'external-flags'; function Guarded({ item }) { let action = item; if (strict) { action = 'thrown'; throw new Error(action); } return <Leaf action={action} />; } function Counted({ items }) { for (let index = 0; index < items.length; index += 1) { if (index > 1) { break; } return <Leaf action='counted' />; } return null; } function Waiting({ ready }) { while (!ready) { return <Leaf action='waited' />; } return null; } function Labeled() { scan: for (const key in { only: 1 }) { continue scan; } return <Leaf action='labeled' />; } function Scoped() { { const label = 'scoped'; return <Leaf action={label} />; } } function Attempt({ load }) { try { load(); return <Leaf action='tried' />; } catch (error) { return <Leaf action='caught' />; } finally { load(); } } export function App() { return <div><Guarded item='guarded' /><Counted items={[]} /><Waiting ready={strict} /><Labeled /><Scoped /><Attempt load={strict} /></div>; }",
+    )]);
+    // The thrown branch ends its path, so the value it assigned never reaches the render.
+    assert_eq!(
+        exact,
+        [
+            "caught", "counted", "guarded", "labeled", "scoped", "tried", "waited"
+        ],
+        "{other:?}"
+    );
+    assert!(other.is_empty(), "{other:?}");
+}
+
+#[test]
 fn class_property_methods_are_bound_to_instance_props() {
     let (exact, other) = exact_actions(&[(
         "src/App.tsx",

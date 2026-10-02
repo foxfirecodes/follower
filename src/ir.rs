@@ -163,6 +163,11 @@ pub enum FlowStatement {
         alternate: Vec<FlowStatement>,
         span: SourceSpan,
     },
+    /// Ends the path with an exception after evaluating the value.
+    Throw {
+        value: FlowExpression,
+        span: SourceSpan,
+    },
     Unsupported(UnsupportedIr),
 }
 

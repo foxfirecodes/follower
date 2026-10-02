@@ -677,6 +677,75 @@ impl Lowerer<'_> {
                     alternate: Vec::new(),
                     span: self.span(statement.span),
                 }),
+                // A block keeps its own scope, like a branch that always runs.
+                Statement::BlockStatement(block) => {
+                    lowered.push(self.always(self.lower_statements(&block.body), block.span));
+                }
+                // Switch cases and loop bodies are explored independently, so jumps end nothing.
+                Statement::BreakStatement(_)
+                | Statement::ContinueStatement(_)
+                | Statement::EmptyStatement(_)
+                | Statement::DebuggerStatement(_) => {}
+                Statement::LabeledStatement(statement) => {
+                    lowered.extend(self.lower_branch(&statement.body));
+                }
+                Statement::ThrowStatement(statement) => lowered.push(FlowStatement::Throw {
+                    value: self.lower_expression(&statement.argument),
+                    span: self.span(statement.span),
+                }),
+                Statement::TryStatement(statement) => {
+                    let block = self.lower_statements(&statement.block.body);
+                    match &statement.handler {
+                        // The handler runs only if the block throws, which is not known.
+                        Some(handler) => {
+                            let mut caught = Vec::new();
+                            if let Some(parameter) = &handler.param {
+                                caught.push(FlowStatement::Bind(FlowBinding {
+                                    lexical: true,
+                                    pattern: self.lower_pattern(&parameter.pattern),
+                                    value: self
+                                        .unsupported_expression("caught_exception", handler.span),
+                                    span: self.span(handler.span),
+                                }));
+                            }
+                            caught.extend(self.lower_statements(&handler.body.body));
+                            lowered.push(FlowStatement::If {
+                                test: self.unsupported_expression("try_outcome", statement.span),
+                                consequent: block,
+                                alternate: caught,
+                                span: self.span(statement.span),
+                            });
+                        }
+                        None => lowered.push(self.always(block, statement.span)),
+                    }
+                    if let Some(finalizer) = &statement.finalizer {
+                        lowered.push(
+                            self.always(self.lower_statements(&finalizer.body), finalizer.span),
+                        );
+                    }
+                }
+                // Loops are explored for zero or one iteration, like `for...of`.
+                Statement::ForStatement(statement) => {
+                    if let Some(oxc::ast::ast::ForStatementInit::VariableDeclaration(declaration)) =
+                        &statement.init
+                    {
+                        lowered.extend(
+                            self.lower_bindings(declaration)
+                                .into_iter()
+                                .map(FlowStatement::Bind),
+                        );
+                    }
+                    lowered.push(self.maybe(self.lower_branch(&statement.body), statement.span));
+                }
+                Statement::ForInStatement(statement) => {
+                    lowered.push(self.maybe(self.lower_branch(&statement.body), statement.span));
+                }
+                Statement::WhileStatement(statement) => {
+                    lowered.push(self.maybe(self.lower_branch(&statement.body), statement.span));
+                }
+                Statement::DoWhileStatement(statement) => {
+                    lowered.push(self.always(self.lower_branch(&statement.body), statement.span));
+                }
                 Statement::SwitchStatement(statement) => {
                     lowered.push(FlowStatement::Unsupported(
                         self.unsupported("switch_fallthrough_not_modeled", statement.span),
@@ -707,6 +776,29 @@ impl Lowerer<'_> {
             }
         }
         lowered
+    }
+
+    /// Statements that always run, in their own scope.
+    fn always(&self, statements: Vec<FlowStatement>, span: Span) -> FlowStatement {
+        FlowStatement::If {
+            test: FlowExpression {
+                kind: FlowExpressionKind::Boolean { value: true },
+                span: self.span(span),
+            },
+            consequent: statements,
+            alternate: Vec::new(),
+            span: self.span(span),
+        }
+    }
+
+    /// Statements that may or may not run, such as a loop body.
+    fn maybe(&self, statements: Vec<FlowStatement>, span: Span) -> FlowStatement {
+        FlowStatement::If {
+            test: self.unsupported_expression("symbolic_loop_iteration", span),
+            consequent: statements,
+            alternate: Vec::new(),
+            span: self.span(span),
+        }
     }
 
     fn lower_branch(&self, statement: &Statement<'_>) -> Vec<FlowStatement> {

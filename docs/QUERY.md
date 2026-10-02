@@ -373,8 +373,13 @@ unresolved rather than disappearing after the branch. Strict equality involving 
 remains unknown, and projected factory captures containing unknown or joined values carry gaps.
 Nullish guards narrow finite local alternatives inside their guarded branch, including guards
 combined with `&&` or `||`.
-`for...of` is explored for zero or one iteration and switch cases independently; both leave
-coverage gaps because repeated iterations and fallthrough are not modeled. `.filter` evaluates
+`for`, `for...in`, `for...of`, and `while` bodies are explored for zero or one iteration, a
+`do...while` body for one, and switch cases independently; these leave coverage gaps because
+repeated iterations and fallthrough are not modeled. Blocks keep their own scope, labels are
+transparent, and `break` and `continue` end nothing, since each body is explored on its own. A
+`try` block and its `catch` handler are explored as alternatives, with an unknown caught value,
+followed by the `finally` block. `throw` ends its path, so bindings assigned on a branch that
+throws do not reach the code after it. `.filter` evaluates
 known predicates; unknown predicates retain possible subsets and leave a coverage gap. Finite
 `.map` and `.filter` callbacks receive a concrete array index. `Object.values` retains values from
 known records, but record key insertion order is not stored; records with multiple keys leave a
@@ -384,6 +389,6 @@ identity. Unknown branches retain up to 32 possible heap values; exceeding that 
 coverage gap. Reassignment of captured
 bindings and opaque calls receiving callback-bearing namespaces are conservatively unresolved.
 Dynamic mutation targets, external mutation, live closure cells, full JavaScript coercion,
-non-null loose comparisons, loops, and array methods
+non-null loose comparisons, repeated loop iterations, and array methods
 other than `.map` and `.filter` still require additional IR and solver work. Unsupported syntax can still hide creations or
 dependencies; the current acceptance tests do not establish production absence guarantees.
