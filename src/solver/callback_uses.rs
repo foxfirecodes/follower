@@ -3,7 +3,10 @@
 //! not an explored path executed it; explored invocations fill in arguments that depend on
 //! context.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    rc::Rc,
+};
 
 use crate::{
     ids::FileId,
@@ -80,8 +83,8 @@ enum Lead<'e> {
         call: &'e FlowExpression,
         arguments: &'e [FlowExpression],
         context: Vec<String>,
-        /// Parameters of the innermost function around the call.
-        parameters: Vec<String>,
+        /// The frame of the innermost function around the call.
+        arrow: Option<usize>,
     },
     /// Passed as an event handler to an intrinsic element, which calls it with an event.
     Handler {
@@ -110,15 +113,52 @@ enum Lead<'e> {
 
 /// A call found by the walk, before its arguments are evaluated.
 struct FoundCall {
-    file_id: FileId,
     span: SourceSpan,
-    arguments: Option<Vec<FlowExpression>>,
+    /// Each projected invocation argument, in projection order; `None` for the event an
+    /// intrinsic element passes.
+    arguments: Vec<Option<WrittenArgument>>,
     context: Vec<String>,
     via: Vec<String>,
-    /// Names bound in the scope that holds the call; arguments that read them depend on context.
-    locals: std::rc::Rc<BTreeSet<String>>,
-    /// Parameters of the innermost function around the call.
-    parameters: Vec<String>,
+    /// The call of the result inside the first wrapper this call goes through.
+    inner: Option<SourceSpan>,
+    /// Whether this call passes a wrapper's parameter on, so calls of the wrapper replace it.
+    forwards: bool,
+}
+
+/// An argument as written at a call, with where to evaluate it.
+#[derive(Clone)]
+struct WrittenArgument {
+    file_id: FileId,
+    /// `None` when the call omits the argument and no default applies.
+    expression: Option<FlowExpression>,
+    /// Names bound in the scope that holds the argument; reading them depends on context.
+    locals: Rc<BTreeSet<String>>,
+    /// Whether the argument is a parameter of the function around the call.
+    parameter: bool,
+}
+
+/// Where a projected invocation argument is in a call to the followed value. A wrapper such as
+/// `(kind) => apply(kind)` moves it to the wrapper's parameter.
+#[derive(Clone)]
+enum ArgumentSource {
+    /// The argument at this position, or the parameter's default when a call omits it.
+    Position(usize, Option<WrittenArgument>),
+    /// A value the wrapper writes itself.
+    Written(WrittenArgument),
+}
+
+/// How calls of the followed value map to calls of the factory result.
+struct Forward {
+    sources: Vec<ArgumentSource>,
+    /// The call of the result inside the first wrapper, where explored invocations are.
+    inner: Option<SourceSpan>,
+}
+
+/// An occurrence's outcome in the walk loop.
+enum Found {
+    Call(FoundCall),
+    /// A lead, the argument mapping it carries, and a hop to add to the path.
+    Lead(OwnedLead, Rc<Forward>, Option<String>),
 }
 
 struct Walk {
@@ -355,23 +395,6 @@ fn describe_arrow(frames: &[Frame<'_>], index: usize) -> String {
             .map_or_else(|| "a local function".to_owned(), |name| (*name).to_owned()),
         _ => "a nested function".to_owned(),
     }
-}
-
-/// The parameter names of the innermost function around frame `index`.
-fn innermost_parameters(frames: &[Frame<'_>], index: usize) -> Vec<String> {
-    (0..index)
-        .rev()
-        .find_map(|frame| match &frames[frame].expression.kind {
-            FlowExpressionKind::Arrow { params, .. } => Some(
-                params
-                    .iter()
-                    .flat_map(pattern_names)
-                    .map(str::to_owned)
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .unwrap_or_default()
 }
 
 /// The functions enclosing frame `index`, innermost first.
@@ -720,7 +743,12 @@ impl Solver<'_> {
                     call,
                     arguments,
                     context: context_of(frames, index),
-                    parameters: innermost_parameters(frames, index),
+                    arrow: (0..index).rev().find(|&frame| {
+                        matches!(
+                            frames[frame].expression.kind,
+                            FlowExpressionKind::Arrow { .. }
+                        )
+                    }),
                 },
                 _ => Lead::Unrelated,
             },
@@ -913,6 +941,15 @@ impl Solver<'_> {
         let Some(start) = self.candidate_scope(candidate) else {
             return walk;
         };
+        let direct = Rc::new(Forward {
+            sources: query
+                .capability
+                .invocation_arguments
+                .iter()
+                .map(|projection| ArgumentSource::Position(projection.index, None))
+                .collect(),
+            inner: None,
+        });
         let mut queue = VecDeque::from([(
             start,
             Target::Site(
@@ -922,12 +959,14 @@ impl Solver<'_> {
                 initial_steps(query),
             ),
             Vec::<String>::new(),
+            direct,
         )]);
         let mut seen = HashSet::new();
-        let mut locals_cache = HashMap::<UseNode, std::rc::Rc<BTreeSet<String>>>::new();
-        let mut handlers = HashSet::new();
-        while let Some((scope, target, via)) = queue.pop_front() {
-            if seen.len() >= WALK_LIMIT || !seen.insert((scope.clone(), target.clone())) {
+        let mut locals_cache = HashMap::<UseNode, Rc<BTreeSet<String>>>::new();
+        let mut recorded = HashSet::new();
+        while let Some((scope, target, via, forward)) = queue.pop_front() {
+            let inner = forward.inner.as_ref().map(span_key);
+            if seen.len() >= WALK_LIMIT || !seen.insert((scope.clone(), target.clone(), inner)) {
                 continue;
             }
             let Some(code) = self.scope_code(&scope) else {
@@ -935,7 +974,7 @@ impl Solver<'_> {
             };
             let locals = locals_cache
                 .entry(scope.clone())
-                .or_insert_with(|| std::rc::Rc::new(self.scope_locals(&scope).unwrap_or_default()))
+                .or_insert_with(|| Rc::new(self.scope_locals(&scope).unwrap_or_default()))
                 .clone();
             let mut leads = Vec::new();
             let file_id = code.file_id;
@@ -959,33 +998,112 @@ impl Solver<'_> {
                     }
                     _ => return,
                 };
-                let lead = self.follow(file_id, frames, frames.len() - 1, steps);
-                leads.push(match lead {
+                let written = |expression: Option<&FlowExpression>| WrittenArgument {
+                    file_id,
+                    expression: expression.cloned(),
+                    locals: locals.clone(),
+                    parameter: false,
+                };
+                match self.follow(file_id, frames, frames.len() - 1, steps) {
                     Lead::Call {
                         call,
                         arguments,
                         context,
-                        parameters,
-                    } => (
-                        Some((
-                            call.span.clone(),
-                            Some(arguments.to_vec()),
+                        arrow,
+                    } => {
+                        let params = arrow.and_then(|arrow| match &frames[arrow].expression.kind {
+                            FlowExpressionKind::Arrow { params, .. } => Some(params),
+                            _ => None,
+                        });
+                        let mut sources = Vec::new();
+                        let mut forwarded = false;
+                        let mut values = Vec::new();
+                        for source in &forward.sources {
+                            let mut argument = match source {
+                                ArgumentSource::Position(position, default) => {
+                                    match (arguments.get(*position), default) {
+                                        (Some(expression), _) => written(Some(expression)),
+                                        (None, Some(default)) => default.clone(),
+                                        (None, None) => written(None),
+                                    }
+                                }
+                                ArgumentSource::Written(argument) => argument.clone(),
+                            };
+                            // A function that passes its own parameter on is a wrapper; calls of
+                            // it give the value.
+                            let parameter = match (&argument.expression, params) {
+                                (
+                                    Some(FlowExpression {
+                                        kind: FlowExpressionKind::Identifier { name, .. },
+                                        ..
+                                    }),
+                                    Some(params),
+                                ) => parameter_position(params, name),
+                                _ => None,
+                            };
+                            if let Some((position, default)) = parameter {
+                                argument.parameter = true;
+                                forwarded = true;
+                                sources.push(ArgumentSource::Position(
+                                    position,
+                                    default.map(|default| written(Some(default))),
+                                ));
+                            } else {
+                                sources.push(ArgumentSource::Written(argument.clone()));
+                            }
+                            values.push(Some(argument));
+                        }
+                        leads.push(Found::Call(FoundCall {
+                            span: call.span.clone(),
+                            arguments: values,
                             context,
-                            parameters,
-                        )),
-                        None,
-                    ),
+                            via: via.clone(),
+                            inner: forward.inner.clone(),
+                            forwards: forwarded,
+                        }));
+                        if forwarded && let Some(arrow) = arrow {
+                            let lead = self.follow(file_id, frames, arrow, Vec::new()).into_owned();
+                            leads.push(Found::Lead(
+                                lead,
+                                Rc::new(Forward {
+                                    sources,
+                                    inner: Some(
+                                        forward.inner.clone().unwrap_or_else(|| call.span.clone()),
+                                    ),
+                                }),
+                                Some(format!("through {}", describe_arrow(frames, arrow))),
+                            ));
+                        }
+                    }
                     Lead::Handler {
                         span,
                         prop,
-                        context,
+                        mut context,
                     } => {
-                        let mut context = context;
                         context.insert(0, format!("the {prop} handler of an intrinsic element"));
-                        (Some((span, None, context, Vec::new())), None)
+                        // The element passes an event as the first argument and nothing else.
+                        let arguments = forward
+                            .sources
+                            .iter()
+                            .map(|source| match source {
+                                ArgumentSource::Position(0, _) => None,
+                                ArgumentSource::Position(_, default) => {
+                                    Some(default.clone().unwrap_or_else(|| written(None)))
+                                }
+                                ArgumentSource::Written(argument) => Some(argument.clone()),
+                            })
+                            .collect();
+                        leads.push(Found::Call(FoundCall {
+                            span,
+                            arguments,
+                            context,
+                            via: via.clone(),
+                            inner: forward.inner.clone(),
+                            forwards: false,
+                        }));
                     }
-                    other => (None, Some(other.into_owned())),
-                });
+                    other => leads.push(Found::Lead(other.into_owned(), forward.clone(), None)),
+                }
             };
             let mut frames = Vec::new();
             match code.body {
@@ -997,27 +1115,27 @@ impl Solver<'_> {
                 }
             }
             let is_start = via.is_empty() && matches!(target, Target::Site(_, _, None, _));
-            for (call, lead) in leads {
-                if let Some((span, arguments, context, parameters)) = call {
-                    walk.used = true;
-                    if arguments.is_none() && !handlers.insert(span.clone()) {
+            for found in leads {
+                let (lead, forward, via) = match found {
+                    Found::Call(call) => {
+                        walk.used = true;
+                        if recorded
+                            .insert((span_key(&call.span), call.inner.as_ref().map(span_key)))
+                        {
+                            walk.calls.push(call);
+                        }
                         continue;
                     }
-                    walk.calls.push(FoundCall {
-                        file_id,
-                        span,
-                        arguments,
-                        context,
-                        via: via.clone(),
-                        locals: locals.clone(),
-                        parameters,
-                    });
-                    continue;
-                }
-                match lead.expect("a lead") {
+                    Found::Lead(lead, forward, hop) => {
+                        let mut via = via.clone();
+                        via.extend(hop);
+                        (lead, forward, via)
+                    }
+                };
+                match lead {
                     OwnedLead::Same(next) => {
                         walk.used |= !is_start;
-                        queue.push_back((scope.clone(), next, via.clone()));
+                        queue.push_back((scope.clone(), next, via, forward));
                     }
                     OwnedLead::Enter {
                         scopes,
@@ -1055,7 +1173,12 @@ impl Solver<'_> {
                             let mut targets = Vec::new();
                             bind_targets(param, &steps, &mut targets);
                             for target in targets {
-                                queue.push_back((next.clone(), target, next_via.clone()));
+                                queue.push_back((
+                                    next.clone(),
+                                    target,
+                                    next_via.clone(),
+                                    forward.clone(),
+                                ));
                             }
                         }
                     }
@@ -1094,6 +1217,7 @@ impl Solver<'_> {
                                     steps.clone(),
                                 ),
                                 next_via,
+                                forward.clone(),
                             ));
                         }
                     }
@@ -1103,7 +1227,7 @@ impl Solver<'_> {
                         context,
                     } => {
                         walk.used = true;
-                        walk.escapes.push((span, detail, context, via.clone()));
+                        walk.escapes.push((span, detail, context, via));
                     }
                     OwnedLead::Used => walk.used |= !is_start,
                     OwnedLead::Unrelated => {}
@@ -1472,32 +1596,51 @@ impl Solver<'_> {
         }
         let mut calls = Vec::new();
         let mut covered = BTreeSet::new();
+        // A call that passes a wrapper's parameter on is replaced by the calls of the wrapper.
+        let wrapped = walk
+            .calls
+            .iter()
+            .filter_map(|call| call.inner.as_ref().map(span_key))
+            .collect::<BTreeSet<_>>();
+        covered.extend(wrapped.iter().copied());
         for call in walk.calls {
-            let key = (call.span.file_id.0, call.span.start);
-            let explored_arguments = explored.get(&key).map(|(_, arguments)| arguments);
-            if explored_arguments.is_some() {
+            let key = span_key(&call.span);
+            if call.forwards && wrapped.contains(&key) {
+                continue;
+            }
+            // Explored invocations of a wrapper's calls are at the call inside the wrapper.
+            let explored_key = call.inner.as_ref().map_or(key, span_key);
+            let explored_arguments = explored.get(&explored_key).map(|(_, arguments)| arguments);
+            if call.inner.is_none() && explored_arguments.is_some() {
                 covered.insert(key);
             }
             let mut arguments = BTreeMap::<String, Vec<QueryValue>>::new();
-            for projection in &query.capability.invocation_arguments {
+            for (projection, argument) in query
+                .capability
+                .invocation_arguments
+                .iter()
+                .zip(&call.arguments)
+            {
                 let mut values = Vec::new();
-                let written = call
-                    .arguments
-                    .as_ref()
-                    .map(|arguments| arguments.get(projection.index));
-                match written {
-                    Some(Some(expression)) if is_context_free(expression, &call.locals) => {
-                        values.push(self.evaluate_context_free(call.file_id, expression));
+                match argument {
+                    Some(WrittenArgument {
+                        expression: None, ..
+                    }) => values.push(QueryValue::Undefined),
+                    Some(WrittenArgument {
+                        file_id,
+                        expression: Some(expression),
+                        locals,
+                        ..
+                    }) if is_context_free(expression, locals) => {
+                        // A context-free value holds on every path.
+                        let value = self.evaluate_context_free(*file_id, expression);
+                        if value_is_known(&value) {
+                            values.push(value);
+                        }
                     }
-                    Some(None) => values.push(QueryValue::Undefined),
                     _ => {}
                 }
-                if values.iter().all(value_is_known) {
-                    // A context-free value holds on every path.
-                } else {
-                    values.clear();
-                }
-                if values.is_empty() {
+                if values.is_empty() && call.inner.is_none() {
                     for explored in explored_arguments.into_iter().flatten() {
                         if let Some(value) = explored.get(&projection.label)
                             && !values.contains(value)
@@ -1508,29 +1651,42 @@ impl Solver<'_> {
                 }
                 if values.is_empty() {
                     values.push(QueryValue::Unknown {
-                        reason: if call.arguments.is_none() {
-                            "event_from_intrinsic_element".to_owned()
-                        } else if written_parameter(
-                            call.arguments.as_deref(),
-                            projection.index,
-                            &call.parameters,
-                        ) {
-                            "argument_is_a_parameter_of_the_enclosing_function".to_owned()
-                        } else {
-                            "argument_depends_on_unexplored_context".to_owned()
-                        },
+                        reason: match argument {
+                            None => "event_from_intrinsic_element",
+                            Some(argument) if argument.parameter => {
+                                "argument_is_a_parameter_of_the_enclosing_function"
+                            }
+                            Some(_) => "argument_depends_on_unexplored_context",
+                        }
+                        .to_owned(),
                     });
                 }
                 arguments.insert(projection.label.clone(), values);
             }
             let arguments_resolved = arguments.values().flatten().all(value_is_known);
+            // A wrapper's call ran on an explored path if the call inside the wrapper saw its
+            // values there.
+            let explored = match (&call.inner, explored_arguments) {
+                (None, explored) => explored.is_some(),
+                (Some(_), Some(explored)) => {
+                    arguments_resolved
+                        && explored.iter().any(|invocation| {
+                            arguments.iter().all(|(label, values)| {
+                                invocation
+                                    .get(label)
+                                    .is_some_and(|value| values.contains(value))
+                            })
+                        })
+                }
+                (Some(_), None) => false,
+            };
             calls.push(QueryCapabilityCall {
                 location: self.query_location(&call.span),
                 context: call.context,
                 via: call.via,
                 arguments,
                 arguments_resolved,
-                explored: explored_arguments.is_some(),
+                explored,
             });
         }
         // Explored invocations the walk did not reach, such as through a value it lost.
@@ -1811,17 +1967,28 @@ fn collect_read_names(expression: &FlowExpression, names: &mut BTreeSet<String>)
     }
 }
 
-/// Whether the argument at `index` is one of the enclosing function's parameters, so its value
-/// comes from that function's callers.
-fn written_parameter(
-    arguments: Option<&[FlowExpression]>,
-    index: usize,
-    parameters: &[String],
-) -> bool {
-    matches!(
-        arguments.and_then(|arguments| arguments.get(index)).map(|argument| &argument.kind),
-        Some(FlowExpressionKind::Identifier { name, .. }) if parameters.contains(name)
-    )
+/// The position and default of the parameter that binds `name` directly.
+fn parameter_position<'p>(
+    params: &'p [FlowPattern],
+    name: &str,
+) -> Option<(usize, Option<&'p FlowExpression>)> {
+    params
+        .iter()
+        .enumerate()
+        .find_map(|(position, param)| match &param.kind {
+            FlowPatternKind::Identifier { name: bound } if bound == name => Some((position, None)),
+            FlowPatternKind::Default { target, default } => match &target.kind {
+                FlowPatternKind::Identifier { name: bound } if bound == name => {
+                    Some((position, Some(default.as_ref())))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+}
+
+fn span_key(span: &SourceSpan) -> (u32, u32) {
+    (span.file_id.0, span.start)
 }
 
 /// Orders reachability from strongest to weakest.

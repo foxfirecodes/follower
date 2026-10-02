@@ -396,9 +396,13 @@ whose callers are not in the parsed files. `status` is `called`, `called_with_un
 contain, such as the types pushed under conditions too many to keep as separate arrays, and
 `values_from_callers` gives the argument's value with what each caller passes, when it reads only
 the enclosing function's parameters and a caller passes values that do not depend on its own
-locals; up to 32 callers are evaluated, one level up. The walk visits at most 400 scope and target pairs
-and 8 scope changes per callsite, and does not follow a result through a function that forwards
-its own parameter to it, so calls of such a wrapper report the parameter as unknown.
+locals; up to 32 callers are evaluated, one level up. A function that passes its own parameter
+on, such as `(kind = Kind.DEFAULT) => { track(); apply(kind); }`, is a wrapper: the walk follows
+the wrapper too, and each call of it reports the value it passes, or the parameter's default when
+it passes none, in place of the call inside the wrapper. Such a call counts as `explored` when the
+call inside the wrapper saw its values on an explored path. The walk visits at most 400 scope and
+target pairs and 8 scope changes per callsite.
+
 Snapshot reuse is not implemented yet.
 
 ## Current analysis fragment

@@ -836,6 +836,56 @@ fn callsite_values_follow_the_result_to_every_call_in_the_source() {
 }
 
 #[test]
+fn calls_of_a_wrapper_that_forwards_its_parameter_give_the_argument() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/App.tsx",
+            "import * as React from 'react'; import { useItemSelection } from './hook'; import { log } from 'external-log'; function Notice({ onClose }) { return <button onClick={() => onClose('from_child')} />; } function Notices() { const [, apply] = useItemSelection(['wrapped']); const wrapped = React.useCallback((kind = 'default_kind') => { log(kind); apply(kind); }, [apply]); return <div><Notice onClose={wrapped} /><button onClick={() => wrapped()} /></div>; } export function App() { return <Notices />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", TUPLE_QUERY);
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("{:?}", report.callsites);
+    };
+    assert_eq!(callsite.capability.status, QueryCapabilityStatus::Called);
+    let mut calls = callsite
+        .capability
+        .calls
+        .iter()
+        .map(|call| {
+            let QueryValue::String { value } = &call.arguments["action"][0] else {
+                panic!("{:?}", call.arguments);
+            };
+            (value.clone(), call.explored, call.via.join(" / "))
+        })
+        .collect::<Vec<_>>();
+    calls.sort();
+    // The call inside the wrapper passes its parameter on, so the wrapper's calls replace it.
+    assert_eq!(
+        calls,
+        [
+            (
+                "default_kind".to_owned(),
+                true,
+                "through the callback passed to React.useCallback".to_owned()
+            ),
+            (
+                "from_child".to_owned(),
+                true,
+                "through the callback passed to React.useCallback / prop onClose of <Notice>"
+                    .to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
 fn unresolved_factory_arguments_report_pushed_elements_and_caller_values() {
     let pushes = (0..6)
         .map(|index| format!("if (flags.f{index}) {{ items.push(Kind.K{index}); }}"))
