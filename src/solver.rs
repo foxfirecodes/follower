@@ -3,6 +3,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
+    fmt::Write as _,
     fs,
     path::Path,
     rc::Rc,
@@ -25,16 +26,17 @@ use crate::{
     project::{ComponentConsumer, Project},
     queries::{AuditFinding, AuditReport, Conclusion, Coverage, FindingRef},
     query::{
-        QueryCallPathKind, QueryCallPathStep, QueryCallsiteInventory, QueryCreation, QueryGap,
-        QueryInvocation, QueryLocation, QueryReport, QueryReverseImporter,
-        QueryReverseImporterEvaluation, QueryScope, QuerySpec, QueryValue, Reachability,
+        QueryBoundaryKind, QueryCallPathKind, QueryCallPathStep, QueryCallsiteInventory,
+        QueryComponentBoundary, QueryCreation, QueryGap, QueryInvocation, QueryLocation,
+        QueryReport, QueryReverseImporter, QueryReverseImporterEvaluation, QueryScope, QuerySpec,
+        QueryValue, Reachability,
     },
 };
 
 const MAX_CALL_DEPTH: usize = 128;
 const MAX_REVERSE_IMPORTER_EVALUATIONS: usize = 5_000;
 const MAX_UNREACHED_RENDER_EVALUATIONS: usize = 5_000;
-const MAX_ASSUMED_RENDER_EVALUATIONS: usize = 200_000;
+const MAX_ASSUMED_RENDER_EVALUATIONS: usize = 1_000_000;
 const MAX_REVERSE_IMPORTER_SOURCE_BYTES: usize = 20_000;
 const MAX_HEAP_ALTERNATIVES: usize = 32;
 const MAX_RENDER_VISITS_PER_SITE: usize = 16;
@@ -93,7 +95,7 @@ enum AbstractValue {
         value: i64,
     },
     Boolean(bool),
-    Record(Rc<BTreeMap<String, TrackedValue>>),
+    Record(Rc<RecordFields>),
     Array(Rc<Vec<TrackedValue>>),
     Union(Rc<Vec<TrackedValue>>),
     Function(FunctionKey),
@@ -115,12 +117,17 @@ enum AbstractValue {
         /// The file and local name of the unknown callee, so a root path that renders the result
         /// can request the callee's module.
         callee: Option<Rc<(FileId, String)>>,
+        /// Index of the first argument that is a component.
+        argument: usize,
     },
 }
 
 impl AbstractValue {
-    fn record(fields: BTreeMap<String, TrackedValue>) -> Self {
-        Self::Record(Rc::new(fields))
+    fn open_record(fields: BTreeMap<String, TrackedValue>, reason: &str) -> Self {
+        Self::Record(Rc::new(RecordFields {
+            fields,
+            open: Some(reason.to_owned()),
+        }))
     }
 
     fn array(elements: Vec<TrackedValue>) -> Self {
@@ -171,12 +178,168 @@ struct ClosureValue {
     span: SourceSpan,
 }
 
+/// Known properties of a record. A closed record, such as an object literal or JSX props, has
+/// exactly these, so reading a missing property gives `undefined`. An open record, such as props
+/// spread from an unknown value, may have others.
+#[derive(Clone, Default)]
+struct RecordFields {
+    fields: BTreeMap<String, TrackedValue>,
+    /// Why the record may have properties beyond `fields`.
+    open: Option<String>,
+}
+
+impl std::ops::Deref for RecordFields {
+    type Target = BTreeMap<String, TrackedValue>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl std::ops::DerefMut for RecordFields {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.fields
+    }
+}
+
+impl IntoIterator for RecordFields {
+    type Item = (String, TrackedValue);
+    type IntoIter = std::collections::btree_map::IntoIter<String, TrackedValue>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.into_iter()
+    }
+}
+
+impl<'r> IntoIterator for &'r RecordFields {
+    type Item = (&'r String, &'r TrackedValue);
+    type IntoIter = std::collections::btree_map::Iter<'r, String, TrackedValue>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.iter()
+    }
+}
+
 #[derive(Clone)]
 struct ElementValue {
     component: Box<TrackedValue>,
-    props: BTreeMap<String, TrackedValue>,
+    props: RecordFields,
     span: SourceSpan,
     trace: Vec<TraceStep>,
+    /// The JSX tag that created the element, when it names a binding.
+    tag: Option<Rc<TagOrigin>>,
+}
+
+/// A JSX tag naming a binding: `Name` or `Object.member` in a file.
+struct TagOrigin {
+    file_id: FileId,
+    local: String,
+    member: Option<String>,
+}
+
+impl TagOrigin {
+    fn text(&self) -> String {
+        self.member.as_ref().map_or_else(
+            || self.local.clone(),
+            |member| format!("{}.{member}", self.local),
+        )
+    }
+}
+
+impl BoundaryState {
+    fn new(
+        kind: QueryBoundaryKind,
+        component: String,
+        module: Option<String>,
+        export: Option<String>,
+        reason: String,
+    ) -> Self {
+        Self {
+            kind,
+            component,
+            module,
+            export,
+            reason,
+            entered_from_reachable: false,
+            sites: Vec::new(),
+            site_keys: BTreeSet::new(),
+            forward_children: false,
+            invoke_children: false,
+            render_props: BTreeSet::new(),
+            component_props: BTreeSet::new(),
+            wrapper: None,
+        }
+    }
+
+    /// A contract that would model the boundary, as TOML for the project definition.
+    fn suggested_contract(&self) -> Option<String> {
+        let quote =
+            |value: &str| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
+        if let Some((module, export, argument)) = &self.wrapper {
+            return Some(format!(
+                "[[component_wrappers]]\nmodule = {}\nexport = {}\ncomponent_argument = {argument}\n",
+                quote(module),
+                quote(export)
+            ));
+        }
+        if matches!(self.kind, QueryBoundaryKind::EscapedJsx) {
+            return None;
+        }
+        let (Some(module), Some(export)) = (&self.module, &self.export) else {
+            return None;
+        };
+        let list = |names: &BTreeSet<String>| {
+            names
+                .iter()
+                .map(|name| quote(name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut contract = format!(
+            "[[component_consumers]]\nmodule = {}\nexport = {}\n",
+            quote(module),
+            quote(export)
+        );
+        if self.forward_children
+            || (!self.invoke_children
+                && self.render_props.is_empty()
+                && self.component_props.is_empty())
+        {
+            contract.push_str("forward_children = true\n");
+        }
+        if self.invoke_children {
+            contract.push_str("invoke_children = true\n");
+        }
+        if !self.render_props.is_empty() {
+            let _ = writeln!(contract, "render_props = [{}]", list(&self.render_props));
+        }
+        if !self.component_props.is_empty() {
+            let _ = writeln!(
+                contract,
+                "component_props = [{}]",
+                list(&self.component_props)
+            );
+        }
+        Some(contract)
+    }
+}
+
+/// A component boundary seen on paths from configured roots, aggregated for the report.
+struct BoundaryState {
+    kind: QueryBoundaryKind,
+    component: String,
+    module: Option<String>,
+    export: Option<String>,
+    reason: String,
+    entered_from_reachable: bool,
+    sites: Vec<SourceSpan>,
+    site_keys: BTreeSet<(u32, u32)>,
+    forward_children: bool,
+    invoke_children: bool,
+    render_props: BTreeSet<String>,
+    component_props: BTreeSet<String>,
+    /// For an unknown higher-order component: the callee's module, export, and argument.
+    wrapper: Option<(String, String, usize)>,
 }
 
 struct CapabilityState {
@@ -192,6 +355,8 @@ struct CapabilityState {
     invocations: Vec<InvocationState>,
     unresolved: Vec<EvidenceId>,
     assumptions: Vec<String>,
+    /// Boundaries the creation was reached through.
+    boundaries: Vec<Rc<str>>,
 }
 
 #[derive(Clone)]
@@ -502,6 +667,8 @@ struct Solver<'a> {
     use_chain: BTreeSet<FunctionKey>,
     /// Components already explored under an assumption, keyed by choice, component, and props.
     assumed_component_renders: BTreeSet<(Option<String>, String, u64)>,
+    /// Components returned by a configured wrapper, which may add props when rendering them.
+    wrapped_components: BTreeSet<FunctionKey>,
     /// Counts budget stops that may have cut a render short.
     render_truncations: usize,
     /// Elements, closures, and function components rendered so far in this pass.
@@ -515,6 +682,9 @@ struct Solver<'a> {
     current_choice: Option<String>,
     current_reachability: Reachability,
     assumed_renders: Vec<(SourceSpan, Assumption)>,
+    /// Boundary keys for `assumed_renders`, one per entry.
+    assumed_boundaries: Vec<Rc<str>>,
+    boundaries: BTreeMap<Rc<str>, BoundaryState>,
     current_reverse_importer: Option<ReverseImporterSeed>,
     call_depth: usize,
     active_captures: Vec<BTreeSet<String>>,
@@ -637,6 +807,7 @@ impl<'a> Solver<'a> {
             corridor_files: BTreeSet::new(),
             use_chain: BTreeSet::new(),
             assumed_component_renders: BTreeSet::new(),
+            wrapped_components: BTreeSet::new(),
             render_truncations: 0,
             render_log: Vec::new(),
             uncertainty_events: 0,
@@ -647,6 +818,8 @@ impl<'a> Solver<'a> {
             current_choice: None,
             current_reachability: Reachability::Reachable,
             assumed_renders: Vec::new(),
+            assumed_boundaries: Vec::new(),
+            boundaries: BTreeMap::new(),
             current_reverse_importer: None,
             call_depth: 0,
             active_captures: Vec::new(),
@@ -728,7 +901,7 @@ impl<'a> Solver<'a> {
                 let mut arguments = Vec::with_capacity(parameter_count.max(1));
                 if parameter_count > 0 {
                     arguments.push(TrackedValue {
-                        value: AbstractValue::record(record),
+                        value: AbstractValue::open_record(record, "unconfigured_entry_prop"),
                         evidence: None,
                         choice: Some(choice),
                         heap_id: None,
@@ -903,6 +1076,7 @@ impl<'a> Solver<'a> {
             value,
             &mut bound,
             RelationKind::ValueTransfer,
+            file_id,
         );
         self.globals.extend(
             bound
@@ -1049,6 +1223,7 @@ impl<'a> Solver<'a> {
                 value,
                 &mut environment,
                 RelationKind::RenderPropBinding,
+                key.file_id,
             );
         }
         self.active_captures.push(BTreeSet::new());
@@ -1080,6 +1255,7 @@ impl<'a> Solver<'a> {
                         value,
                         environment,
                         RelationKind::ValueTransfer,
+                        file_id,
                     );
                 }
                 FlowStatement::Expression { value, .. } => {
@@ -1537,6 +1713,7 @@ impl<'a> Solver<'a> {
         value: TrackedValue,
         environment: &mut Environment,
         relation: RelationKind,
+        file_id: FileId,
     ) {
         match &pattern.kind {
             FlowPatternKind::Identifier { name } => {
@@ -1564,7 +1741,7 @@ impl<'a> Solver<'a> {
                         field.target.span.clone(),
                         relation,
                     );
-                    self.bind_pattern(&field.target, selected, environment, relation);
+                    self.bind_pattern(&field.target, selected, environment, relation, file_id);
                 }
                 if let Some(rest) = rest {
                     let remainder = match self.materialize(&value).value {
@@ -1583,7 +1760,7 @@ impl<'a> Solver<'a> {
                             TrackedValue::unknown("unknown_object_rest")
                         }
                     };
-                    self.bind_pattern(rest, remainder, environment, relation);
+                    self.bind_pattern(rest, remainder, environment, relation, file_id);
                 }
             }
             FlowPatternKind::Array { elements } => {
@@ -1595,9 +1772,27 @@ impl<'a> Solver<'a> {
                             target.span.clone(),
                             relation,
                         );
-                        self.bind_pattern(target, selected, environment, relation);
+                        self.bind_pattern(target, selected, environment, relation, file_id);
                     }
                 }
+            }
+            FlowPatternKind::Default { target, default } => {
+                // The default applies only when the value is `undefined`.
+                let value = match undefined_alternatives(&value) {
+                    Some(Undefinedness::Never) => value,
+                    Some(Undefinedness::Always) => self.eval(default, environment, file_id),
+                    _ => {
+                        let default = self.eval(default, environment, file_id);
+                        let mut alternatives = Vec::new();
+                        collect_defined_alternatives(&value, &mut alternatives);
+                        alternatives.push(default);
+                        TrackedValue {
+                            evidence: value.evidence,
+                            ..TrackedValue::plain(AbstractValue::union(alternatives))
+                        }
+                    }
+                };
+                self.bind_pattern(target, value, environment, relation, file_id);
             }
             FlowPatternKind::Unsupported { syntax } => {
                 self.mark_value_unresolved(
@@ -1718,16 +1913,17 @@ impl<'a> Solver<'a> {
                 self.linked_value(resolution, &expression.span)
             }
             FlowExpressionKind::Record { fields } => {
-                let values = fields
-                    .iter()
-                    .map(|field| {
-                        (
-                            field.property.clone(),
-                            self.eval(&field.value, environment, file_id),
-                        )
-                    })
-                    .collect();
-                TrackedValue::plain(AbstractValue::record(values))
+                let mut record = RecordFields::default();
+                for field in fields {
+                    let value = self.eval(&field.value, environment, file_id);
+                    if field.spread {
+                        let value = self.materialize(&value);
+                        spread_into_record(&mut record, &value);
+                    } else {
+                        record.insert(field.property.clone(), value);
+                    }
+                }
+                TrackedValue::plain(AbstractValue::Record(Rc::new(record)))
             }
             FlowExpressionKind::Array { elements } => {
                 self.eval_array_literal(elements, environment, file_id, &expression.span)
@@ -1872,6 +2068,10 @@ impl<'a> Solver<'a> {
                         return TrackedValue::unknown("missing_wrapped_component");
                     };
                     let mut component = self.eval(component, environment, file_id);
+                    // The wrapper may pass props of its own to the component.
+                    if let AbstractValue::Function(key) = &component.value {
+                        self.wrapped_components.insert(key.clone());
+                    }
                     let evidence = self.push_evidence(
                         RelationKind::ValueTransfer,
                         "configured_component_wrapper",
@@ -1984,10 +2184,13 @@ impl<'a> Solver<'a> {
                                     },
                                 ))
                             };
-                            return TrackedValue::plain(AbstractValue::record(BTreeMap::from([
-                                ("Provider".to_owned(), component("Provider", true, false)),
-                                ("Consumer".to_owned(), component("Consumer", false, true)),
-                            ])));
+                            return TrackedValue::plain(AbstractValue::open_record(
+                                BTreeMap::from([
+                                    ("Provider".to_owned(), component("Provider", true, false)),
+                                    ("Consumer".to_owned(), component("Consumer", false, true)),
+                                ]),
+                                "unmodeled_context_property",
+                            ));
                         }
                         "useState" => {
                             // The initializer only describes the first render. A later render
@@ -2053,6 +2256,9 @@ impl<'a> Solver<'a> {
             }
             FlowExpressionKind::Arrow { params, body } => {
                 let mut references = ClosureReferences::default();
+                for param in params {
+                    collect_pattern_references(param, &mut references);
+                }
                 collect_body_references(body, &mut references);
                 let mut captured = environment
                     .iter()
@@ -2418,19 +2624,22 @@ impl<'a> Solver<'a> {
                         self.scan_callback_bodies(argument, &span, 0);
                     }
                 }
+                let argument = arguments
+                    .iter()
+                    .position(|argument| self.is_component_like(argument));
                 let wrapped = arguments
                     .iter()
                     .filter(|argument| self.is_component_like(argument))
                     .cloned()
                     .collect::<Vec<_>>();
-                if wrapped.is_empty() {
-                    TrackedValue::unknown("unknown_call_result")
-                } else {
-                    TrackedValue::plain(AbstractValue::AssumedWrapper {
+                match argument {
+                    Some(argument) => TrackedValue::plain(AbstractValue::AssumedWrapper {
                         reason: "unknown_call_result".to_owned(),
                         wrapped: Rc::new(wrapped),
                         callee: None,
-                    })
+                        argument,
+                    }),
+                    None => TrackedValue::unknown("unknown_call_result"),
                 }
             }
             _ => {
@@ -2818,7 +3027,7 @@ impl<'a> Solver<'a> {
                 ),
             }
         };
-        let mut values = BTreeMap::new();
+        let mut values = RecordFields::default();
         for prop in props {
             match prop {
                 FlowJsxProp::Property { name, value, span } => {
@@ -2836,9 +3045,16 @@ impl<'a> Solver<'a> {
                 }
                 FlowJsxProp::Spread { value, span } => {
                     let spread = self.eval(value, environment, file_id);
+                    let spread = self.materialize(&spread);
                     if let AbstractValue::Record(fields) = spread.value {
-                        values.extend(Rc::unwrap_or_clone(fields));
-                    } else {
+                        let fields = Rc::unwrap_or_clone(fields);
+                        values.open = values.open.take().or(fields.open);
+                        values.extend(fields.fields);
+                    } else if !matches!(
+                        spread.value,
+                        AbstractValue::Null | AbstractValue::Undefined
+                    ) {
+                        values.open = Some("jsx_spread_of_unknown_value".to_owned());
                         self.mark_value_unresolved(
                             &spread,
                             "JSX spread value is not a known record",
@@ -2880,12 +3096,67 @@ impl<'a> Solver<'a> {
                 }
             }
         }
+        let tag = match tag {
+            FlowJsxTag::Identifier {
+                name,
+                intrinsic: false,
+                ..
+            } => Some(Rc::new(TagOrigin {
+                file_id,
+                local: name.clone(),
+                member: None,
+            })),
+            FlowJsxTag::Member {
+                object, property, ..
+            } => Some(Rc::new(TagOrigin {
+                file_id,
+                local: object.clone(),
+                member: Some(property.clone()),
+            })),
+            _ => None,
+        };
         TrackedValue::plain(AbstractValue::element(ElementValue {
             component: Box::new(component),
             props: values,
             span: expression.span.clone(),
             trace: self.trace.clone(),
+            tag,
         }))
+    }
+
+    /// Applies a component's `defaultProps` as React does: a default replaces a prop that is
+    /// missing or `undefined`. Defaults that are not a known record leave the props open.
+    fn apply_default_props(&mut self, key: &FunctionKey, props: &mut RecordFields) {
+        let Some(declaration) = self.symbol_linker.file(key.file_id).and_then(|file| {
+            file.flow
+                .default_props
+                .iter()
+                .find(|declaration| declaration.component == key.name)
+        }) else {
+            return;
+        };
+        let environment = self.module_environment(key.file_id);
+        let defaults = self.eval(&declaration.value, &environment, key.file_id);
+        let AbstractValue::Record(defaults) = self.materialize(&defaults).value else {
+            props.open = Some("unmodeled_default_props".to_owned());
+            return;
+        };
+        for (name, default) in defaults.iter() {
+            let value = match props.get(name).map(undefined_alternatives) {
+                None | Some(Some(Undefinedness::Always)) => default.clone(),
+                Some(Some(Undefinedness::Never)) => continue,
+                Some(None) => {
+                    let mut alternatives = Vec::new();
+                    collect_defined_alternatives(&props[name], &mut alternatives);
+                    alternatives.push(default.clone());
+                    TrackedValue::plain(AbstractValue::union(alternatives))
+                }
+            };
+            props.insert(name.clone(), value);
+        }
+        if props.open.is_none() {
+            props.open.clone_from(&defaults.open);
+        }
     }
 
     /// Finds a configured consumer whose module and export the tag's import chain passes through,
@@ -3097,15 +3368,26 @@ impl<'a> Solver<'a> {
             AbstractValue::Function(key) => {
                 let props = element.props.clone();
                 let tracking = self.begin_render_tracking(&props);
+                let mut received = element.props;
+                self.apply_default_props(key, &mut received);
+                if received.open.is_none() && self.wrapped_components.contains(key) {
+                    received.open = Some("props_from_configured_wrapper".to_owned());
+                }
                 let argument = TrackedValue {
-                    value: AbstractValue::record(element.props),
+                    value: AbstractValue::Record(Rc::new(received)),
                     evidence: element.component.evidence,
                     choice: element.component.choice.clone(),
                     heap_id: None,
                 };
                 let returned = self.call_function(key, vec![argument]);
                 self.render(returned);
-                self.finish_render_tracking(tracking, &element.span);
+                self.finish_render_tracking(
+                    tracking,
+                    &element.span,
+                    element.tag.as_deref(),
+                    &format!("{}:{}", key.file_id.0, key.name),
+                    &props,
+                );
                 if self.model.scan_callback_bodies {
                     for prop in props.values() {
                         self.scan_callback_bodies(prop, &element.span, 0);
@@ -3115,14 +3397,20 @@ impl<'a> Solver<'a> {
             AbstractValue::Closure(closure) => {
                 let props = element.props.clone();
                 let tracking = self.begin_render_tracking(&props);
-                let argument = TrackedValue::plain(AbstractValue::record(element.props));
+                let argument = TrackedValue::plain(AbstractValue::Record(Rc::new(element.props)));
                 let returned = self.invoke_value(
                     TrackedValue::plain(AbstractValue::Closure(closure.clone())),
                     vec![argument],
                     element.span.clone(),
                 );
                 self.render(returned);
-                self.finish_render_tracking(tracking, &element.span);
+                self.finish_render_tracking(
+                    tracking,
+                    &element.span,
+                    element.tag.as_deref(),
+                    &format!("{}:{}", closure.file_id.0, closure.span.start),
+                    &props,
+                );
                 if self.model.scan_callback_bodies {
                     for prop in props.values() {
                         self.scan_callback_bodies(prop, &element.span, 0);
@@ -3163,9 +3451,13 @@ impl<'a> Solver<'a> {
                     if let Some(component) = element.props.get(prop) {
                         self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
                             component: Box::new(component.clone()),
-                            props: BTreeMap::new(),
+                            props: RecordFields {
+                                fields: BTreeMap::new(),
+                                open: Some("props_from_configured_component".to_owned()),
+                            },
                             span: element.span.clone(),
                             trace: self.trace.clone(),
+                            tag: None,
                         })));
                     }
                 }
@@ -3199,6 +3491,7 @@ impl<'a> Solver<'a> {
                 reason,
                 wrapped,
                 callee,
+                ..
             } => {
                 // A root path renders this wrapper, so its module may model it exactly.
                 if let Some(callee) = callee
@@ -3233,6 +3526,7 @@ impl<'a> Solver<'a> {
                         props: element.props.clone(),
                         span: element.span.clone(),
                         trace: self.trace.clone(),
+                        tag: element.tag.clone(),
                     })));
                 }
             }
@@ -3257,6 +3551,166 @@ impl<'a> Solver<'a> {
         self.trace = previous_trace;
     }
 
+    /// Records one site of a boundary and returns its key.
+    fn register_boundary(
+        &mut self,
+        key: String,
+        span: &SourceSpan,
+        from_reachable: bool,
+        make: impl FnOnce() -> BoundaryState,
+    ) -> Rc<str> {
+        let key: Rc<str> = Rc::from(key);
+        let state = self.boundaries.entry(Rc::clone(&key)).or_insert_with(make);
+        state.entered_from_reachable |= from_reachable;
+        if state.site_keys.insert((span.file_id.0, span.start)) && state.sites.len() < 10 {
+            state.sites.push(span.clone());
+        }
+        key
+    }
+
+    /// The module specifier and export a tag imports, as written at the tag's file.
+    fn tag_import(&self, tag: &TagOrigin) -> (Option<String>, Option<String>) {
+        let Some(import) = self.symbol_linker.file(tag.file_id).and_then(|file| {
+            file.flow
+                .imports
+                .iter()
+                .find(|import| import.local == tag.local && !import.type_only)
+        }) else {
+            return (None, None);
+        };
+        let export = match &tag.member {
+            Some(member) if import.imported == "*" => member.clone(),
+            Some(member) => format!("{}.{member}", import.imported),
+            None => import.imported.clone(),
+        };
+        (Some(import.module.clone()), Some(export))
+    }
+
+    /// Classifies an element whose component the model could not follow and records the site.
+    fn unmodeled_boundary(&mut self, element: &ElementValue, from_reachable: bool) -> Rc<str> {
+        let reason = match &element.component.value {
+            AbstractValue::Unknown(reason) | AbstractValue::AssumedWrapper { reason, .. } => {
+                reason.clone()
+            }
+            _ => "unmodeled component".to_owned(),
+        };
+        let wrapper = match &element.component.value {
+            AbstractValue::AssumedWrapper {
+                callee: Some(callee),
+                argument,
+                ..
+            } => self
+                .symbol_linker
+                .file(callee.0)
+                .and_then(|file| {
+                    file.flow
+                        .imports
+                        .iter()
+                        .find(|import| import.local == callee.1 && !import.type_only)
+                })
+                .map(|import| (import.module.clone(), import.imported.clone(), *argument)),
+            _ => None,
+        };
+        // A linked value is keyed by its declaration, so every import of it aggregates.
+        let mut identity = None;
+        let (kind, module, export, component) = match element.tag.as_deref() {
+            Some(tag) => {
+                let (site_module, site_export) = self.tag_import(tag);
+                let member = |export: &str| match &tag.member {
+                    Some(member) if export == "*" => member.clone(),
+                    Some(member) => format!("{export}.{member}"),
+                    None => export.to_owned(),
+                };
+                if site_module.is_none() {
+                    (QueryBoundaryKind::DynamicValue, None, None, tag.text())
+                } else {
+                    let unparsed = self
+                        .symbol_linker
+                        .unparsed_link_targets(tag.file_id, &tag.local);
+                    let resolution = self.symbol_linker.resolve_binding(tag.file_id, &tag.local);
+                    let last = self
+                        .symbol_linker
+                        .linked_exports(tag.file_id, &tag.local)
+                        .last()
+                        .cloned();
+                    let at_last = |kind| {
+                        last.as_ref().map_or(
+                            (kind, site_module.clone(), site_export.clone(), tag.text()),
+                            |(module, export)| {
+                                (kind, Some(module.clone()), Some(member(export)), tag.text())
+                            },
+                        )
+                    };
+                    if !unparsed.is_empty() {
+                        if unparsed.iter().any(|path| {
+                            path.components()
+                                .any(|part| part.as_os_str() == "node_modules")
+                        }) {
+                            at_last(QueryBoundaryKind::ExternalPackage)
+                        } else {
+                            at_last(QueryBoundaryKind::UnparsedSource)
+                        }
+                    } else if resolution == ValueResolution::Unresolved {
+                        let bare =
+                            last.as_ref().is_some_and(|(module, _)| {
+                                !module.starts_with('.')
+                                    && !module.starts_with('/')
+                                    && self.project.config.import_aliases.keys().all(|alias| {
+                                        !module.starts_with(alias.trim_end_matches('*'))
+                                    })
+                            });
+                        at_last(if bare {
+                            QueryBoundaryKind::ExternalPackage
+                        } else {
+                            QueryBoundaryKind::UnresolvedImport
+                        })
+                    } else {
+                        identity = match resolution {
+                            ValueResolution::Resolved(LinkedValue::Declaration(symbol)) => {
+                                Some(format!("{}:{}", symbol.file_id.0, member(&symbol.name)))
+                            }
+                            ValueResolution::Resolved(LinkedValue::Namespace(file_id)) => {
+                                Some(format!("{}:{}", file_id.0, member("*")))
+                            }
+                            _ => None,
+                        };
+                        (
+                            QueryBoundaryKind::DynamicValue,
+                            site_module,
+                            site_export,
+                            tag.text(),
+                        )
+                    }
+                }
+            }
+            None => (
+                QueryBoundaryKind::DynamicValue,
+                None,
+                None,
+                "component value".to_owned(),
+            ),
+        };
+        let key = match (&module, &export, &wrapper) {
+            (_, _, Some((module, export, _))) => format!("wrapper:{module}#{export}"),
+            _ if identity.is_some() => format!("{kind:?}:{}", identity.unwrap_or_default()),
+            (Some(module), Some(export), None) => format!("{kind:?}:{module}#{export}"),
+            _ => format!("{kind:?}:{}:{}", element.span.file_id.0, element.span.start),
+        };
+        let shape = contract_shape(&element.props, |value| self.is_component_like(value));
+        let key = self.register_boundary(key, &element.span, from_reachable, || {
+            let mut state = BoundaryState::new(kind, component, module, export, reason);
+            state.wrapper = wrapper;
+            state
+        });
+        if let Some(state) = self.boundaries.get_mut(&key) {
+            state.forward_children |= shape.0;
+            state.invoke_children |= shape.1;
+            state.render_props.extend(shape.2);
+            state.component_props.extend(shape.3);
+        }
+        key
+    }
+
     /// Explores what an unmodeled component may render on a path from a configured root.
     ///
     /// Children, JSX-valued props, component props, and render functions that return JSX are
@@ -3269,21 +3723,28 @@ impl<'a> Solver<'a> {
         wrapped: &[TrackedValue],
     ) {
         let previous = self.current_reachability;
+        let boundary = self.unmodeled_boundary(element, previous == Reachability::Reachable);
         self.current_reachability = Reachability::Possible;
         self.assumed_renders
             .push((element.span.clone(), Assumption::UnmodeledComponent));
+        self.assumed_boundaries.push(boundary);
+        // The wrapper can add props of its own.
+        let mut props = element.props.clone();
+        props.open = Some("props_from_unmodeled_wrapper".to_owned());
         for component in wrapped {
             self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
                 component: Box::new(component.clone()),
-                props: element.props.clone(),
+                props: props.clone(),
                 span: element.span.clone(),
                 trace: self.trace.clone(),
+                tag: None,
             })));
         }
         for value in element.props.values() {
             self.render_assumed_prop(value, &element.span);
         }
         self.assumed_renders.pop();
+        self.assumed_boundaries.pop();
         self.current_reachability = previous;
     }
 
@@ -3340,7 +3801,14 @@ impl<'a> Solver<'a> {
 
     /// After a component's body runs, renders received JSX it did not render if the body hit
     /// anything the model could not follow. A fully modeled body that drops JSX stays exact.
-    fn finish_render_tracking(&mut self, tracking: Option<RenderTracking>, span: &SourceSpan) {
+    fn finish_render_tracking(
+        &mut self,
+        tracking: Option<RenderTracking>,
+        span: &SourceSpan,
+        tag: Option<&TagOrigin>,
+        component: &str,
+        props: &RecordFields,
+    ) {
         let Some(tracking) = tracking else {
             return;
         };
@@ -3361,9 +3829,35 @@ impl<'a> Solver<'a> {
             return;
         }
         let previous = self.current_reachability;
+        let (module, export) = tag.map_or((None, None), |tag| self.tag_import(tag));
+        let boundary = self.register_boundary(
+            format!("partial:{component}"),
+            span,
+            previous == Reachability::Reachable,
+            || {
+                BoundaryState::new(
+                QueryBoundaryKind::PartiallyModeled,
+                tag.map_or_else(|| component.to_owned(), TagOrigin::text),
+                module,
+                export,
+                "component body reached an unmodeled operation and did not render JSX it received; \
+                 a contract would replace the body in the model, so factory calls inside it would \
+                 no longer be explored"
+                    .to_owned(),
+            )
+            },
+        );
+        let shape = contract_shape(props, |value| self.is_component_like(value));
+        if let Some(state) = self.boundaries.get_mut(&boundary) {
+            state.forward_children |= shape.0;
+            state.invoke_children |= shape.1;
+            state.render_props.extend(shape.2);
+            state.component_props.extend(shape.3);
+        }
         self.current_reachability = Reachability::Possible;
         self.assumed_renders
             .push((span.clone(), Assumption::UnrenderedJsx));
+        self.assumed_boundaries.push(boundary);
         let trace_len = self.trace.len();
         self.trace.push(TraceStep {
             kind: QueryCallPathKind::AssumedRender,
@@ -3374,6 +3868,7 @@ impl<'a> Solver<'a> {
         }
         self.trace.truncate(trace_len);
         self.assumed_renders.pop();
+        self.assumed_boundaries.pop();
         self.current_reachability = previous;
     }
 
@@ -3396,9 +3891,24 @@ impl<'a> Solver<'a> {
             return;
         }
         let previous = self.current_reachability;
+        let boundary = self.register_boundary(
+            format!("escaped:{}:{}", span.file_id.0, span.start),
+            span,
+            previous == Reachability::Reachable,
+            || {
+                BoundaryState::new(
+                    QueryBoundaryKind::EscapedJsx,
+                    "JSX passed to an unmodeled call".to_owned(),
+                    None,
+                    None,
+                    "JSX handed to an unmodeled call or unsupported expression".to_owned(),
+                )
+            },
+        );
         self.current_reachability = Reachability::Possible;
         self.assumed_renders
             .push((span.clone(), Assumption::EscapedJsx));
+        self.assumed_boundaries.push(boundary);
         let trace_len = self.trace.len();
         self.trace.push(TraceStep {
             kind: QueryCallPathKind::AssumedRender,
@@ -3409,6 +3919,7 @@ impl<'a> Solver<'a> {
         }
         self.trace.truncate(trace_len);
         self.assumed_renders.pop();
+        self.assumed_boundaries.pop();
         self.current_reachability = previous;
     }
 
@@ -3428,9 +3939,13 @@ impl<'a> Solver<'a> {
                 {
                     self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
                         component: Box::new(value.clone()),
-                        props: BTreeMap::new(),
+                        props: RecordFields {
+                            fields: BTreeMap::new(),
+                            open: Some("props_from_unmodeled_component".to_owned()),
+                        },
                         span: span.clone(),
                         trace: self.trace.clone(),
+                        tag: None,
                     })));
                 }
             }
@@ -3610,6 +4125,7 @@ impl<'a> Solver<'a> {
                 argument,
                 &mut environment,
                 RelationKind::ValueTransfer,
+                closure.file_id,
             );
         }
         self.active_captures.push(captures);
@@ -3800,6 +4316,14 @@ impl<'a> Solver<'a> {
             invocations,
             unresolved,
             assumptions,
+            boundaries: if self.current_reachability == Reachability::Possible {
+                let mut boundaries = self.assumed_boundaries.clone();
+                boundaries.sort();
+                boundaries.dedup();
+                boundaries
+            } else {
+                Vec::new()
+            },
         });
         let creation_invocations = self.capabilities[capability_id]
             .invocations
@@ -3828,7 +4352,10 @@ impl<'a> Solver<'a> {
             let mut returned = capability;
             for property in self.model.returned_property.iter().rev() {
                 returned = TrackedValue {
-                    value: AbstractValue::record(BTreeMap::from([(property.clone(), returned)])),
+                    value: AbstractValue::open_record(
+                        BTreeMap::from([(property.clone(), returned)]),
+                        "unmodeled_factory_result_property",
+                    ),
                     evidence: Some(origin),
                     choice: self.current_choice.clone(),
                     heap_id: None,
@@ -3935,6 +4462,10 @@ impl<'a> Solver<'a> {
             return TrackedValue::unknown("property_read_from_non_record");
         };
         let Some(value) = fields.get(property).cloned() else {
+            // Prototype members are not modeled, so they stay unknown even on a closed record.
+            if fields.open.is_none() && !is_object_prototype_member(property) {
+                return TrackedValue::plain(AbstractValue::Undefined);
+            }
             self.mark_value_unresolved(&object, &format!("unknown property {property}"), span);
             return TrackedValue::unknown(format!("unknown_property:{property}"));
         };
@@ -4434,6 +4965,7 @@ impl<'a> Solver<'a> {
                     TrackedValue::unknown("unreached_caller_parameter"),
                     &mut environment,
                     RelationKind::RenderPropBinding,
+                    file_id,
                 );
             }
             self.reverse_evaluations = 0;
@@ -4492,6 +5024,7 @@ impl<'a> Solver<'a> {
                             value,
                             &mut environment,
                             RelationKind::ValueTransfer,
+                            file_id,
                         );
                     }
                     FlowStatement::Assign {
@@ -4709,6 +5242,74 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// Boundaries that matter for the report: those possible creations depend on, and those an
+    /// exact path reaches while handing them content to render. Most consequential first.
+    fn component_boundaries(&self, query: &QuerySpec) -> Vec<QueryComponentBoundary> {
+        use sha2::{Digest, Sha256};
+        let mut counts = BTreeMap::<&str, (usize, usize)>::new();
+        for capability in &self.capabilities {
+            if capability.reachability != Reachability::Possible
+                || (!query.report.include_non_invoked && capability.invocations.is_empty())
+            {
+                continue;
+            }
+            let sole = capability.boundaries.len() == 1;
+            for boundary in &capability.boundaries {
+                let entry = counts.entry(boundary).or_default();
+                entry.0 += 1;
+                entry.1 += usize::from(sole);
+            }
+        }
+        let mut boundaries = self
+            .boundaries
+            .iter()
+            .filter_map(|(key, state)| {
+                let (affected, sole) = counts.get(key.as_ref()).copied().unwrap_or_default();
+                let renders_content = state.forward_children
+                    || state.invoke_children
+                    || !state.render_props.is_empty()
+                    || !state.component_props.is_empty()
+                    || state.wrapper.is_some();
+                (affected > 0 || (state.entered_from_reachable && renders_content)).then(|| {
+                    QueryComponentBoundary {
+                        boundary_id: format!(
+                            "B{}",
+                            &hex::encode(Sha256::digest(key.as_bytes()))[..16]
+                        ),
+                        kind: state.kind,
+                        component: state.component.clone(),
+                        module: state.module.clone(),
+                        export: state.export.clone(),
+                        reason: state.reason.clone(),
+                        entered_from_reachable: state.entered_from_reachable,
+                        site_count: state.site_keys.len(),
+                        sites: state
+                            .sites
+                            .iter()
+                            .filter_map(|span| self.query_location(span))
+                            .collect(),
+                        affected_creations: affected,
+                        sole_blocker_creations: sole,
+                        suggested_contract: state.suggested_contract(),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        boundaries.sort_by(|left, right| {
+            right
+                .entered_from_reachable
+                .cmp(&left.entered_from_reachable)
+                .then(
+                    right
+                        .sole_blocker_creations
+                        .cmp(&left.sole_blocker_creations),
+                )
+                .then(right.affected_creations.cmp(&left.affected_creations))
+                .then_with(|| left.component.cmp(&right.component))
+        });
+        boundaries
+    }
+
     fn query_report(self, query: &QuerySpec, query_hash: &str) -> QueryReport {
         let snapshot_prefix = &self.snapshot.snapshot_id[..12.min(self.snapshot.snapshot_id.len())];
         let creations =
@@ -4877,8 +5478,9 @@ impl<'a> Solver<'a> {
                 )
             })
             .collect();
+        let component_boundaries = self.component_boundaries(query);
         QueryReport {
-            schema_version: 8,
+            schema_version: 9,
             snapshot_id: self.snapshot.snapshot_id.clone(),
             config_hash: self.snapshot.config_hash.clone(),
             query_hash: query_hash.to_owned(),
@@ -4895,6 +5497,7 @@ impl<'a> Solver<'a> {
             },
             evidence: self.evidence,
             gaps,
+            component_boundaries,
             coverage: Coverage {
                 scope: match query.scope {
                     QueryScope::Reachable => {
@@ -5027,7 +5630,7 @@ fn hash_value_fingerprint(
             ..
         } => ("e", enum_name, member_name).hash(hasher),
         AbstractValue::Record(fields) => {
-            "record".hash(hasher);
+            ("record", &fields.open).hash(hasher);
             for (name, value) in fields.iter() {
                 name.hash(hasher);
                 complete &= hash_value_fingerprint(heap, value, hasher, depth + 1);
@@ -5365,7 +5968,12 @@ fn collect_expression_references(expression: &FlowExpression, references: &mut C
                 collect_expression_references(value, references);
             }
         }
-        FlowExpressionKind::Arrow { body, .. } => collect_body_references(body, references),
+        FlowExpressionKind::Arrow { params, body } => {
+            for param in params {
+                collect_pattern_references(param, references);
+            }
+            collect_body_references(body, references);
+        }
         FlowExpressionKind::JsxElement { tag, props } => {
             if matches!(tag, FlowJsxTag::Unsupported { .. }) {
                 references.has_unsupported = true;
@@ -5411,9 +6019,34 @@ fn collect_expression_references(expression: &FlowExpression, references: &mut C
     }
 }
 
+/// Collects references made by defaults inside a binding pattern.
+fn collect_pattern_references(pattern: &FlowPattern, references: &mut ClosureReferences) {
+    match &pattern.kind {
+        FlowPatternKind::Object { fields, rest } => {
+            for field in fields {
+                collect_pattern_references(&field.target, references);
+            }
+            if let Some(rest) = rest {
+                collect_pattern_references(rest, references);
+            }
+        }
+        FlowPatternKind::Array { elements } => {
+            for element in elements.iter().flatten() {
+                collect_pattern_references(element, references);
+            }
+        }
+        FlowPatternKind::Default { target, default } => {
+            collect_pattern_references(target, references);
+            collect_expression_references(default, references);
+        }
+        FlowPatternKind::Identifier { .. } | FlowPatternKind::Unsupported { .. } => {}
+    }
+}
+
 fn collect_statement_references(statement: &FlowStatement, references: &mut ClosureReferences) {
     match statement {
         FlowStatement::Bind(binding) => {
+            collect_pattern_references(&binding.pattern, references);
             collect_expression_references(&binding.value, references);
         }
         FlowStatement::Expression { value, .. }
@@ -5539,6 +6172,172 @@ fn returns_capability_data(value: &TrackedValue) -> bool {
         }
         _ => false,
     }
+}
+
+/// Copies a spread value's properties into a record literal under construction. A spread of a
+/// value without known properties makes the record open, and properties set before it may have
+/// been overwritten.
+fn spread_into_record(record: &mut RecordFields, value: &TrackedValue) {
+    match &value.value {
+        AbstractValue::Null | AbstractValue::Undefined => {}
+        AbstractValue::Record(fields) => {
+            if let Some(reason) = &fields.open {
+                widen_record_for_unknown_spread(record, reason);
+            }
+            record.extend(
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+        }
+        AbstractValue::Union(alternatives) => {
+            // Each alternative spreads into its own copy; the record keeps every outcome.
+            let before = record.clone();
+            let outcomes = alternatives
+                .iter()
+                .map(|alternative| {
+                    let mut outcome = before.clone();
+                    spread_into_record(&mut outcome, alternative);
+                    outcome
+                })
+                .collect::<Vec<_>>();
+            let names = outcomes
+                .iter()
+                .flat_map(|outcome| outcome.keys().cloned())
+                .collect::<BTreeSet<_>>();
+            for name in names {
+                let values = outcomes
+                    .iter()
+                    .map(|outcome| {
+                        outcome
+                            .get(&name)
+                            .cloned()
+                            .unwrap_or_else(|| TrackedValue::plain(AbstractValue::Undefined))
+                    })
+                    .collect::<Vec<_>>();
+                let value = if values.iter().all(|value| same_value(value, &values[0])) {
+                    values[0].clone()
+                } else {
+                    TrackedValue::plain(AbstractValue::union(values))
+                };
+                record.insert(name, value);
+            }
+            record.open = outcomes.into_iter().find_map(|outcome| outcome.open);
+        }
+        _ => widen_record_for_unknown_spread(record, "object_spread_of_unknown_value"),
+    }
+}
+
+fn widen_record_for_unknown_spread(record: &mut RecordFields, reason: &str) {
+    for value in record.values_mut() {
+        *value = TrackedValue::plain(AbstractValue::union(vec![
+            value.clone(),
+            TrackedValue::unknown(reason),
+        ]));
+    }
+    record.open = Some(reason.to_owned());
+}
+
+/// Whether two alternatives are the same tracked value, so a union is not needed.
+fn same_value(left: &TrackedValue, right: &TrackedValue) -> bool {
+    let fingerprint = |value: &TrackedValue| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let complete = hash_value_fingerprint(&BTreeMap::new(), value, &mut hasher, 0);
+        complete.then(|| std::hash::Hasher::finish(&hasher))
+    };
+    left.evidence == right.evidence
+        && left.heap_id == right.heap_id
+        && fingerprint(left).is_some_and(|left| Some(left) == fingerprint(right))
+}
+
+/// Properties every object inherits from `Object.prototype`.
+fn is_object_prototype_member(property: &str) -> bool {
+    matches!(
+        property,
+        "constructor"
+            | "hasOwnProperty"
+            | "isPrototypeOf"
+            | "propertyIsEnumerable"
+            | "toLocaleString"
+            | "toString"
+            | "valueOf"
+            | "__proto__"
+            | "__defineGetter__"
+            | "__defineSetter__"
+            | "__lookupGetter__"
+            | "__lookupSetter__"
+    )
+}
+
+enum Undefinedness {
+    Never,
+    Always,
+}
+
+/// Whether a value is `undefined`: `None` when it may or may not be.
+fn undefined_alternatives(value: &TrackedValue) -> Option<Undefinedness> {
+    match &value.value {
+        AbstractValue::Undefined => Some(Undefinedness::Always),
+        AbstractValue::Unknown(_) | AbstractValue::AssumedWrapper { .. } => None,
+        AbstractValue::Union(values) => {
+            let mut kinds = values.iter().map(undefined_alternatives);
+            let first = kinds.next().flatten()?;
+            kinds
+                .all(|kind| {
+                    matches!(
+                        (&first, kind),
+                        (Undefinedness::Never, Some(Undefinedness::Never))
+                            | (Undefinedness::Always, Some(Undefinedness::Always))
+                    )
+                })
+                .then_some(first)
+        }
+        _ => Some(Undefinedness::Never),
+    }
+}
+
+/// Collects a value's alternatives other than `undefined`.
+fn collect_defined_alternatives(value: &TrackedValue, alternatives: &mut Vec<TrackedValue>) {
+    match &value.value {
+        AbstractValue::Undefined => {}
+        AbstractValue::Union(values) => {
+            for value in values.iter() {
+                collect_defined_alternatives(value, alternatives);
+            }
+        }
+        _ => alternatives.push(value.clone()),
+    }
+}
+
+/// How an unmodeled component's props would map onto a consumer contract: children to forward,
+/// a function child to invoke, render-function props, and component props.
+fn contract_shape(
+    props: &RecordFields,
+    is_component: impl Fn(&TrackedValue) -> bool,
+) -> (bool, bool, BTreeSet<String>, BTreeSet<String>) {
+    let mut forward = false;
+    let mut invoke = false;
+    let mut render_props = BTreeSet::new();
+    let mut component_props = BTreeSet::new();
+    for (name, value) in props {
+        let callable = matches!(
+            value.value,
+            AbstractValue::Closure(_) | AbstractValue::Function(_)
+        );
+        if name == "children" {
+            if callable {
+                invoke = true;
+            } else if contains_element(value, 0) {
+                forward = true;
+            }
+        } else if matches!(&value.value, AbstractValue::Closure(closure) if arrow_body_renders_jsx(&closure.body))
+        {
+            render_props.insert(name.clone());
+        } else if callable && is_component(value) {
+            component_props.insert(name.clone());
+        }
+    }
+    (forward, invoke, render_props, component_props)
 }
 
 /// The local binding a call goes through: `name(...)` or `name.member(...)`.

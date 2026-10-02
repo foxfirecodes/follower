@@ -251,8 +251,8 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   ran, if its file is on the entry corridor), or if it receives JSX or callbacks. If the walk stops
   at its budget, components it did not reach can be skipped; the stop is reported as a gap. A
   component is explored once per entry input for the same props, which removes repeated paths
-  that would only duplicate results; props too deep to fingerprint are always explored. Assumed rendering has a 200,000-step budget per entry input;
-  exhausting it is a coverage gap.
+  that would only duplicate results; props too deep to fingerprint are always explored. Assumed
+  rendering has a 1,000,000-step budget per entry input; exhausting it is a coverage gap.
 - JSX can also leave the model inside a component that is parsed. On paths from configured roots,
   elements handed to an unknown or unsupported call, or referenced by an unsupported expression,
   are explored as possible with a `jsx_passed_to_an_unmodeled_call` gap. After a parsed component
@@ -260,6 +260,18 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   `jsx_dropped_by_a_partially_modeled_component` gap if its body reached anything the model could
   not follow. A fully modeled body that does not render a prop, such as one that returns `null`,
   keeps it unrendered.
+- Records built from object literals and JSX props are closed: they have exactly the listed
+  properties, so reading a missing one gives `undefined`, as in JavaScript, and a guard such as
+  `onClose != null` on a prop that was not passed is decided. Defaults in destructuring and
+  parameters apply when the value is `undefined`, and a component's `defaultProps`
+  (`static defaultProps` or `Component.defaultProps = ...`) fill missing props as React does.
+  Records that may have other properties stay open, and reading a missing property of one is
+  unknown with a gap: entry props, the modeled factory result, context objects, props after a
+  spread of an unknown value, props a higher-order component or configured wrapper passes, and
+  props given by an assumed render. `Object.prototype` members are always unknown. An object
+  literal spread copies a known record's properties in order, keeps each alternative of a union,
+  and ignores `null` and `undefined`; spreading anything else makes the record open, and
+  properties listed before that spread may have been overwritten.
 - `all_creations` additionally scans the owned IR for every resolved factory callsite. It explores
   an otherwise-unreached enclosing function once with unknown parameters. Such rows have
   `reachability = "unknown"`, an unresolved reference, and an incomplete-coverage gap; they are
@@ -297,6 +309,23 @@ is a possible relationship at an invocation or excluded callsite. `unknown_relev
 gap's impact could not be established; `unlinked` means no source location or target was available.
 The old `coverage.gaps` strings remain for compatibility. A gap link is static provenance, not
 proof that an event executed at runtime.
+
+Schema version 9 adds `component_boundaries`: the components on paths from configured roots that
+the model could not follow, most consequential first. Each names the JSX tag, where linkage
+stopped (`module` and `export` as written there), and a kind: `external_package` (an unparsed
+package, such as one under `node_modules`), `unparsed_source` (a project file the text filter or
+an expansion budget left out), `unresolved_import`, `dynamic_value` (a linked value the model does
+not follow, such as an unknown higher-order component's result), `partially_modeled` (a parsed
+component that dropped JSX after an unmodeled operation), or `escaped_jsx`.
+`entered_from_reachable` marks boundaries an exact path reaches, which are the ones whose modeling
+can make creations reachable; `affected_creations` and `sole_blocker_creations` count reported
+possible creations below the boundary and those with no other assumption. Where a project
+contract applies, `suggested_contract` gives TOML for it, with children forwarding, function-child
+invocation, render props, and component props inferred from the props seen at the sites, or a
+`component_wrappers` entry for a higher-order component. A contract is an assumption about the
+component's behavior: check the component first. A contract on a parsed project component replaces
+its body in the model, so factory calls inside it are no longer explored. The text renderer prints
+the first ten boundaries with their suggestions, and the HTML report has a Boundaries tab.
 Snapshot reuse is not implemented yet.
 
 ## Current analysis fragment
@@ -304,7 +333,8 @@ Snapshot reuse is not implemented yet.
 The engine follows object and array destructuring, local calls and closures, records, finite computed record
 selection, arrays and finite spreads, exact string/boolean/numeric-enum strict-equality branches,
 null comparisons, logical expressions, conditional expressions, finite-array `.map` and `.filter`,
-`Object.values` on known records, local `.push`, JSX component props/children/spreads,
+`Object.values` on known records, local `.push`, object literal spreads, destructuring and
+parameter defaults, `defaultProps`, JSX component props/children/spreads,
 React `useMemo`, `useCallback`, `useState`, `memo`, `forwardRef`, and `createContext`, prop renaming, wrapper callbacks, simple
 identifier reassignment, and intrinsic `onClick` handlers. Factory matching and ordinary
 function/component calls, enums, and module values use canonical identities across named import

@@ -18,10 +18,10 @@ use oxc::{
 use crate::{
     ids::FileId,
     ir::{
-        FlowArrowBody, FlowAssignmentTarget, FlowBinding, FlowExport, FlowExpression,
-        FlowExpressionKind, FlowFileIr, FlowFunction, FlowImport, FlowJsxProp, FlowJsxTag,
-        FlowLogicalOperator, FlowPattern, FlowPatternField, FlowPatternKind, FlowRecordField,
-        FlowStatement, SourceSpan, UnsupportedIr,
+        FlowArrowBody, FlowAssignmentTarget, FlowBinding, FlowDefaultProps, FlowExport,
+        FlowExpression, FlowExpressionKind, FlowFileIr, FlowFunction, FlowImport, FlowJsxProp,
+        FlowJsxTag, FlowLogicalOperator, FlowPattern, FlowPatternField, FlowPatternKind,
+        FlowRecordField, FlowStatement, SourceSpan, UnsupportedIr,
     },
 };
 
@@ -98,6 +98,20 @@ impl Lowerer<'_> {
             }
             Statement::FunctionDeclaration(function) => self.lower_function(function),
             Statement::ClassDeclaration(class) => self.lower_class(class),
+            Statement::ExpressionStatement(statement) => {
+                if let Expression::AssignmentExpression(assignment) = &statement.expression
+                    && let oxc::ast::ast::AssignmentTarget::StaticMemberExpression(member) =
+                        &assignment.left
+                    && member.property.name == "defaultProps"
+                    && let Expression::Identifier(component) = &member.object
+                {
+                    let value = self.lower_expression(&assignment.right);
+                    self.output.default_props.push(FlowDefaultProps {
+                        component: component.name.to_string(),
+                        value,
+                    });
+                }
+            }
             Statement::ExportDeclaration(export) => {
                 self.record_direct_exports(&export.declaration);
                 self.lower_declaration(&export.declaration);
@@ -238,6 +252,7 @@ impl Lowerer<'_> {
                         .members
                         .iter()
                         .map(|member| FlowRecordField {
+                            spread: false,
                             property: member.id.static_name().to_string(),
                             value: member.initializer.as_ref().map_or_else(
                                 || self.unsupported_expression("implicit_enum_value", member.span),
@@ -375,6 +390,17 @@ impl Lowerer<'_> {
         let class_name = identifier.name.to_string();
         self.current_class = Some(class_name.clone());
         for element in &class.body.body {
+            if let ClassElement::PropertyDefinition(property) = element
+                && property.r#static
+                && property.key.static_name().as_deref() == Some("defaultProps")
+                && let Some(value) = &property.value
+            {
+                let value = self.lower_expression(value);
+                self.output.default_props.push(FlowDefaultProps {
+                    component: class_name.clone(),
+                    value,
+                });
+            }
             let ClassElement::MethodDefinition(method) = element else {
                 continue;
             };
@@ -416,7 +442,19 @@ impl Lowerer<'_> {
         params
             .items
             .iter()
-            .map(|parameter| self.lower_pattern(&parameter.pattern))
+            .map(|parameter| {
+                let pattern = self.lower_pattern(&parameter.pattern);
+                match &parameter.initializer {
+                    Some(default) => FlowPattern {
+                        span: self.span(parameter.span),
+                        kind: FlowPatternKind::Default {
+                            target: Box::new(pattern),
+                            default: Box::new(self.lower_expression(default)),
+                        },
+                    },
+                    None => pattern,
+                }
+            })
             .collect()
     }
 
@@ -448,6 +486,10 @@ impl Lowerer<'_> {
                         .map(|rest| Box::new(self.lower_pattern(&rest.argument))),
                 }
             }
+            BindingPattern::AssignmentPattern(assignment) => FlowPatternKind::Default {
+                target: Box::new(self.lower_pattern(&assignment.left)),
+                default: Box::new(self.lower_expression(&assignment.right)),
+            },
             BindingPattern::ArrayPattern(array) if array.rest.is_none() => FlowPatternKind::Array {
                 elements: array
                     .elements
@@ -659,8 +701,17 @@ impl Lowerer<'_> {
             Expression::ObjectExpression(object) => {
                 let mut fields = Vec::with_capacity(object.properties.len());
                 for property in &object.properties {
-                    let ObjectPropertyKind::ObjectProperty(property) = property else {
-                        return self.unsupported_expression("object_spread", expression.span());
+                    let property = match property {
+                        ObjectPropertyKind::ObjectProperty(property) => property,
+                        ObjectPropertyKind::SpreadProperty(spread) => {
+                            fields.push(FlowRecordField {
+                                property: "...".to_owned(),
+                                value: self.lower_expression(&spread.argument),
+                                span: self.span(spread.span),
+                                spread: true,
+                            });
+                            continue;
+                        }
                     };
                     let Some(name) = property.key.static_name() else {
                         return self
@@ -670,6 +721,7 @@ impl Lowerer<'_> {
                         property: name.into_owned(),
                         value: self.lower_expression(&property.value),
                         span: self.span(property.span),
+                        spread: false,
                     });
                 }
                 FlowExpressionKind::Record { fields }

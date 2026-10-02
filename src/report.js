@@ -5,9 +5,10 @@
   app.innerHTML = `<main class="shell">
     <header class="top"><div><p class="eyebrow">Follower / Query report</p><h1 id="title"></h1><p class="sub" id="subtitle"></p></div><div class="snapshot mono" id="snapshot"></div></header>
     <div class="metrics" id="metrics"></div>
-    <nav class="tabs" aria-label="Report sections"><button class="tab active" data-tab="creations">Creations</button><button class="tab" data-tab="coverage">Coverage</button><button class="tab" data-tab="evidence">Evidence</button></nav>
+    <nav class="tabs" aria-label="Report sections"><button class="tab active" data-tab="creations">Creations</button><button class="tab" data-tab="boundaries">Boundaries</button><button class="tab" data-tab="coverage">Coverage</button><button class="tab" data-tab="evidence">Evidence</button></nav>
     <section id="creations" class="panel active"><div class="toolbar"><input class="search" id="creation-search" type="search" placeholder="Search creation, choice, value, or file" aria-label="Search creations"><select class="filter" id="creation-filter" aria-label="Filter creation status"><option value="all">All conclusions</option><option value="candidate_invocation">Invoked</option><option value="unresolved">Unresolved</option><option value="absent_within_model">No invocation</option></select><span class="count" id="creation-count"></span></div><div class="split"><div class="list"><div class="list-title">Creation contexts</div><div id="creation-list"></div></div><div class="detail" id="creation-detail"></div></div></section>
     <section id="coverage" class="panel"><div class="notice" id="coverage-notice"></div><div class="coverage-grid"><div class="coverage-card"><header><h2>Coverage gaps</h2><span class="count" id="gap-count"></span></header><div class="toolbar"><input class="search" id="gap-search" type="search" placeholder="Search gaps" aria-label="Search gaps"><select class="filter" id="gap-filter" aria-label="Filter gap assessment"><option value="all">All assessments</option><option value="direct">Direct</option><option value="may_affect">May affect</option><option value="unknown_relevance">Unknown relevance</option><option value="unlinked">Unlinked</option></select></div><div id="gap-list"></div></div><div class="coverage-card"><header><h2>Callsite inventory</h2><span class="count" id="inventory-count"></span></header><div class="toolbar"><input class="search" id="inventory-search" type="search" placeholder="Search file or reason" aria-label="Search callsites"><select class="filter" id="inventory-filter" aria-label="Filter callsite status"><option value="all">All callsites</option><option value="analyzed">Analyzed</option><option value="filtered">Filtered</option><option value="unresolved">Unresolved</option><option value="skipped">Skipped</option></select></div><div id="inventory-list"></div></div></div></section>
+    <section id="boundaries" class="panel"><div class="notice" id="boundary-notice"></div><div class="evidence-card"><div class="toolbar"><input class="search" id="boundary-search" type="search" placeholder="Search component, module, or file" aria-label="Search boundaries"><span class="count" id="boundary-count"></span></div><div id="boundary-list" class="stack"></div></div></section>
     <section id="evidence" class="panel"><div class="evidence-card"><div class="toolbar"><input class="search" id="evidence-search" type="search" placeholder="Search evidence ID, rule, summary" aria-label="Search evidence"><span class="count" id="evidence-count"></span></div><div id="evidence-list" class="evidence-list"></div></div></section>
     <p class="footer">Static analysis describes possible flow within configured roots and model limits. A candidate invocation does not prove runtime execution. This file is self-contained and stored locally.</p>
   </main>`;
@@ -76,6 +77,7 @@
     ['Creations', report.creations.length],
     ['Candidate calls', report.creations.reduce((sum, creation) => sum + creation.invocations.length, 0)],
     ['Unresolved rows', unresolvedCount],
+    ['Boundaries', (report.component_boundaries || []).length],
     ['Coverage gaps', report.gaps.length],
     ['Callsites', report.callsite_inventory.callsites.length],
   ];
@@ -236,6 +238,29 @@
     });
     if (grouped.length > gapLimit) list.append(button(`Show more (${grouped.length - gapLimit} remaining)`, () => { gapLimit += 100; renderGaps(); }, 'load'));
   }
+  const boundaries = report.component_boundaries || [];
+  $('#boundary-notice').textContent = boundaries.length
+    ? 'Possible creations depend on these components, most consequential first. Start with boundaries reached exactly. A suggested contract is an assumption about the component: check that it renders what it receives before adding one to the project definition.'
+    : 'No component boundary affects the reported creations.';
+  function renderBoundaries() {
+    const search = $('#boundary-search').value.trim().toLowerCase();
+    const filtered = boundaries.filter(boundary => !search || [boundary.component, boundary.module, boundary.export, boundary.kind, ...boundary.sites.map(loc)].join(' ').toLowerCase().includes(search));
+    $('#boundary-count').textContent = `${filtered.length} of ${boundaries.length}`;
+    const list = $('#boundary-list'); list.replaceChildren();
+    if (!filtered.length) { list.append(node('p', 'empty', 'No matching boundaries.')); return; }
+    filtered.forEach(boundary => {
+      const card = node('details', 'gap'); const summary = node('summary');
+      summary.append(badge(boundary.kind, boundary.entered_from_reachable ? 'conditional' : 'unknown'), node('span', 'gap-kind', `${boundary.component}${boundary.module ? ` from ${boundary.module}#${boundary.export}` : ''}`), node('span', 'count', `${boundary.affected_creations} creations · ${boundary.sole_blocker_creations} only through it`));
+      card.append(summary);
+      const body = node('div', 'gap-body');
+      body.append(node('div', 'mono', `${boundary.boundary_id}${boundary.entered_from_reachable ? ' · reached exactly' : ''} · ${boundary.site_count} site${boundary.site_count === 1 ? '' : 's'}`));
+      body.append(node('p', 'mini', boundary.reason));
+      boundary.sites.forEach(site => body.append(node('div', 'mini mono', loc(site))));
+      if (boundary.suggested_contract) { body.append(node('h3', 'mini', 'Suggested contract')); body.append(node('pre', 'mono', boundary.suggested_contract)); }
+      card.append(body); list.append(card);
+    });
+  }
+  $('#boundary-search').addEventListener('input', renderBoundaries);
   $('#gap-search').addEventListener('input', () => { gapLimit = 100; renderGaps(); });
   $('#gap-filter').addEventListener('change', () => { gapLimit = 100; renderGaps(); });
 
@@ -283,5 +308,5 @@
     $('#evidence-count').textContent = `${visited.size} nodes on selected path`;
   }
   $('#evidence-search').addEventListener('input', () => { evidenceLimit = 100; renderEvidence(); });
-  renderCreationList(); renderCreationDetail(); renderGaps(); renderInventory(); renderEvidence();
+  renderCreationList(); renderCreationDetail(); renderBoundaries(); renderGaps(); renderInventory(); renderEvidence();
 })();

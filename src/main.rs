@@ -174,6 +174,43 @@ fn print_query_report(report: &QueryReport) {
             );
         }
     }
+    if !report.component_boundaries.is_empty() {
+        println!(
+            "component boundaries: {} (possible creations depend on these; check a component before adding a suggested contract)",
+            report.component_boundaries.len()
+        );
+        for boundary in report.component_boundaries.iter().take(10) {
+            let target = match (&boundary.module, &boundary.export) {
+                (Some(module), Some(export)) => format!(" from {module}#{export}"),
+                _ => String::new(),
+            };
+            println!(
+                "  {} {:?} {}{target}: {} creations, {} only through it{} ({})",
+                boundary.boundary_id,
+                boundary.kind,
+                boundary.component,
+                boundary.affected_creations,
+                boundary.sole_blocker_creations,
+                if boundary.entered_from_reachable {
+                    ", reached exactly"
+                } else {
+                    ""
+                },
+                boundary
+                    .sites
+                    .first()
+                    .map_or_else(String::new, |site| format!(
+                        "{}:{}",
+                        site.path, site.start_line
+                    )),
+            );
+            if let Some(contract) = &boundary.suggested_contract {
+                for line in contract.lines() {
+                    println!("    {line}");
+                }
+            }
+        }
+    }
     println!(
         "coverage: {} ({} creations, {} processed files)",
         if report.coverage.complete {

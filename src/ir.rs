@@ -73,6 +73,16 @@ pub struct FlowFileIr {
     pub globals: Vec<FlowBinding>,
     pub functions: Vec<FlowFunction>,
     pub unsupported: Vec<UnsupportedIr>,
+    /// `defaultProps` declared in this module, from `static defaultProps` or
+    /// `Component.defaultProps = ...`.
+    #[serde(default)]
+    pub default_props: Vec<FlowDefaultProps>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FlowDefaultProps {
+    pub component: String,
+    pub value: FlowExpression,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -196,6 +206,12 @@ pub enum FlowPatternKind {
     Array {
         elements: Vec<Option<FlowPattern>>,
     },
+    /// A target with a default used when the value is `undefined`, as in `{ size = 'md' }` or a
+    /// parameter default.
+    Default {
+        target: Box<FlowPattern>,
+        default: Box<FlowExpression>,
+    },
     Unsupported {
         syntax: String,
     },
@@ -311,6 +327,9 @@ pub struct FlowRecordField {
     pub property: String,
     pub value: FlowExpression,
     pub span: SourceSpan,
+    /// `...value` copies the value's properties at this point; `property` is unused.
+    #[serde(default)]
+    pub spread: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -335,7 +354,7 @@ pub fn lazy_component_import<'a>(
     };
     let callback = &fields
         .iter()
-        .find(|field| field.property == promise_property)?
+        .find(|field| !field.spread && field.property == promise_property)?
         .value;
     let FlowExpressionKind::Arrow { body, .. } = &callback.kind else {
         return None;

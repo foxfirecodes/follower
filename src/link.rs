@@ -674,6 +674,7 @@ pub(crate) fn pattern_names(pattern: &FlowPattern) -> Vec<&str> {
         FlowPatternKind::Array { elements } => {
             elements.iter().flatten().flat_map(pattern_names).collect()
         }
+        FlowPatternKind::Default { target, .. } => pattern_names(target),
         FlowPatternKind::Unsupported { .. } => Vec::new(),
     }
 }

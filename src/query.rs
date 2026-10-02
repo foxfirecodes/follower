@@ -344,8 +344,57 @@ pub struct QueryReport {
     pub evidence: Vec<Evidence>,
     #[serde(default)]
     pub gaps: Vec<QueryGap>,
+    /// Components on paths from configured roots that the model could not follow, most
+    /// consequential first. Each is a place where a contract, a larger parse, or engine support
+    /// can turn possible creations into reachable ones.
+    #[serde(default)]
+    pub component_boundaries: Vec<QueryComponentBoundary>,
     pub coverage: Coverage,
     pub diagnostics: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryBoundaryKind {
+    /// Linkage ends in a package that is not parsed, such as one under `node_modules`.
+    ExternalPackage,
+    /// Linkage ends in a project source file that was not parsed, for example because of the
+    /// text filter or an expansion budget.
+    UnparsedSource,
+    /// A relative or aliased import did not resolve.
+    UnresolvedImport,
+    /// The component is linked but its value is not modeled, such as the result of an unknown
+    /// higher-order component call.
+    DynamicValue,
+    /// A parsed component did not render JSX it received after reaching an unmodeled operation.
+    PartiallyModeled,
+    /// JSX was handed to an unmodeled call or unsupported expression.
+    EscapedJsx,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryComponentBoundary {
+    pub boundary_id: String,
+    pub kind: QueryBoundaryKind,
+    /// The JSX tag or call as written at the first site.
+    pub component: String,
+    /// Module specifier and export where linkage stops, as written there; `.member` follows a
+    /// member tag.
+    pub module: Option<String>,
+    pub export: Option<String>,
+    pub reason: String,
+    /// Whether an exact path from a configured root reaches the boundary, so modeling it can make
+    /// creations below it reachable.
+    pub entered_from_reachable: bool,
+    pub site_count: usize,
+    pub sites: Vec<QueryLocation>,
+    /// Reported creations that are possible only through this boundary and possibly others.
+    pub affected_creations: usize,
+    /// Reported creations whose only assumption is this boundary.
+    pub sole_blocker_creations: usize,
+    /// A project contract that would model the boundary, when one applies. Contracts are
+    /// assumptions about library behavior; check the component before adding one.
+    pub suggested_contract: Option<String>,
 }
 
 impl QueryGap {

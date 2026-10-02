@@ -4,8 +4,9 @@ use code_flow::{
     Project,
     queries::Conclusion,
     query::{
-        QueryCallPathKind, QueryCallsiteStatus, QueryGapAssessment, QueryGapTarget,
-        QueryReverseImporterEvaluation, QueryScope, QueryValue, Reachability, load_query,
+        QueryBoundaryKind, QueryCallPathKind, QueryCallsiteStatus, QueryGapAssessment,
+        QueryGapTarget, QueryReverseImporterEvaluation, QueryScope, QueryValue, Reachability,
+        load_query,
     },
 };
 use support::TestProject;
@@ -301,6 +302,146 @@ fn root_path_parses_the_higher_order_component_it_renders() {
         "{:?}",
         report.coverage.gaps
     );
+}
+
+fn exact_actions(files: &[(&str, &str)]) -> (Vec<String>, Vec<String>) {
+    let mut all = vec![
+        HOOK,
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf({ action }) { const [, apply] = useItemSelection(['alpha']); apply(action); return null; }",
+        ),
+    ];
+    all.extend_from_slice(files);
+    let fixture = TestProject::new(&all);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", TUPLE_QUERY);
+    let report = fixture.report();
+    let mut exact = Vec::new();
+    let mut other = Vec::new();
+    for creation in &report.creations {
+        for invocation in &creation.invocations {
+            let action = match &invocation.arguments["action"] {
+                QueryValue::String { value } => value.clone(),
+                value => format!("{value:?}"),
+            };
+            if creation.reachability == Reachability::Reachable {
+                exact.push(action);
+            } else {
+                other.push(action);
+            }
+        }
+    }
+    exact.sort();
+    exact.dedup();
+    other.sort();
+    (exact, other)
+}
+
+#[test]
+fn missing_props_are_undefined_and_destructuring_defaults_apply() {
+    let (exact, other) = exact_actions(&[(
+        "src/App.tsx",
+        "import { Leaf } from './Leaf'; function label(text = 'unlabeled') { return text; } function Panel({ mode = 'compact', onClose }) { if (onClose != null) { return <Leaf action='closable' />; } return <div><Leaf action={mode} /><Leaf action={label()} /></div>; } export function App() { return <div><Panel /><Panel mode='wide' /></div>; }",
+    )]);
+    assert_eq!(exact, ["compact", "unlabeled", "wide"]);
+    assert!(other.is_empty(), "{other:?}");
+}
+
+#[test]
+fn object_spread_keeps_known_properties_of_each_alternative() {
+    let (exact, other) = exact_actions(&[(
+        "src/App.tsx",
+        "import { Leaf } from './Leaf'; import { extra } from 'external-values'; function Base({ children, hover }) { const base = { kind: 'base', ...(hover ? { kind: 'hovered' } : {}) }; return children({ ...base, size: 'md' }); } function Open() { const merged = { action: 'listed', ...extra }; return <Leaf action={merged.action} />; } export function App() { return <div><Base hover={false}>{(props) => <Leaf action={props.kind} />}</Base><Base hover>{(props) => <Leaf action={props.size} />}</Base><Open /></div>; }",
+    )]);
+    // A spread of an unknown value may overwrite properties listed before it, so that read is a
+    // joined unknown; the other spreads keep exact values.
+    assert_eq!(
+        exact,
+        ["Unknown { reason: \"joined_alternatives\" }", "base", "md"],
+        "{other:?}"
+    );
+}
+
+#[test]
+fn default_props_fill_missing_class_and_function_component_props() {
+    let (exact, other) = exact_actions(&[(
+        "src/App.tsx",
+        "import * as React from 'react'; import { Leaf } from './Leaf'; class Card extends React.Component { static defaultProps = { action: 'class-default' }; render() { return <Leaf action={this.props.action} />; } } function Tile({ action }) { return <Leaf action={action} />; } Tile.defaultProps = { action: 'function-default' }; export function App() { return <div><Card /><Card action='explicit' /><Tile /></div>; }",
+    )]);
+    assert_eq!(
+        exact,
+        ["class-default", "explicit", "function-default"],
+        "{other:?}"
+    );
+}
+
+#[test]
+fn component_boundaries_suggest_contracts_that_make_creations_reachable() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/Leaf.tsx",
+            "import { useItemSelection } from './hook'; export function Leaf({ action }) { const [, apply] = useItemSelection(['alpha']); apply(action); return null; }",
+        ),
+        ("src/ui.ts", "export { Frame } from 'external-frame';"),
+        (
+            "src/App.tsx",
+            "import { Frame } from './ui'; import { withTracking } from 'external-tracking'; import { Leaf } from './Leaf'; function Panel({ action }) { return <section><Leaf action={action} /></section>; } const TrackedPanel = withTracking(Panel); export function App() { return <div><Frame><Leaf action='framed' /></Frame><TrackedPanel action='tracked' /></div>; }",
+        ),
+    ]);
+    let config = "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n";
+    fixture.write("flow.toml", config);
+    fixture.write("query.toml", TUPLE_QUERY);
+    let report = fixture.report();
+    assert_eq!(report.schema_version, 9);
+    assert!(
+        report
+            .creations
+            .iter()
+            .all(|creation| creation.reachability == Reachability::Possible)
+    );
+    let frame = report
+        .component_boundaries
+        .iter()
+        .find(|boundary| boundary.component == "Frame")
+        .expect("frame boundary");
+    assert_eq!(frame.kind, QueryBoundaryKind::ExternalPackage);
+    assert_eq!(frame.module.as_deref(), Some("external-frame"));
+    assert!(frame.entered_from_reachable);
+    assert_eq!(frame.sole_blocker_creations, 1);
+    let tracked = report
+        .component_boundaries
+        .iter()
+        .find(|boundary| boundary.component == "TrackedPanel")
+        .expect("wrapper boundary");
+    assert_eq!(tracked.kind, QueryBoundaryKind::DynamicValue);
+    assert_eq!(
+        tracked.suggested_contract.as_deref(),
+        Some(
+            "[[component_wrappers]]\nmodule = \"external-tracking\"\nexport = \"withTracking\"\ncomponent_argument = 0\n"
+        )
+    );
+    let contracts = report
+        .component_boundaries
+        .iter()
+        .filter_map(|boundary| boundary.suggested_contract.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fixture.write("flow.toml", &format!("{config}\n{contracts}"));
+    let report = fixture.report();
+    assert_eq!(report.creations.len(), 2, "{:?}", report.coverage.gaps);
+    assert!(
+        report
+            .creations
+            .iter()
+            .all(|creation| creation.reachability == Reachability::Reachable),
+        "{contracts}"
+    );
+    assert!(report.component_boundaries.is_empty());
 }
 
 #[test]
