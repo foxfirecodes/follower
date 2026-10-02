@@ -389,7 +389,22 @@ pub struct QueryCallsiteValues {
     /// The distinct values of each projected factory argument across contexts.
     pub factory_arguments: BTreeMap<String, Vec<QueryValue>>,
     pub factory_arguments_resolved: bool,
+    /// For an unresolved argument that is a local array built from literal elements and `push`
+    /// calls, the values it may contain, in source order.
+    #[serde(default)]
+    pub possible_elements: BTreeMap<String, Vec<QueryValue>>,
+    /// For an unresolved argument that reads the enclosing function's parameters, its value
+    /// with what each caller passes.
+    #[serde(default)]
+    pub values_from_callers: BTreeMap<String, Vec<QueryCallerValue>>,
     pub capability: QueryCapabilityUse,
+}
+
+/// An argument's value with the parameters one caller passes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryCallerValue {
+    pub caller: Option<QueryLocation>,
+    pub value: QueryValue,
 }
 
 /// What became of the selected factory result: the calls made with it and where it went that

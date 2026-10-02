@@ -13,20 +13,22 @@ use crate::{
     },
     link::{LinkedSymbol, LinkedValue, ValueResolution, pattern_names},
     query::{
-        QueryCallsiteValues, QueryCapabilityCall, QueryCapabilityEscape, QueryCapabilityStatus,
-        QueryCapabilityUse, QuerySpec, QueryValue, Reachability,
+        QueryCallerValue, QueryCallsiteValues, QueryCapabilityCall, QueryCapabilityEscape,
+        QueryCapabilityStatus, QueryCapabilityUse, QuerySpec, QueryValue, Reachability,
     },
 };
 
 use super::{
-    Environment, FactoryCallCandidate, FunctionKey, Solver, UseEdge, UseNode, callee_text,
-    query_value,
+    Environment, FactoryCallCandidate, FunctionKey, Solver, TrackedValue, UseEdge, UseNode,
+    callee_text, query_value,
 };
 
 /// Scopes and targets one callsite's walk may visit.
 const WALK_LIMIT: usize = 400;
 /// Scope changes from the callsite to a call.
 const MAX_HOPS: usize = 8;
+/// Callers whose arguments are evaluated for one unresolved factory argument.
+const MAX_CALLERS: usize = 32;
 
 /// A property name, or `[index]` for an array element, on the way from a value to the factory
 /// result inside it.
@@ -536,7 +538,7 @@ impl Solver<'_> {
         let mut results = Vec::new();
         for candidate in &candidates {
             let walk = self.walk_capability(candidate, query, &graph);
-            results.push(self.summarize_callsite(candidate, query, walk));
+            results.push(self.summarize_callsite(candidate, query, walk, &graph));
         }
         results
     }
@@ -1133,16 +1135,27 @@ impl Solver<'_> {
         Some(locals)
     }
 
-    /// Evaluates a context-free argument with only module bindings, without keeping the gaps
-    /// the evaluation records.
+    /// Evaluates a context-free argument with only module bindings.
     fn evaluate_context_free(
         &mut self,
         file_id: FileId,
         expression: &FlowExpression,
     ) -> QueryValue {
+        query_value(&self.eval_with(file_id, expression, Vec::new()))
+    }
+
+    /// Evaluates an expression with module bindings and the given locals, without keeping the
+    /// gaps the evaluation records: this is a report on the source, not an explored path.
+    fn eval_with(
+        &mut self,
+        file_id: FileId,
+        expression: &FlowExpression,
+        locals: Vec<(String, TrackedValue)>,
+    ) -> TrackedValue {
         let gaps = self.coverage_gaps.len();
         let query_gaps = self.query_gaps.len();
-        let environment: Environment = self.module_environment(file_id);
+        let mut environment: Environment = self.module_environment(file_id);
+        environment.extend(locals);
         let value = self.eval(expression, &environment, file_id);
         for gap in self.coverage_gaps.drain(gaps..) {
             self.coverage_gap_keys.remove(&gap);
@@ -1150,7 +1163,220 @@ impl Solver<'_> {
         for (gap, _, _, choice) in self.query_gaps.drain(query_gaps..) {
             self.query_gap_keys.remove(&(gap, choice));
         }
-        query_value(&value)
+        value
+    }
+
+    /// For a local array built from literal elements and `push` calls, such as
+    /// `const items = []; if (ready) items.push(Kind.A);`, the values it may contain.
+    fn pushed_elements(
+        &mut self,
+        scope: &UseNode,
+        argument: &FlowExpression,
+    ) -> Option<Vec<QueryValue>> {
+        let FlowExpressionKind::Identifier { name, .. } = &argument.kind else {
+            return None;
+        };
+        let locals = self.scope_locals(scope)?;
+        let (file_id, elements) = {
+            let code = self.scope_code(scope)?;
+            let mut elements = Vec::new();
+            let mut bound = false;
+            let mut reassigned = false;
+            let mut found = |frames: &[Frame<'_>]| {
+                let frame = frames.last().expect("visited frame");
+                match (&frame.role, &frame.expression.kind) {
+                    (
+                        Role::Bind(FlowPattern {
+                            kind: FlowPatternKind::Identifier { name: bound_name },
+                            ..
+                        }),
+                        FlowExpressionKind::Array { elements: initial },
+                    ) if bound_name == name => {
+                        bound = true;
+                        elements.extend(initial.iter().cloned());
+                    }
+                    (Role::Assign(FlowAssignmentTarget::Identifier { name: assigned }), _)
+                        if assigned == name =>
+                    {
+                        reassigned = true;
+                    }
+                    (_, FlowExpressionKind::Call { callee, arguments }) => {
+                        if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
+                            && property == "push"
+                            && matches!(&object.kind, FlowExpressionKind::Identifier { name: pushed, .. } if pushed == name)
+                        {
+                            elements.extend(arguments.iter().cloned());
+                        }
+                    }
+                    _ => {}
+                }
+            };
+            let mut frames = Vec::new();
+            match code.body {
+                ScopeBody::Statements(statements) => {
+                    visit_statements(statements, &mut frames, &mut found);
+                }
+                ScopeBody::Expression(expression) => {
+                    visit(expression, Role::Return, &mut frames, &mut found);
+                }
+            }
+            if !bound || reassigned || elements.is_empty() {
+                return None;
+            }
+            (code.file_id, elements)
+        };
+        let mut values = Vec::new();
+        for element in &elements {
+            let value = if is_context_free(element, &locals)
+                && !matches!(element.kind, FlowExpressionKind::Spread { .. })
+            {
+                self.evaluate_context_free(file_id, element)
+            } else {
+                QueryValue::Unknown {
+                    reason: "element_depends_on_context".to_owned(),
+                }
+            };
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+        Some(values)
+    }
+
+    /// For an argument that reads only the enclosing function's parameters, its value with
+    /// what each caller passes for them, when the caller passes context-free values.
+    fn values_from_callers(
+        &mut self,
+        scope: &UseNode,
+        argument: &FlowExpression,
+        graph: &HashMap<UseNode, Vec<UseEdge>>,
+    ) -> Vec<QueryCallerValue> {
+        let Some(locals) = self.scope_locals(scope) else {
+            return Vec::new();
+        };
+        let mut read = BTreeSet::new();
+        collect_read_names(argument, &mut read);
+        let read = read.intersection(&locals).cloned().collect::<Vec<_>>();
+        if read.is_empty() {
+            return Vec::new();
+        }
+        let (file_id, callee, parameters) = {
+            let Some(code) = self.scope_code(scope) else {
+                return Vec::new();
+            };
+            // Each read name must come straight from a parameter.
+            let mut parameters = Vec::new();
+            for name in &read {
+                let Some(binding) = code.params.iter().enumerate().find_map(|(index, param)| {
+                    pattern_path(param, name).map(|steps| (index, steps))
+                }) else {
+                    return Vec::new();
+                };
+                parameters.push((name.clone(), binding));
+            }
+            (
+                code.file_id,
+                code.name.rsplit('.').next().unwrap_or_default().to_owned(),
+                parameters,
+            )
+        };
+        let callers = graph
+            .get(scope)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .map(|edge| (edge.user.clone(), edge.site.clone()))
+            .take(MAX_CALLERS)
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        for (user, site) in callers {
+            let Some(caller_locals) = self.scope_locals(&user) else {
+                continue;
+            };
+            let Some((caller_file, passed)) =
+                self.passed_values(&user, &site, &callee, &parameters)
+            else {
+                continue;
+            };
+            if !passed
+                .iter()
+                .all(|(_, expression)| is_context_free(expression, &caller_locals))
+            {
+                continue;
+            }
+            let locals = passed
+                .iter()
+                .map(|(name, expression)| {
+                    (
+                        name.clone(),
+                        self.eval_with(caller_file, expression, Vec::new()),
+                    )
+                })
+                .collect();
+            let value = query_value(&self.eval_with(file_id, argument, locals));
+            if value_is_known(&value) {
+                results.push(QueryCallerValue {
+                    caller: self.query_location(&site),
+                    value,
+                });
+            }
+        }
+        results
+    }
+
+    /// At a call or JSX site in a caller, the expression passed for each parameter binding.
+    fn passed_values(
+        &self,
+        user: &UseNode,
+        site: &SourceSpan,
+        callee: &str,
+        parameters: &[(String, (usize, Vec<Step>))],
+    ) -> Option<(FileId, Vec<(String, FlowExpression)>)> {
+        let code = self.scope_code(user)?;
+        let mut at_site = None;
+        let mut found = |frames: &[Frame<'_>]| {
+            let expression = frames.last().expect("visited frame").expression;
+            if at_site.is_none() && expression.span == *site {
+                at_site = Some(expression.clone());
+            }
+        };
+        let mut frames = Vec::new();
+        match code.body {
+            ScopeBody::Statements(statements) => {
+                visit_statements(statements, &mut frames, &mut found);
+            }
+            ScopeBody::Expression(expression) => {
+                visit(expression, Role::Return, &mut frames, &mut found);
+            }
+        }
+        let at_site = at_site?;
+        let mut passed = Vec::new();
+        for (name, (index, steps)) in parameters {
+            let (mut value, rest) = match &at_site.kind {
+                FlowExpressionKind::Call {
+                    callee: target,
+                    arguments,
+                } if callee_text(target).rsplit('.').next() == Some(callee) => {
+                    (arguments.get(*index)?.clone(), &steps[..])
+                }
+                // A component's props are its first parameter, one prop per first step.
+                FlowExpressionKind::JsxElement { props, .. } if *index == 0 => {
+                    let prop = steps.first()?;
+                    let value = props.iter().find_map(|candidate| match candidate {
+                        FlowJsxProp::Property { name, value, .. } if name == prop => {
+                            Some(value.clone())
+                        }
+                        _ => None,
+                    })?;
+                    (value, &steps[1..])
+                }
+                _ => return None,
+            };
+            for step in rest {
+                value = record_field(&value, step)?;
+            }
+            passed.push((name.clone(), value));
+        }
+        Some((code.file_id, passed))
     }
 
     fn summarize_callsite(
@@ -1158,6 +1384,7 @@ impl Solver<'_> {
         candidate: &FactoryCallCandidate,
         query: &QuerySpec,
         walk: Walk,
+        graph: &HashMap<UseNode, Vec<UseEdge>>,
     ) -> QueryCallsiteValues {
         // What exploration found at the callsite, copied out so arguments can be evaluated.
         let mut reachability = Reachability::Unknown;
@@ -1366,6 +1593,29 @@ impl Solver<'_> {
             .candidate_scope(candidate)
             .map(|scope| self.describe_node(&scope));
         let factory_arguments_resolved = factory_arguments.values().flatten().all(value_is_known);
+        // Where an argument is unresolved, what the source still says about it.
+        let mut possible_elements = BTreeMap::new();
+        let mut values_from_callers = BTreeMap::new();
+        if let Some(scope) = self.candidate_scope(candidate) {
+            for projection in &query.factory_arguments {
+                if factory_arguments
+                    .get(&projection.label)
+                    .is_some_and(|values| values.iter().all(value_is_known))
+                {
+                    continue;
+                }
+                let Some(argument) = candidate.arguments.get(projection.index) else {
+                    continue;
+                };
+                if let Some(elements) = self.pushed_elements(&scope, argument) {
+                    possible_elements.insert(projection.label.clone(), elements);
+                }
+                let callers = self.values_from_callers(&scope, argument, graph);
+                if !callers.is_empty() {
+                    values_from_callers.insert(projection.label.clone(), callers);
+                }
+            }
+        }
         QueryCallsiteValues {
             location,
             enclosing,
@@ -1374,6 +1624,8 @@ impl Solver<'_> {
             contexts,
             factory_arguments,
             factory_arguments_resolved,
+            possible_elements,
+            values_from_callers,
             capability: QueryCapabilityUse {
                 status,
                 calls,
@@ -1501,6 +1753,61 @@ fn loaded_module(callback: &FlowExpression) -> Option<(String, String)> {
             }
         }
         _ => None,
+    }
+}
+
+/// The steps from a parameter's value to the binding `name` in its pattern.
+fn pattern_path(pattern: &FlowPattern, name: &str) -> Option<Vec<Step>> {
+    match &pattern.kind {
+        FlowPatternKind::Identifier { name: bound } => (bound == name).then(Vec::new),
+        FlowPatternKind::Default { target, .. } => pattern_path(target, name),
+        FlowPatternKind::Object { fields, .. } => fields.iter().find_map(|field| {
+            pattern_path(&field.target, name).map(|rest| {
+                std::iter::once(field.source_property.clone())
+                    .chain(rest)
+                    .collect()
+            })
+        }),
+        FlowPatternKind::Array { elements } => {
+            elements.iter().enumerate().find_map(|(index, element)| {
+                let element = element.as_ref()?;
+                pattern_path(element, name)
+                    .map(|rest| std::iter::once(format!("[{index}]")).chain(rest).collect())
+            })
+        }
+        FlowPatternKind::Unsupported { .. } => None,
+    }
+}
+
+/// The value written for a property or index in a record or array literal.
+fn record_field(value: &FlowExpression, step: &str) -> Option<FlowExpression> {
+    match &value.kind {
+        FlowExpressionKind::Record { fields } => fields
+            .iter()
+            .rev()
+            .find(|field| !field.spread && field.property == step)
+            .map(|field| field.value.clone()),
+        FlowExpressionKind::Array { elements } => {
+            let index = step
+                .strip_prefix('[')?
+                .strip_suffix(']')?
+                .parse::<usize>()
+                .ok()?;
+            elements.get(index).cloned()
+        }
+        _ => None,
+    }
+}
+
+/// Every name an expression reads.
+fn collect_read_names(expression: &FlowExpression, names: &mut BTreeSet<String>) {
+    if let FlowExpressionKind::Identifier { name, .. } = &expression.kind {
+        names.insert(name.clone());
+    }
+    let mut children = Vec::new();
+    expression_children(expression, &mut children);
+    for child in children {
+        collect_read_names(child, names);
     }
 }
 

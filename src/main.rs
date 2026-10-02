@@ -340,6 +340,18 @@ fn print_callsite_values(report: &QueryReport) {
         for (label, value) in &callsite.factory_arguments {
             println!("    factory {label} = {}", values(value));
         }
+        for (label, elements) in &callsite.possible_elements {
+            println!("    factory {label} may contain {}", values(elements));
+        }
+        for (label, callers) in &callsite.values_from_callers {
+            for caller in callers {
+                println!(
+                    "    factory {label} = {} from the caller at {}",
+                    render_query_value(&caller.value),
+                    place(caller.caller.as_ref())
+                );
+            }
+        }
         println!("    result {:?}", callsite.capability.status);
         for call in &callsite.capability.calls {
             let arguments = call

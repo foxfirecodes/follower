@@ -836,6 +836,71 @@ fn callsite_values_follow_the_result_to_every_call_in_the_source() {
 }
 
 #[test]
+fn unresolved_factory_arguments_report_pushed_elements_and_caller_values() {
+    let pushes = (0..6)
+        .map(|index| format!("if (flags.f{index}) {{ items.push(Kind.K{index}); }}"))
+        .collect::<Vec<_>>()
+        .concat();
+    let members = (0..6)
+        .map(|index| format!("K{index} = {index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let app = format!(
+        "import {{ Kind }} from './kinds'; import {{ flags }} from 'external-flags'; import {{ useItemSelection }} from './hook'; function Many() {{ const items = []; {pushes} const [, apply] = useItemSelection(items); apply('many'); return null; }} function Card({{ kind }}) {{ const [, apply] = useItemSelection([kind]); apply('card'); return null; }} function Cards() {{ return <div><Card kind={{Kind.K1}} /><Card kind={{Kind.K2}} /></div>; }} export function App() {{ return <Many />; }}"
+    );
+    let kinds = format!("export enum Kind {{ {members} }}");
+    let fixture = TestProject::new(&[
+        HOOK,
+        ("src/kinds.ts", kinds.as_str()),
+        ("src/App.tsx", app.as_str()),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let names = |values: &[QueryValue]| {
+        let mut names = Vec::new();
+        for value in values {
+            collect_enum_members(value, &mut names);
+        }
+        names
+    };
+    let by_enclosing = |prefix: &str| {
+        report
+            .callsites
+            .iter()
+            .find(|callsite| {
+                callsite
+                    .enclosing
+                    .as_deref()
+                    .is_some_and(|enclosing| enclosing.starts_with(prefix))
+            })
+            .expect("callsite")
+    };
+    // Six independent pushes exceed the heap alternative budget, but the source still names
+    // every element the array may hold.
+    let many = by_enclosing("Many ");
+    assert!(!many.factory_arguments_resolved);
+    assert_eq!(
+        names(&many.possible_elements["items"]),
+        ["K0", "K1", "K2", "K3", "K4", "K5"]
+    );
+    // No explored path renders the cards, so the value comes from each caller's props.
+    let card = by_enclosing("Card ");
+    assert!(!card.factory_arguments_resolved);
+    let from_callers = card.values_from_callers["items"]
+        .iter()
+        .map(|caller| names(std::slice::from_ref(&caller.value)))
+        .collect::<Vec<_>>();
+    assert_eq!(from_callers, [["K1"], ["K2"]]);
+}
+
+#[test]
 fn all_creations_explores_configured_roots_when_expansion_budget_stops() {
     let mut files = vec![
         (

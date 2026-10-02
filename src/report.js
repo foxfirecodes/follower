@@ -271,7 +271,7 @@
   function renderCallsites() {
     const search = $('#callsite-search').value.trim().toLowerCase();
     const status = $('#callsite-filter').value;
-    const filtered = callsites.filter(item => (status === 'all' || item.capability.status === status) && (!search || [loc(item.location), item.enclosing, item.reachability, ...Object.values(item.factory_arguments).flat().map(valueText), ...item.capability.calls.flatMap(call => [loc(call.location), ...call.context, ...call.via, ...Object.values(call.arguments).flat().map(valueText)]), ...item.capability.escapes.map(escape => escape.detail)].join(' ').toLowerCase().includes(search)));
+    const filtered = callsites.filter(item => (status === 'all' || item.capability.status === status) && (!search || [loc(item.location), item.enclosing, item.reachability, ...Object.values(item.factory_arguments).flat().map(valueText), ...Object.values(item.possible_elements || {}).flat().map(valueText), ...Object.values(item.values_from_callers || {}).flat().map(caller => valueText(caller.value)), ...item.capability.calls.flatMap(call => [loc(call.location), ...call.context, ...call.via, ...Object.values(call.arguments).flat().map(valueText)]), ...item.capability.escapes.map(escape => escape.detail)].join(' ').toLowerCase().includes(search)));
     $('#callsite-count').textContent = `${filtered.length} of ${callsites.length}`;
     const list = $('#callsite-list'); list.replaceChildren();
     if (!filtered.length) { list.append(node('p', 'empty', 'No matching callsites.')); return; }
@@ -283,6 +283,8 @@
       if (item.enclosing) body.append(node('div', 'mini', `In ${item.enclosing}`));
       body.append(node('div', 'mini', `Reachability: ${item.reachability}${item.unreached_reason ? ` (${item.unreached_reason.replaceAll('_', ' ')})` : ''} · ${item.contexts} explored contexts`));
       Object.entries(item.factory_arguments).forEach(([label, values]) => body.append(node('div', 'mini mono', `${label} = ${values.map(valueText).join(' | ')}`)));
+      Object.entries(item.possible_elements || {}).forEach(([label, values]) => body.append(node('div', 'mini mono', `${label} may contain ${values.map(valueText).join(', ')}`)));
+      Object.entries(item.values_from_callers || {}).forEach(([label, callers]) => callers.forEach(caller => body.append(node('div', 'mini mono', `${label} = ${valueText(caller.value)} from ${loc(caller.caller)}`))));
       item.capability.calls.forEach(call => {
         const args = Object.entries(call.arguments).map(([label, values]) => `${label} = ${values.map(valueText).join(' | ')}`).join(', ');
         body.append(node('h3', 'mini', `Call at ${loc(call.location)}${call.explored ? '' : ' · not executed by an explored path'}`));
