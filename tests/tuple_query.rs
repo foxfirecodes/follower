@@ -509,6 +509,43 @@ fn optional_chains_read_and_call_like_their_plain_forms() {
 }
 
 #[test]
+fn callbacks_run_without_known_arguments_do_not_invent_undefined() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/App.tsx",
+            "import { useItemSelection } from './hook'; import { open } from 'external-open'; function Notice() { const [, apply] = useItemSelection(['alpha']); open({ onChoice: (choice) => apply(choice) }); return <button onClick={(event) => apply(event)} />; } export function App() { return <Notice />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        &TUPLE_QUERY.replace(
+            "scope = 'reachable'\n",
+            "scope = 'reachable'\nscan_callback_bodies = true\n",
+        ),
+    );
+    let report = fixture.report();
+    let actions = report
+        .creations
+        .iter()
+        .flat_map(|creation| &creation.invocations)
+        .map(|invocation| invocation.arguments["action"].clone())
+        .collect::<Vec<_>>();
+    // The opaque consumer's argument and the click event are unknown, never a missing argument.
+    assert_eq!(actions.len(), 2, "{actions:?}");
+    assert!(
+        actions
+            .iter()
+            .all(|action| matches!(action, QueryValue::Unknown { .. })),
+        "{actions:?}"
+    );
+}
+
+#[test]
 fn class_property_methods_are_bound_to_instance_props() {
     let (exact, other) = exact_actions(&[(
         "src/App.tsx",

@@ -3299,7 +3299,13 @@ impl<'a> Solver<'a> {
                     return;
                 }
                 self.scanned_callback_values.push(Rc::clone(closure));
-                let returned = self.call_closure(closure, Vec::new());
+                // The consumer's arguments are not known; none of them is a missing argument.
+                let arguments = closure
+                    .params
+                    .iter()
+                    .map(|_| TrackedValue::unknown("scanned_callback_argument"))
+                    .collect();
+                let returned = self.call_closure(closure, arguments);
                 self.scan_callback_bodies(&returned, span, depth + 1);
             }
             AbstractValue::Array(values) | AbstractValue::Union(values) => {
@@ -5211,8 +5217,15 @@ impl<'a> Solver<'a> {
         }
         match &handler.value {
             AbstractValue::Closure(closure) => {
-                // Explore a possible later event call. React ignores its return value.
-                self.call_closure(closure, Vec::new());
+                // Explore a possible later event call, which passes an event. React ignores its
+                // return value.
+                let arguments = closure
+                    .params
+                    .iter()
+                    .take(1)
+                    .map(|_| TrackedValue::unknown("intrinsic_event"))
+                    .collect();
+                self.call_closure(closure, arguments);
             }
             AbstractValue::Capability(capability) => {
                 let call_path = self.trace_at(QueryCallPathKind::Invocation, element_span);
