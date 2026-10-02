@@ -43,9 +43,9 @@ enum Target {
     /// A binding, with the steps from its value to the factory result.
     Name(String, Vec<Step>),
     /// The expression at this span in the scope's file, with the steps from its value to the
-    /// factory result. With a callee name, only a call to that name matches, since a use site
-    /// can also be a call that receives the name as an argument.
-    Site(u32, u32, Option<String>, Vec<Step>),
+    /// factory result. With a callee scope, only a call of that scope matches, since a use site
+    /// can also be a call that receives the function as an argument.
+    Site(u32, u32, Option<UseNode>, Vec<Step>),
 }
 
 /// How an expression is used by the expression or statement that contains it.
@@ -100,6 +100,17 @@ enum Lead<'e> {
         hop: String,
     },
     Callers(Vec<Step>),
+    /// Passed to a call of `root` at `path`, which may be a parameter whose callers pass a
+    /// function.
+    ParameterCall {
+        root: String,
+        path: Vec<Step>,
+        position: usize,
+        steps: Vec<Step>,
+        span: SourceSpan,
+        text: String,
+        context: Vec<String>,
+    },
     Escape {
         span: SourceSpan,
         detail: String,
@@ -166,6 +177,8 @@ struct Walk {
     escapes: Vec<(SourceSpan, String, Vec<String>, Vec<String>)>,
     /// Whether the result was used anywhere after the factory callsite binds it.
     used: bool,
+    /// Files whose importers the walk needs but are not parsed, such as a hook's callers.
+    importer_requests: BTreeSet<std::path::PathBuf>,
 }
 
 /// The parameters and body of a scope the walk can enter.
@@ -560,7 +573,8 @@ impl Solver<'_> {
         let graph = self.use_graph();
         let mut results = Vec::new();
         for candidate in &candidates {
-            let walk = self.walk_capability(candidate, query, &graph);
+            let mut walk = self.walk_capability(candidate, query, &graph);
+            self.importer_requests.append(&mut walk.importer_requests);
             results.push(self.summarize_callsite(candidate, query, walk, &graph));
         }
         results
@@ -638,6 +652,9 @@ impl Solver<'_> {
     /// The scopes a linked declaration runs as: a function with any class methods that share
     /// its props, or a module binding.
     fn declaration_scopes(&self, symbol: &LinkedSymbol) -> Vec<UseNode> {
+        if let Some(target) = self.destructured_namespace_export(symbol) {
+            return self.declaration_scopes(&target);
+        }
         let key = FunctionKey {
             file_id: symbol.file_id,
             name: symbol.name.clone(),
@@ -677,7 +694,17 @@ impl Solver<'_> {
             }
             _ => None,
         })?;
-        let file = self.symbol_linker.file(*file_id)?;
+        self.module_export_scopes(*file_id, &module, &export)
+    }
+
+    /// The scopes of a module's export, for a module specifier written in a file.
+    fn module_export_scopes(
+        &self,
+        file_id: FileId,
+        module: &str,
+        export: &str,
+    ) -> Option<Vec<UseNode>> {
+        let file = self.symbol_linker.file(file_id)?;
         let path = self
             .symbol_linker
             .import_resolutions(&file.path)
@@ -686,7 +713,7 @@ impl Solver<'_> {
         let target = self.symbol_linker.file_at(path)?;
         match self
             .symbol_linker
-            .resolve_exported_value(target.file_id, &export)
+            .resolve_exported_value(target.file_id, export)
         {
             ValueResolution::Resolved(LinkedValue::Declaration(symbol)) => {
                 let scopes = self.declaration_scopes(&symbol);
@@ -696,8 +723,49 @@ impl Solver<'_> {
         }
     }
 
-    /// The scopes a name, or a namespace member, refers to from a file.
-    fn resolve_scopes(&self, file_id: FileId, name: &str, member: Option<&str>) -> Vec<UseNode> {
+    /// For a module binding such as `export const { usePanel } = web` over `import * as web`,
+    /// the declaration it re-exports.
+    pub(super) fn destructured_namespace_export(
+        &self,
+        symbol: &LinkedSymbol,
+    ) -> Option<LinkedSymbol> {
+        let index = *self.global_bindings.get(symbol)?;
+        let (file_id, binding) = self.globals_ir.get(index)?;
+        let FlowExpressionKind::Identifier {
+            name: namespace, ..
+        } = &binding.value.kind
+        else {
+            return None;
+        };
+        let steps = pattern_path(&binding.pattern, &symbol.name)?;
+        let [export] = steps.as_slice() else {
+            return None;
+        };
+        let ValueResolution::Resolved(LinkedValue::Namespace(module)) =
+            self.symbol_linker.resolve_binding(*file_id, namespace)
+        else {
+            return None;
+        };
+        match self.symbol_linker.resolve_exported_value(module, export) {
+            ValueResolution::Resolved(LinkedValue::Declaration(target)) => Some(target),
+            _ => None,
+        }
+    }
+
+    /// The scopes a name, or a namespace member, refers to from a file. A local bound to
+    /// `import('./Panel')` is that module's namespace.
+    fn resolve_scopes(
+        &self,
+        file_id: FileId,
+        imports: &Imports,
+        name: &str,
+        member: Option<&str>,
+    ) -> Vec<UseNode> {
+        if let (Some(module), Some(member)) = (imports.get(name), member) {
+            return self
+                .module_export_scopes(file_id, module, member)
+                .unwrap_or_default();
+        }
         match (self.symbol_linker.resolve_binding(file_id, name), member) {
             (ValueResolution::Resolved(LinkedValue::Declaration(symbol)), None) => {
                 self.declaration_scopes(&symbol)
@@ -719,6 +787,7 @@ impl Solver<'_> {
     fn follow<'e>(
         &self,
         file_id: FileId,
+        imports: &Imports,
         frames: &[Frame<'e>],
         index: usize,
         steps: Vec<Step>,
@@ -728,7 +797,7 @@ impl Solver<'_> {
         match &frame.role {
             Role::Member(key) => match (steps.first(), key) {
                 (Some(first), Some(key)) if first == key => {
-                    self.follow(file_id, frames, index - 1, steps[1..].to_vec())
+                    self.follow(file_id, imports, frames, index - 1, steps[1..].to_vec())
                 }
                 (Some(_), Some(_)) => Lead::Unrelated,
                 _ => Lead::Used,
@@ -765,25 +834,65 @@ impl Solver<'_> {
                     return Lead::Used;
                 }
                 if *position == 0 && returns_first_argument(&text) {
-                    return self.follow(file_id, frames, index - 1, steps);
+                    return self.follow(file_id, imports, frames, index - 1, steps);
+                }
+                if *position == 0 && text.rsplit('.').next() == Some("useRef") {
+                    return self.follow(
+                        file_id,
+                        imports,
+                        frames,
+                        index - 1,
+                        std::iter::once("current".to_owned()).chain(steps).collect(),
+                    );
                 }
                 let scopes = match &callee.kind {
                     FlowExpressionKind::Identifier { name, .. } => {
-                        self.resolve_scopes(file_id, name, None)
+                        self.resolve_scopes(file_id, imports, name, None)
                     }
                     FlowExpressionKind::StaticMember { object, property } => match &object.kind {
                         FlowExpressionKind::Identifier { name, .. } => {
-                            self.resolve_scopes(file_id, name, Some(property))
+                            self.resolve_scopes(file_id, imports, name, Some(property))
                         }
                         _ => Vec::new(),
                     },
                     _ => Vec::new(),
                 };
+                // Props passed next to a module import, as in `open(import('./Sheet'), { onClose })`,
+                // are taken as props of the component the module exports.
+                if scopes.is_empty()
+                    && matches!(frame.expression.kind, FlowExpressionKind::Record { .. })
+                    && let Some(FlowExpressionKind::Call { arguments, .. }) =
+                        parent.map(|parent| &parent.kind)
+                    && let Some((module, export)) = arguments
+                        .iter()
+                        .find_map(|argument| imported_module(argument, imports))
+                    && let Some(scopes) = self.module_export_scopes(file_id, &module, &export)
+                {
+                    return Lead::Enter {
+                        scopes,
+                        parameter: 0,
+                        steps,
+                        hop: format!("props passed with the component {text} loads from {module}"),
+                    };
+                }
                 if scopes.is_empty() {
-                    Lead::Escape {
-                        span: span.clone(),
-                        detail: format!("passed to {text}, which the walk does not follow"),
-                        context: context_of(frames, index),
+                    // A call of a parameter, such as a function child, is followed to what the
+                    // callers pass for it.
+                    match read_path(callee) {
+                        Some((root, path)) => Lead::ParameterCall {
+                            root,
+                            path,
+                            position: *position,
+                            steps,
+                            span: span.clone(),
+                            text,
+                            context: context_of(frames, index),
+                        },
+                        None => Lead::Escape {
+                            span: span.clone(),
+                            detail: format!("passed to {text}, which the walk does not follow"),
+                            context: context_of(frames, index),
+                        },
                     }
                 } else {
                     Lead::Enter {
@@ -818,11 +927,14 @@ impl Solver<'_> {
                         ..
                     } => (Vec::new(), Some(name.clone())),
                     FlowJsxTag::Identifier { name, .. } => {
-                        (self.resolve_scopes(file_id, name, None), None)
+                        (self.resolve_scopes(file_id, imports, name, None), None)
                     }
                     FlowJsxTag::Member {
                         object, property, ..
-                    } => (self.resolve_scopes(file_id, object, Some(property)), None),
+                    } => (
+                        self.resolve_scopes(file_id, imports, object, Some(property)),
+                        None,
+                    ),
                     FlowJsxTag::Unsupported { .. } => (Vec::new(), None),
                 };
                 if intrinsic.is_some() {
@@ -857,20 +969,24 @@ impl Solver<'_> {
             }
             Role::Field(name) => self.follow(
                 file_id,
+                imports,
                 frames,
                 index - 1,
                 std::iter::once((*name).to_owned()).chain(steps).collect(),
             ),
             Role::Element(position) => self.follow(
                 file_id,
+                imports,
                 frames,
                 index - 1,
                 std::iter::once(format!("[{position}]"))
                     .chain(steps)
                     .collect(),
             ),
-            Role::FieldSpread | Role::Through => self.follow(file_id, frames, index - 1, steps),
-            Role::ArrowBody => self.follow_arrow_result(file_id, frames, index - 1, steps),
+            Role::FieldSpread | Role::Through => {
+                self.follow(file_id, imports, frames, index - 1, steps)
+            }
+            Role::ArrowBody => self.follow_arrow_result(file_id, imports, frames, index - 1, steps),
             Role::Return => {
                 let arrow = (0..index).rev().find(|&frame| {
                     matches!(
@@ -879,7 +995,7 @@ impl Solver<'_> {
                     )
                 });
                 match arrow {
-                    Some(arrow) => self.follow_arrow_result(file_id, frames, arrow, steps),
+                    Some(arrow) => self.follow_arrow_result(file_id, imports, frames, arrow, steps),
                     None => Lead::Callers(steps),
                 }
             }
@@ -892,6 +1008,22 @@ impl Solver<'_> {
             Role::Assign(target) => match target {
                 FlowAssignmentTarget::Identifier { name } => {
                     Lead::Same(Target::Name(name.clone(), steps))
+                }
+                // `ref.current = value` and other writes to a local's properties.
+                FlowAssignmentTarget::StaticMember { object, property } => {
+                    match read_path(object) {
+                        Some((root, mut path)) => {
+                            path.push(property.clone());
+                            path.extend(steps);
+                            Lead::Same(Target::Name(root, path))
+                        }
+                        None => Lead::Escape {
+                            span: frame.expression.span.clone(),
+                            detail: "stored in a property, which the walk does not follow"
+                                .to_owned(),
+                            context: context_of(frames, index),
+                        },
+                    }
                 }
                 _ => Lead::Escape {
                     span: frame.expression.span.clone(),
@@ -907,6 +1039,7 @@ impl Solver<'_> {
     fn follow_arrow_result<'e>(
         &self,
         file_id: FileId,
+        imports: &Imports,
         frames: &[Frame<'e>],
         arrow: usize,
         steps: Vec<Step>,
@@ -920,7 +1053,7 @@ impl Solver<'_> {
             (Role::Argument(0), Some(FlowExpressionKind::Call { callee, .. }))
                 if returns_callback_result(&callee_text(callee)) =>
             {
-                self.follow(file_id, frames, arrow - 1, steps)
+                self.follow(file_id, imports, frames, arrow - 1, steps)
             }
             _ => Lead::Used,
         }
@@ -937,6 +1070,7 @@ impl Solver<'_> {
             calls: Vec::new(),
             escapes: Vec::new(),
             used: false,
+            importer_requests: BTreeSet::new(),
         };
         let Some(start) = self.candidate_scope(candidate) else {
             return walk;
@@ -978,6 +1112,7 @@ impl Solver<'_> {
                 .clone();
             let mut leads = Vec::new();
             let file_id = code.file_id;
+            let imports = &local_imports(&code.body);
             let mut found = |frames: &[Frame<'_>]| {
                 let frame = frames.last().expect("visited frame");
                 let expression = frame.expression;
@@ -991,7 +1126,7 @@ impl Solver<'_> {
                             && expression.span.end == *end
                             && callee.as_ref().is_none_or(|callee| {
                                 matches!(kind, FlowExpressionKind::Call { callee: called, .. }
-                                    if callee_text(called).rsplit('.').next() == Some(callee))
+                                    if self.calls_scope(file_id, called, callee))
                             }) =>
                     {
                         steps.clone()
@@ -1004,7 +1139,7 @@ impl Solver<'_> {
                     locals: locals.clone(),
                     parameter: false,
                 };
-                match self.follow(file_id, frames, frames.len() - 1, steps) {
+                match self.follow(file_id, imports, frames, frames.len() - 1, steps) {
                     Lead::Call {
                         call,
                         arguments,
@@ -1062,7 +1197,9 @@ impl Solver<'_> {
                             forwards: forwarded,
                         }));
                         if forwarded && let Some(arrow) = arrow {
-                            let lead = self.follow(file_id, frames, arrow, Vec::new()).into_owned();
+                            let lead = self
+                                .follow(file_id, imports, frames, arrow, Vec::new())
+                                .into_owned();
                             leads.push(Found::Lead(
                                 lead,
                                 Rc::new(Forward {
@@ -1187,7 +1324,7 @@ impl Solver<'_> {
                         if via.len() >= MAX_HOPS {
                             continue;
                         }
-                        let callee = code.name.rsplit('.').next().map(str::to_owned);
+                        let callee = Some(scope.clone());
                         let edges = graph.get(&scope).map_or(&[][..], Vec::as_slice);
                         if edges.is_empty() {
                             walk.escapes.push((
@@ -1199,6 +1336,7 @@ impl Solver<'_> {
                                 Vec::new(),
                                 via.clone(),
                             ));
+                            self.request_importers(&scope, &mut walk);
                         }
                         for edge in edges {
                             let mut next_via = via.clone();
@@ -1221,6 +1359,124 @@ impl Solver<'_> {
                             ));
                         }
                     }
+                    OwnedLead::ParameterCall {
+                        root,
+                        path,
+                        position,
+                        steps,
+                        span,
+                        text,
+                        context,
+                    } => {
+                        walk.used = true;
+                        let binding = code.params.iter().enumerate().find_map(|(index, param)| {
+                            pattern_path(param, &root).map(|inner| (index, inner))
+                        });
+                        let Some((parameter, inner)) = binding else {
+                            walk.escapes.push((
+                                span,
+                                format!("passed to {text}, which the walk does not follow"),
+                                context,
+                                via,
+                            ));
+                            continue;
+                        };
+                        if via.len() >= MAX_HOPS {
+                            continue;
+                        }
+                        let parameter_steps = inner.into_iter().chain(path).collect::<Vec<_>>();
+                        let edges = graph.get(&scope).map_or(&[][..], Vec::as_slice);
+                        if edges.is_empty() {
+                            walk.escapes.push((
+                                span.clone(),
+                                format!(
+                                    "passed to {text}, a parameter of {}, whose callers are not in the parsed files",
+                                    code.name
+                                ),
+                                context.clone(),
+                                via.clone(),
+                            ));
+                            self.request_importers(&scope, &mut walk);
+                        }
+                        for edge in edges {
+                            let Some((caller_file, passed)) = self.passed_values(
+                                &edge.user,
+                                &edge.site,
+                                &scope,
+                                &[(root.clone(), (parameter, parameter_steps.clone()))],
+                            ) else {
+                                continue;
+                            };
+                            let Some((_, function)) = passed.into_iter().next() else {
+                                continue;
+                            };
+                            let caller = self
+                                .scope_code(&edge.user)
+                                .map_or_else(String::new, |user| user.name);
+                            let mut next_via = via.clone();
+                            next_via.push(format!("{text} given by {caller}"));
+                            let mut targets = Vec::new();
+                            match &function.kind {
+                                // A function written at the call, such as a function child.
+                                FlowExpressionKind::Arrow { params, .. } => {
+                                    if let Some(param) = params.get(position) {
+                                        bind_targets(param, &steps, &mut targets);
+                                    }
+                                    for target in targets {
+                                        queue.push_back((
+                                            edge.user.clone(),
+                                            target,
+                                            next_via.clone(),
+                                            forward.clone(),
+                                        ));
+                                    }
+                                }
+                                FlowExpressionKind::Identifier { name, .. } => {
+                                    let scopes =
+                                        self.resolve_scopes(caller_file, &Imports::new(), name, None);
+                                    let local = self.local_function_params(&edge.user, name);
+                                    for next in scopes {
+                                        let Some(code) = self.scope_code(&next) else {
+                                            continue;
+                                        };
+                                        let mut targets = Vec::new();
+                                        if let Some(param) = code.params.get(position) {
+                                            bind_targets(param, &steps, &mut targets);
+                                        }
+                                        for target in targets {
+                                            queue.push_back((
+                                                next.clone(),
+                                                target,
+                                                next_via.clone(),
+                                                forward.clone(),
+                                            ));
+                                        }
+                                    }
+                                    if let Some(params) = local
+                                        && let Some(param) = params.get(position)
+                                    {
+                                        bind_targets(param, &steps, &mut targets);
+                                        for target in targets {
+                                            queue.push_back((
+                                                edge.user.clone(),
+                                                target,
+                                                next_via.clone(),
+                                                forward.clone(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                _ => walk.escapes.push((
+                                    function.span.clone(),
+                                    format!(
+                                        "passed to {text}, which {caller} gives a value the walk does not follow"
+                                    ),
+                                    Vec::new(),
+                                    via.clone(),
+                                )),
+                            }
+                        }
+                    }
                     OwnedLead::Escape {
                         span,
                         detail,
@@ -1235,6 +1491,76 @@ impl Solver<'_> {
             }
         }
         walk
+    }
+
+    /// The parameters of a function bound to a local name in a scope, such as a handler
+    /// declared in a component.
+    fn local_function_params(&self, scope: &UseNode, name: &str) -> Option<Vec<FlowPattern>> {
+        let code = self.scope_code(scope)?;
+        let mut params = None;
+        let mut found = |frames: &[Frame<'_>]| {
+            let frame = frames.last().expect("visited frame");
+            if params.is_none()
+                && let Role::Bind(pattern) = &frame.role
+                && matches!(&pattern.kind, FlowPatternKind::Identifier { name: bound } if bound == name)
+            {
+                // A function bound directly or through `useCallback`.
+                let function = match &frame.expression.kind {
+                    FlowExpressionKind::Call { callee, arguments }
+                        if returns_first_argument(&callee_text(callee)) =>
+                    {
+                        arguments.first()
+                    }
+                    _ => Some(frame.expression),
+                };
+                if let Some(FlowExpression {
+                    kind: FlowExpressionKind::Arrow { params: arrow, .. },
+                    ..
+                }) = function
+                {
+                    params = Some(arrow.clone());
+                }
+            }
+        };
+        let mut frames = Vec::new();
+        match code.body {
+            ScopeBody::Statements(statements) => {
+                visit_statements(statements, &mut frames, &mut found);
+            }
+            ScopeBody::Expression(expression) => {
+                visit(expression, Role::Return, &mut frames, &mut found);
+            }
+        }
+        params
+    }
+
+    /// Whether a call's callee is a scope, through any import alias, as for a default import
+    /// named differently from the function.
+    fn calls_scope(&self, file_id: FileId, callee: &FlowExpression, scope: &UseNode) -> bool {
+        let scopes = match &callee.kind {
+            FlowExpressionKind::Identifier { name, .. } => {
+                self.resolve_scopes(file_id, &Imports::new(), name, None)
+            }
+            FlowExpressionKind::StaticMember { object, property } => match &object.kind {
+                FlowExpressionKind::Identifier { name, .. } => {
+                    self.resolve_scopes(file_id, &Imports::new(), name, Some(property))
+                }
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        scopes.contains(scope)
+    }
+
+    /// Asks the next pass to parse the files that import a scope's file.
+    fn request_importers(&self, scope: &UseNode, walk: &mut Walk) {
+        let file_id = match scope {
+            UseNode::Function(key) => key.file_id,
+            UseNode::Global(index) => self.globals_ir[*index].0,
+        };
+        if let Some(file) = self.symbol_linker.file(file_id) {
+            walk.importer_requests.insert(file.path.clone());
+        }
     }
 
     fn scope_span(&self, scope: &UseNode) -> SourceSpan {
@@ -1398,11 +1724,7 @@ impl Solver<'_> {
                 };
                 parameters.push((name.clone(), binding));
             }
-            (
-                code.file_id,
-                code.name.rsplit('.').next().unwrap_or_default().to_owned(),
-                parameters,
-            )
+            (code.file_id, scope.clone(), parameters)
         };
         let callers = graph
             .get(scope)
@@ -1452,7 +1774,7 @@ impl Solver<'_> {
         &self,
         user: &UseNode,
         site: &SourceSpan,
-        callee: &str,
+        callee: &UseNode,
         parameters: &[(String, (usize, Vec<Step>))],
     ) -> Option<(FileId, Vec<(String, FlowExpression)>)> {
         let code = self.scope_code(user)?;
@@ -1479,7 +1801,7 @@ impl Solver<'_> {
                 FlowExpressionKind::Call {
                     callee: target,
                     arguments,
-                } if callee_text(target).rsplit('.').next() == Some(callee) => {
+                } if self.calls_scope(code.file_id, target, callee) => {
                     (arguments.get(*index)?.clone(), &steps[..])
                 }
                 // A component's props are its first parameter, one prop per first step.
@@ -1819,6 +2141,15 @@ enum OwnedLead {
         hop: String,
     },
     Callers(Vec<Step>),
+    ParameterCall {
+        root: String,
+        path: Vec<Step>,
+        position: usize,
+        steps: Vec<Step>,
+        span: SourceSpan,
+        text: String,
+        context: Vec<String>,
+    },
     Escape {
         span: SourceSpan,
         detail: String,
@@ -1844,6 +2175,23 @@ impl Lead<'_> {
                 hop,
             },
             Lead::Callers(steps) => OwnedLead::Callers(steps),
+            Lead::ParameterCall {
+                root,
+                path,
+                position,
+                steps,
+                span,
+                text,
+                context,
+            } => OwnedLead::ParameterCall {
+                root,
+                path,
+                position,
+                steps,
+                span,
+                text,
+                context,
+            },
             Lead::Escape {
                 span,
                 detail,
@@ -2035,6 +2383,58 @@ fn collect_array_elements(value: &QueryValue, elements: &mut Vec<QueryValue>) {
         }
         QueryValue::Unknown { .. } => add(value),
         _ => {}
+    }
+}
+
+/// Local names bound to a module namespace, as in `const module = await import('./Panel')`.
+type Imports = HashMap<String, String>;
+
+fn local_imports(body: &ScopeBody<'_>) -> Imports {
+    let mut imports = Imports::new();
+    let mut found = |frames: &[Frame<'_>]| {
+        let frame = frames.last().expect("visited frame");
+        if let (Role::Bind(pattern), FlowExpressionKind::DynamicImport { module }) =
+            (&frame.role, &frame.expression.kind)
+            && let FlowPatternKind::Identifier { name } = &pattern.kind
+        {
+            imports.insert(name.clone(), module.clone());
+        }
+    };
+    let mut frames = Vec::new();
+    match body {
+        ScopeBody::Statements(statements) => visit_statements(statements, &mut frames, &mut found),
+        ScopeBody::Expression(expression) => {
+            visit(expression, Role::Return, &mut frames, &mut found);
+        }
+    }
+    imports
+}
+
+/// The module and export an argument loads: `import('./Panel')`, a local bound to one, or a
+/// loader such as `() => import('./Panel')`.
+fn imported_module(argument: &FlowExpression, imports: &Imports) -> Option<(String, String)> {
+    match &argument.kind {
+        FlowExpressionKind::DynamicImport { module } => {
+            Some((module.clone(), "default".to_owned()))
+        }
+        FlowExpressionKind::Identifier { name, .. } => imports
+            .get(name)
+            .map(|module| (module.clone(), "default".to_owned())),
+        FlowExpressionKind::Arrow { .. } => loaded_module(argument),
+        _ => None,
+    }
+}
+
+/// A name and the properties read from it, as in `props.children` or `ref.current`.
+fn read_path(expression: &FlowExpression) -> Option<(String, Vec<Step>)> {
+    match &expression.kind {
+        FlowExpressionKind::Identifier { name, .. } => Some((name.clone(), Vec::new())),
+        FlowExpressionKind::StaticMember { object, property } => {
+            let (root, mut path) = read_path(object)?;
+            path.push(property.clone());
+            Some((root, path))
+        }
+        _ => None,
     }
 }
 

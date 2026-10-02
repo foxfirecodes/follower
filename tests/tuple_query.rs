@@ -937,6 +937,86 @@ fn set_and_array_membership_decide_filters_with_unknown_conditions() {
 }
 
 #[test]
+fn callsite_walk_follows_function_children_refs_loaders_and_aliases() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/Selected.tsx",
+            "import { useItemSelection } from './hook'; export default function Selected({ children }) { const [visible, apply] = useItemSelection(['selected']); return <>{children({ visible, apply })}</>; }",
+        ),
+        (
+            "src/Sheet.tsx",
+            "export default function Sheet({ onDone }) { return <button onClick={() => onDone('sheet')} />; }",
+        ),
+        (
+            "src/Modal.tsx",
+            "export default function Modal({ onClose }) { return <button onClick={() => onClose('modal')} />; }",
+        ),
+        (
+            "src/platform.web.tsx",
+            "import { useItemSelection } from './hook'; export function usePlatform() { return useItemSelection(['platform']); }",
+        ),
+        (
+            "src/platform.tsx",
+            "import * as web from './platform.web'; export const { usePlatform } = web;",
+        ),
+        (
+            "src/shared.tsx",
+            "import { useItemSelection } from './hook'; export default function useShared({ open }) { const [, apply] = useItemSelection(['shared']); open({ onClose: (kind) => apply(kind) }); }",
+        ),
+        (
+            "src/App.tsx",
+            "import * as React from 'react'; import Selected from './Selected'; import { usePlatform } from './platform'; import useSharedBase from './shared'; import { openSheet, openModal } from 'external-open'; import { useItemSelection } from './hook'; function Child() { return <Selected>{({ apply }) => <button onClick={() => apply('child')} />}</Selected>; } function Platform() { const [, apply] = usePlatform(); apply('platform_call'); return null; } function Refs() { const [, apply] = useItemSelection(['refs']); const ref = React.useRef(apply); React.useEffect(() => { ref.current = apply; }); return <button onClick={() => ref.current('ref')} />; } function Lazy() { const [, apply] = useItemSelection(['lazy']); openModal(async () => { const mod = await import('./Modal'); return () => <mod.default onClose={apply} />; }); openSheet(import('./Sheet'), 'key', { onDone: apply }); return null; } function Shared() { const open = React.useCallback(({ onClose }) => onClose('shared_call'), []); useSharedBase({ open }); return null; } export function App() { return <div><Child /><Platform /><Refs /><Lazy /><Shared /></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let actions = |items: &str| {
+        let callsite = report
+            .callsites
+            .iter()
+            .find(|callsite| {
+                callsite.factory_arguments["items"]
+                    == [QueryValue::Array {
+                        elements: vec![QueryValue::String {
+                            value: items.to_owned(),
+                        }],
+                    }]
+            })
+            .unwrap_or_else(|| panic!("callsite for {items}"));
+        let mut actions = callsite
+            .capability
+            .calls
+            .iter()
+            .flat_map(|call| &call.arguments["action"])
+            .map(|value| match value {
+                QueryValue::String { value } => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        actions.sort();
+        actions
+    };
+    // A call of the `children` parameter is followed into the function child its caller writes.
+    assert_eq!(actions("selected"), ["child"]);
+    // `export const { usePlatform } = web` re-exports the declaration in `platform.web`.
+    assert_eq!(actions("platform"), ["platform_call"]);
+    assert_eq!(actions("refs"), ["ref"]);
+    // `await import()` names a module, and props passed next to an import are its component's.
+    assert_eq!(actions("lazy"), ["modal", "sheet"]);
+    // A default import under another name still matches its callers, and an injected function
+    // bound through `useCallback` is followed.
+    assert_eq!(actions("shared"), ["shared_call"]);
+}
+
+#[test]
 fn calls_of_a_wrapper_that_forwards_its_parameter_give_the_argument() {
     let fixture = TestProject::new(&[
         HOOK,

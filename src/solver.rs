@@ -584,6 +584,9 @@ pub struct QueryPass {
     pub root_requested_imports: Vec<std::path::PathBuf>,
     pub producer_paths: BTreeSet<std::path::PathBuf>,
     pub reachable_seed_callsites: Vec<SourceSpan>,
+    /// Files whose importers the callsite walk needs, such as a hook whose callers are not
+    /// parsed.
+    pub importer_requests: BTreeSet<std::path::PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -732,6 +735,7 @@ pub fn execute_query(
     };
     let phase_start = Instant::now();
     solver.callsite_values = solver.callsite_values(query);
+    let importer_requests = std::mem::take(&mut solver.importer_requests);
     if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
         eprintln!(
             "query callsite values: {} ms",
@@ -752,6 +756,7 @@ pub fn execute_query(
         root_requested_imports,
         producer_paths,
         reachable_seed_callsites,
+        importer_requests,
     })
 }
 
@@ -815,6 +820,8 @@ struct Solver<'a> {
     unreached_callsites: Vec<QueryUnreachedCallsite>,
     /// Each factory callsite's values and the calls made with its result.
     callsite_values: Vec<QueryCallsiteValues>,
+    /// Files whose importers the callsite walk needs.
+    importer_requests: BTreeSet<std::path::PathBuf>,
     /// Calls of each function in progress.
     active_functions: std::collections::HashMap<FunctionKey, usize>,
     /// Closures carrying a factory result, in creation order, until the render that created
@@ -977,6 +984,7 @@ impl<'a> Solver<'a> {
             exact_renders: std::collections::HashMap::new(),
             unreached_callsites: Vec::new(),
             callsite_values: Vec::new(),
+            importer_requests: BTreeSet::new(),
             active_functions: std::collections::HashMap::new(),
             pending_callbacks: Vec::new(),
             uncalled_runs: std::collections::HashSet::new(),
@@ -4360,6 +4368,9 @@ impl<'a> Solver<'a> {
     fn use_graph(&self) -> std::collections::HashMap<UseNode, Vec<UseEdge>> {
         let mut graph = std::collections::HashMap::<UseNode, Vec<UseEdge>>::new();
         let node_for = |symbol: &LinkedSymbol| {
+            // A name destructured from a namespace re-exports that module's declaration.
+            let target = self.destructured_namespace_export(symbol);
+            let symbol = target.as_ref().unwrap_or(symbol);
             let key = FunctionKey {
                 file_id: symbol.file_id,
                 name: symbol.name.clone(),

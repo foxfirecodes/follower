@@ -377,13 +377,22 @@ callsite no context explored reports the arguments it writes when they do not de
 values. `reachability` is the strongest tier among its creations, `unknown` with an
 `unreached_reason` when no path reached it. `capability` describes what became of the selected
 result. The walk follows it through the source from the factory call: through destructuring and
-aliases, `useCallback` and `useMemo`, record and array fields, JSX props into function and class
-components (including components loaded by `lazy(() => import(...))` or a loader whose record
-argument returns `import(...)`), arguments to project functions, and `return` to each caller of
-a hook. Each call made with the result is in `calls`, with the functions it sits in (`context`,
-such as `the onClose prop of <Panel>`), how the result reached it (`via`, such as `prop onClose of
-<Panel>` or `returned by useNotice to Banner`), and the values of each projected invocation
-argument. An argument that reads no local values, such as an enum member or a literal, is
+aliases, `useCallback`, `useMemo`, and `useRef` (whose `current` holds its argument), property
+writes such as `ref.current = value`, record and array fields, JSX props into function and class
+components (including components loaded by `lazy(() => import(...))`, a loader whose record
+argument returns `import(...)`, or a local bound to `await import(...)`, as in `<module.default />`),
+arguments to project functions, and `return` to each caller of a hook. A call of a parameter, such
+as `children({ apply })` or an injected `open({ onClose })`, is followed into the function each
+caller passes for it, written at the call or bound to a name, including through `useCallback`.
+Props passed next to a module import, as in `openSheet(import('./Sheet'), { onClose })`, are taken
+as props of the component the module exports; the path step names the call and module, since this
+is inferred from the call's shape. Callers match through any import name, and a name destructured
+from a namespace, as in `export const { useNotice } = web` over `import * as web`, is the
+declaration it re-exports. When a hook's or parameter's callers are not parsed, the walk asks the
+next round to parse the files that import it, within the root phase's file budget. Each call
+made with the result is in `calls`, with the functions it sits in (`context`, such as `the
+onClose prop of <Panel>`), how the result reached it (`via`, such as `prop onClose of <Panel>` or
+`returned by useNotice to Banner`), and the values of each projected invocation argument. An argument that reads no local values, such as an enum member or a literal, is
 evaluated from module bindings, so it is known even if no explored path executed the call;
 otherwise the values come from explored invocations at the same call, or are unknown with the
 reason, such as a parameter of the enclosing function. `explored` says whether an explored path

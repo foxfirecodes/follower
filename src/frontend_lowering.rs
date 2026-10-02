@@ -1078,6 +1078,11 @@ impl Lowerer<'_> {
             Expression::TSNonNullExpression(assertion) => {
                 return self.lower_expression(&assertion.expression);
             }
+            // The awaited value is what the expression gives, such as the module namespace of
+            // `await import('./Panel')` or the result of a project async function.
+            Expression::AwaitExpression(awaited) => {
+                return self.lower_expression(&awaited.argument);
+            }
             _ => FlowExpressionKind::Unsupported {
                 syntax: "unsupported_expression".to_owned(),
                 references: referenced_names(expression),

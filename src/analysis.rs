@@ -277,12 +277,28 @@ impl SourceCatalog {
         linker: &ModuleLinker,
         targets: &BTreeSet<PathBuf>,
     ) -> BTreeSet<PathBuf> {
+        self.importers(linker, targets, false)
+    }
+
+    /// Importers of the given files. Importers are indexed by their specifier's stem, and
+    /// `./Panel.web` has the stem `Panel`, so with `dotted` a file such as `Panel.web.tsx` is
+    /// also looked up by its first part. Discovery keeps the narrower lookup: the files it adds
+    /// decide what the root phase's file budget reaches first.
+    fn importers(
+        &self,
+        linker: &ModuleLinker,
+        targets: &BTreeSet<PathBuf>,
+        dotted: bool,
+    ) -> BTreeSet<PathBuf> {
         let names = targets
             .iter()
             .flat_map(|path| {
                 let mut names = Vec::new();
                 if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
                     names.push(stem.to_owned());
+                    if dotted && let Some((first, _)) = stem.split_once('.') {
+                        names.push(first.to_owned());
+                    }
                     if stem == "index" {
                         if let Some(parent) = path
                             .parent()
@@ -974,6 +990,7 @@ impl Analyzer {
                 root_requested_imports,
                 producer_paths: producers,
                 reachable_seed_callsites,
+                importer_requests,
             } = crate::solver::execute_query(
                 &self.project,
                 &snapshot,
@@ -995,10 +1012,16 @@ impl Analyzer {
                     reverse_seed_paths.len()
                 );
             }
+            // Importers the callsite walk needs, such as the callers of a hook that returns the
+            // factory result, are parsed like root requests.
+            let walk_requests = catalog.importers(&linker, &importer_requests, true);
             if let Some(phase) = &mut root_phase {
                 // Follow only what root paths read, plus components on the entry corridor.
                 let mut additions = Vec::new();
-                for path in &root_requested_imports {
+                for path in root_requested_imports.iter().chain(&walk_requests) {
+                    if additions.contains(path) {
+                        continue;
+                    }
                     if snapshot.files.iter().any(|file| &file.path == path) {
                         continue;
                     }
@@ -1045,6 +1068,9 @@ impl Analyzer {
             let mut additions = Vec::new();
             for path in requests
                 .union(&reverse_requests)
+                .chain(&walk_requests)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .filter(|path| !indexed.contains(*path))
             {
                 if is_expandable_source(path) {
