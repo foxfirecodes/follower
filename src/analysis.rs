@@ -699,9 +699,14 @@ impl Analyzer {
                     if !visited.insert((file_id, symbol.clone())) {
                         continue;
                     }
-                    if visited.len() > 20_000 || depth > 32 {
+                    if visited.len() > 20_000 {
                         result.limit_hit = true;
                         break;
+                    }
+                    // A branch past the depth limit stops; the others still run.
+                    if depth > 32 {
+                        result.limit_hit = true;
+                        continue;
                     }
                     let Some(file) = snapshot.files.iter().find(|file| file.file_id == file_id)
                     else {
@@ -1555,8 +1560,95 @@ fn inventory_location(root: &Path, path: &Path, source: &str, span: &SourceSpan)
 mod tests {
     use std::fs;
 
+    use std::collections::BTreeSet;
+
     use super::Analyzer;
-    use crate::{link::ModuleLinker, project::Project, query::load_query};
+    use crate::{
+        ids::FileId, ir::SourceSpan, link::ModuleLinker, project::Project, query::load_query,
+    };
+
+    fn write_fixture(name: &str, files: &[(&str, String)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        for (path, source) in files {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().expect("parent")).expect("create fixture");
+            fs::write(path, source).expect("write fixture");
+        }
+        root
+    }
+
+    #[test]
+    fn backward_use_walk_continues_past_a_branch_over_the_depth_limit() {
+        // `Leaf` is used by `Middle`, which the entry renders, and by the first of a chain of
+        // local components in the entry file. The walk visits the entry file first, so the
+        // chain passes the depth limit before `Middle` is looked at.
+        let chain = (1..=40)
+            .map(|level| format!("function D{level}() {{ return <D{} />; }}", level - 1))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let root = write_fixture(
+            "flow-backward-depth",
+            &[
+                (
+                    "flow.toml",
+                    "schema_version = 1\nname = 'sample'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n".to_owned(),
+                ),
+                (
+                    "query.toml",
+                    "schema_version = 1\nid = 'sample'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'sample'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n".to_owned(),
+                ),
+                (
+                    "src/hook.ts",
+                    "export function useItemSelection(_items: string[]) { return [null, () => {}]; }".to_owned(),
+                ),
+                (
+                    "src/Leaf.tsx",
+                    "import { useItemSelection } from './hook'; export function Leaf() { useItemSelection(['a']); return null; }".to_owned(),
+                ),
+                (
+                    "src/Middle.tsx",
+                    "import { Leaf } from './Leaf'; export function Middle() { return <Leaf />; }".to_owned(),
+                ),
+                (
+                    "src/App.tsx",
+                    format!("import {{ Middle }} from './Middle'; import {{ Leaf }} from './Leaf'; function D0() {{ return <Leaf />; }} {chain} export function App() {{ return <Middle />; }}"),
+                ),
+            ],
+        );
+        let analyzer = Analyzer::new(Project::load(root.join("flow.toml")).expect("load project"));
+        let (query, _) = load_query(&root.join("query.toml")).expect("load query");
+        let linker = ModuleLinker::new(analyzer.project());
+        let (mut snapshot, catalog) = analyzer
+            .index_with_catalog(&linker, &query)
+            .expect("index with catalog");
+        let leaf = snapshot
+            .files
+            .iter()
+            .find(|file| file.path.ends_with("Leaf.tsx"))
+            .expect("leaf parsed");
+        let source = fs::read_to_string(&leaf.path).expect("read leaf");
+        let start =
+            u32::try_from(source.find("useItemSelection([").expect("call")).expect("offset");
+        let callsite = SourceSpan {
+            file_id: FileId(leaf.file_id.0),
+            start,
+            end: start + 1,
+        };
+        let seeds = BTreeSet::from([leaf.path.clone()]);
+        let (corridor, _) = catalog.entry_corridor(analyzer.project(), &linker, &seeds);
+        let walk = analyzer.walk_backward_uses(
+            &linker,
+            &mut snapshot,
+            &catalog,
+            &corridor,
+            &[callsite],
+            256,
+        );
+        fs::remove_dir_all(&root).expect("remove fixture");
+
+        assert!(walk.reached_entry);
+        assert!(walk.limit_hit);
+    }
 
     #[test]
     fn single_read_pass_indexes_the_same_sources_as_index() {
