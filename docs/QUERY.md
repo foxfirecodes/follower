@@ -293,7 +293,8 @@ comes from a parameter, as in `open(props.importer(), props)`, the walk takes wh
 call it entered the function through passes for it, so each caller's component gets only its
 caller's path. The walk follows a render function's JSX in the source without a contract, since the
 JSX is written where the result is. A lazy factory contract recognizes a callback
-returning a literal `import()` and links its default export. These contracts describe possible
+returning a literal `import()`, written inline or declared in the file under the name the property
+holds (`load: importPanel`), and links its default export. These contracts describe possible
 paths, not guaranteed
 route matches, authorization, loading, or runtime rendering. Exploration takes an awaited value
 as the value itself, so `import('./Panel')` gives the module's namespace when the module is parsed

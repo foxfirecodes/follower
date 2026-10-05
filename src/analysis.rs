@@ -845,7 +845,8 @@ impl Analyzer {
                             else {
                                 continue;
                             };
-                            let Some(module) = lazy_component_import(&binding.value, property)
+                            let Some(module) =
+                                lazy_component_import(&importer.flow, &binding.value, property)
                             else {
                                 continue;
                             };

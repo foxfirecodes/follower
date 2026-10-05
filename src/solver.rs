@@ -2525,11 +2525,12 @@ impl<'a> Solver<'a> {
                     component.evidence = Some(evidence);
                     return component;
                 }
-                if let Some(property) = self.symbol_linker.file(file_id).and_then(|file| {
-                    self.project
+                if let Some(file) = self.symbol_linker.file(file_id)
+                    && let Some(property) = self
+                        .project
                         .config
                         .lazy_factory_property(&file.flow, callee)
-                }) && let Some(module) = lazy_component_import(expression, property)
+                    && let Some(module) = lazy_component_import(&file.flow, expression, property)
                 {
                     return self
                         .module_export_value(file_id, module, "default", &expression.span)

@@ -344,10 +344,12 @@ pub enum FlowArrowBody {
     Statements { statements: Vec<FlowStatement> },
 }
 
-/// Recognize a configured lazy factory only when one record property contains
-/// an arrow returning a literal dynamic import. The caller checks the factory
-/// symbol before using this result.
+/// Recognize a configured lazy factory only when one record property holds a loader returning
+/// a literal dynamic import: an arrow, or a function or arrow the file declares under that name,
+/// as `load: importPanel`. The caller checks the factory symbol before using this
+/// result.
 pub fn lazy_component_import<'a>(
+    file: &'a FlowFileIr,
     expression: &'a FlowExpression,
     promise_property: &str,
 ) -> Option<&'a str> {
@@ -361,25 +363,51 @@ pub fn lazy_component_import<'a>(
         .iter()
         .find(|field| !field.spread && field.property == promise_property)?
         .value;
-    let FlowExpressionKind::Arrow { body, .. } = &callback.kind else {
+    let statements = match &callback.kind {
+        FlowExpressionKind::Arrow { body, .. } => match body {
+            FlowArrowBody::Expression { expression } => return imported_module(expression),
+            FlowArrowBody::Statements { statements } => statements,
+        },
+        FlowExpressionKind::Identifier { name, .. } => {
+            if let Some(function) = file
+                .functions
+                .iter()
+                .find(|function| &function.name == name)
+            {
+                &function.body
+            } else {
+                let binding = file.globals.iter().find(|binding| {
+                    matches!(&binding.pattern.kind, FlowPatternKind::Identifier { name: bound } if bound == name)
+                })?;
+                match &binding.value.kind {
+                    FlowExpressionKind::Arrow {
+                        body: FlowArrowBody::Expression { expression },
+                        ..
+                    } => return imported_module(expression),
+                    FlowExpressionKind::Arrow {
+                        body: FlowArrowBody::Statements { statements },
+                        ..
+                    } => statements,
+                    _ => return None,
+                }
+            }
+        }
+        _ => return None,
+    };
+    let [
+        FlowStatement::Return {
+            value: Some(expression),
+            ..
+        },
+    ] = statements.as_slice()
+    else {
         return None;
     };
-    let imported = match body {
-        FlowArrowBody::Expression { expression } => expression.as_ref(),
-        FlowArrowBody::Statements { statements } => {
-            let [
-                FlowStatement::Return {
-                    value: Some(expression),
-                    ..
-                },
-            ] = statements.as_slice()
-            else {
-                return None;
-            };
-            expression
-        }
-    };
-    match &imported.kind {
+    imported_module(expression)
+}
+
+fn imported_module(expression: &FlowExpression) -> Option<&str> {
+    match &expression.kind {
         FlowExpressionKind::DynamicImport { module } => Some(module),
         _ => None,
     }

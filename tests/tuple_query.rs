@@ -1327,6 +1327,56 @@ fn exploration_renders_what_render_function_openers_load() {
 }
 
 #[test]
+fn lazy_factories_follow_loaders_declared_by_name() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/Panel.tsx",
+            "export default function Panel({ onDone }) { return <button onClick={() => onDone('panel')} />; }",
+        ),
+        (
+            "src/Card.tsx",
+            "export default function Card({ onDone }) { return <button onClick={() => onDone('card')} />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { deferComponent } from 'external-lazy'; import { useItemSelection } from './hook'; function importPanel() { return import('./Panel'); } const loadCard = () => import('./Card'); const LazyPanel = deferComponent({ load: importPanel }); const LazyCard = deferComponent({ load: loadCard }); function Shown() { const [, apply] = useItemSelection(['shown']); return <div><LazyPanel onDone={apply} /><LazyCard onDone={apply} /></div>; } export function App() { return <Shown />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n[[lazy_component_factories]]\nmodule = 'external-lazy'\nexport = 'deferComponent'\npromise_property = 'load'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    let mut actions = callsite
+        .capability
+        .calls
+        .iter()
+        .map(|call| (format!("{:?}", call.arguments["action"]), call.explored))
+        .collect::<Vec<_>>();
+    actions.sort();
+    // A loader declared as a function or bound to a name is followed like one written inline,
+    // by the walk and by exploration.
+    assert_eq!(
+        actions,
+        [
+            ("[String { value: \"card\" }]".to_owned(), true),
+            ("[String { value: \"panel\" }]".to_owned(), true)
+        ],
+        "{:?}",
+        callsite.capability.escapes
+    );
+    assert!(callsite.capability.escapes.is_empty());
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,

@@ -942,21 +942,35 @@ impl Solver<'_> {
         value
     }
 
-    /// For a module binding built by a loader, such as `lazy(() => import('./Panel'))` or
-    /// `load({ promise: () => import('./Panel') })`, the scopes of the component it loads.
+    /// For a module binding built by a loader, such as `lazy(() => import('./Panel'))`,
+    /// `load({ promise: () => import('./Panel') })`, or `load({ promise: importPanel })` with
+    /// `importPanel` declared to return an import, the scopes of the component it loads.
     fn lazy_scopes(&self, index: usize) -> Option<Vec<UseNode>> {
         let (file_id, binding) = self.globals_ir.get(index)?;
         let FlowExpressionKind::Call { arguments, .. } = &binding.value.kind else {
             return None;
         };
-        let (module, export) = arguments.iter().find_map(|argument| match &argument.kind {
-            FlowExpressionKind::Arrow { .. } => loaded_module(argument),
-            FlowExpressionKind::Record { fields } => {
-                fields.iter().find_map(|field| loaded_module(&field.value))
+        let loader = |value: &FlowExpression| match &value.kind {
+            FlowExpressionKind::Arrow { .. } => loaded_module(value)
+                .and_then(|(module, export)| self.module_export_scopes(*file_id, &module, &export)),
+            FlowExpressionKind::Identifier { .. } => {
+                let scopes = self.component_scopes(
+                    *file_id,
+                    &Imports::new(),
+                    value,
+                    true,
+                    &mut BTreeSet::new(),
+                );
+                (!scopes.is_empty()).then_some(scopes)
             }
             _ => None,
-        })?;
-        self.module_export_scopes(*file_id, &module, &export)
+        };
+        arguments.iter().find_map(|argument| match &argument.kind {
+            FlowExpressionKind::Record { fields } => {
+                fields.iter().find_map(|field| loader(&field.value))
+            }
+            _ => loader(argument),
+        })
     }
 
     /// The scopes of a module's export, for a module specifier written in a file.
