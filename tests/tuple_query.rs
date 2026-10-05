@@ -1828,6 +1828,192 @@ fn callsite_walk_ignores_set_state_follows_chosen_components_and_nested_wrappers
 }
 
 #[test]
+fn callsite_walk_links_state_written_in_one_place_to_where_it_is_read() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/store.ts",
+            "import { create } from 'zustand'; export const usePopoverStore = create(() => ({ onClose: () => {} }));",
+        ),
+        (
+            "src/Reader.tsx",
+            "import { usePopoverStore } from './store'; export function Reader() { const onClose = usePopoverStore((state) => state.onClose); return <button onClick={() => onClose('store_read')} />; } export function later() { usePopoverStore.getState().onClose('store_get'); }",
+        ),
+        (
+            "src/SheetA.tsx",
+            "export default function SheetA({ onDone }) { return <button onClick={() => onDone('sheet_a')} />; }",
+        ),
+        (
+            "src/SheetB.tsx",
+            "export default function SheetB({ onDone }) { return <button onClick={() => onDone('sheet_b')} />; }",
+        ),
+        (
+            "src/Opener.tsx",
+            "import Sheets from 'external-ui'; export function Opener(props) { Sheets.openDeferred(props.importer(), 'key', { ...props }); return null; }",
+        ),
+        (
+            "src/App.tsx",
+            "import * as React from 'react'; import { usePopoverStore } from './store'; import { Opener } from './Opener'; import { useItemSelection } from './hook';\
+             function Publisher() { const [, apply] = useItemSelection(['store']); React.useLayoutEffect(() => { usePopoverStore.setState({ onClose: apply }); }, [apply]); return null; }\
+             function Holder() { const [, apply] = useItemSelection(['state']); const [initial] = React.useState(apply); const [handler, setHandler] = React.useState(null); const pending = React.useRef('ref_initial'); React.useEffect(() => { setHandler(() => apply); }, []); const choose = () => { pending.current = 'ref_set'; }; return <div><button onClick={() => handler('state_set')} /><button onClick={() => initial('state_initial')} /><button onMouseEnter={choose} onClick={() => apply(pending.current)} /></div>; }\
+             class Panel extends React.Component { componentDidMount() { this.setState({ close: this.props.apply }); } render() { return <button onClick={() => this.state.close('class_state')} />; } }\
+             function ClassHost() { const [, apply] = useItemSelection(['class']); return <Panel apply={apply} />; }\
+             const CloseContext = React.createContext(null);\
+             function Consumer() { const { close } = React.useContext(CloseContext); return <button onClick={() => close('context_read')} />; }\
+             function Provider() { const [, apply] = useItemSelection(['context']); return <CloseContext.Provider value={{ close: apply }}><Consumer /></CloseContext.Provider>; }\
+             function loadA() { return import('./SheetA'); } function loadB() { return import('./SheetB'); }\
+             const SHEETS = [{ id: 'a', importer: loadA }, { id: 'b', importer: loadB }];\
+             function Tracked({ extra, ...props }) { return <Opener {...props} />; }\
+             function Table({ index }) { const [, apply] = useItemSelection(['table']); const [selected] = React.useState(SHEETS[index]); return <Tracked extra={1} importer={selected.importer} onDone={apply} />; }\
+             export function App() { return <div><Publisher /><Holder /><ClassHost /><Provider /><Table index={0} /></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n[[state_stores]]\nkind = 'zustand'\nmodule = 'zustand'\nexport = 'create'\n[[component_openers]]\nmodule = 'external-ui'\nexport = 'default.openDeferred'\ncomponent_argument = 0\nprops_argument = 2\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let callsite = |items: &str| {
+        report
+            .callsites
+            .iter()
+            .find(|callsite| {
+                callsite.factory_arguments["items"]
+                    == [QueryValue::Array {
+                        elements: vec![QueryValue::String {
+                            value: items.to_owned(),
+                        }],
+                    }]
+            })
+            .unwrap_or_else(|| panic!("callsite for {items}"))
+    };
+    let actions = |items: &str| {
+        let callsite = callsite(items);
+        assert!(
+            callsite.capability.escapes.is_empty(),
+            "{items}: {:?}",
+            callsite.capability.escapes
+        );
+        let mut actions = callsite
+            .capability
+            .calls
+            .iter()
+            .flat_map(|call| &call.arguments["action"])
+            .map(|value| match value {
+                QueryValue::String { value } => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        actions.sort();
+        actions
+    };
+    // A zustand store's setState reaches its selector and getState reads in another file.
+    assert_eq!(actions("store"), ["store_get", "store_read"]);
+    // useState holds its initial value and what an updater returns, and a ref's current holds
+    // its initial value and what is assigned to it.
+    assert_eq!(
+        actions("state"),
+        ["ref_initial", "ref_set", "state_initial", "state_set"]
+    );
+    // this.setState reaches this.state in the class's methods.
+    assert_eq!(actions("class"), ["class_state"]);
+    // A context's value reaches each useContext.
+    assert_eq!(actions("context"), ["context_read"]);
+    // A sheet chosen from a table through state, spread on through a wrapper's props, opens
+    // as any sheet the table names, and says it was inferred.
+    assert_eq!(actions("table"), ["sheet_a", "sheet_b"]);
+    assert!(callsite("table").capability.calls.iter().all(|call| {
+        call.via
+            .iter()
+            .any(|step| step.starts_with("props passed with the component"))
+    }));
+}
+
+#[test]
+fn an_instance_reading_a_table_entry_requests_any_entry_of_the_table() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/Selected.tsx",
+            "import { useItemSelection } from './hook'; export function Selected({ contentTypes, children }) { const [, apply] = useItemSelection(contentTypes); return children({ apply }); }",
+        ),
+        (
+            "src/SheetA.tsx",
+            "export default function SheetA({ onDone }) { return <button onClick={() => onDone('sheet_a')} />; }",
+        ),
+        (
+            "src/SheetB.tsx",
+            "export default function SheetB({ onDone }) { return <button onClick={() => onDone('sheet_b')} />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import * as React from 'react'; import { pick } from 'external-pick'; import { openSheet } from 'external-ui'; import { Selected } from './Selected';\
+             function loadA() { return import('./SheetA'); } function loadB() { return import('./SheetB'); }\
+             const SHEETS = [{ id: 'a', importer: loadA }, { id: 'b', importer: loadB }];\
+             function Opener(props) { openSheet(props.importer(), props); return null; }\
+             function Table() { const [selected, setSelected] = React.useState(null); React.useEffect(() => { setSelected(pick(SHEETS)); }, []); return <Selected contentTypes={[selected.id]}>{({ apply }) => <Opener importer={selected.importer} onDone={apply} />}</Selected>; }\
+             export function App() { return <Table />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n[[component_openers]]\nmodule = 'external-ui'\nexport = 'openSheet'\ncomponent_argument = 0\nprops_argument = 1\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    let strings = |values: &[QueryValue]| {
+        let mut strings = values
+            .iter()
+            .map(|value| match value {
+                QueryValue::String { value } => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        strings.sort();
+        strings
+    };
+    let mut calls = callsite
+        .capability
+        .calls
+        .iter()
+        .map(|call| {
+            (
+                strings(&call.arguments["action"]),
+                strings(&call.elements["items"]),
+            )
+        })
+        .collect::<Vec<_>>();
+    calls.sort();
+    // The sheet and the content types both come from the entry picked from the table, so each
+    // sheet's calls are attributed to every entry's item rather than to none.
+    assert_eq!(
+        calls,
+        [
+            (
+                vec!["sheet_a".to_owned()],
+                vec!["a".to_owned(), "b".to_owned()]
+            ),
+            (
+                vec!["sheet_b".to_owned()],
+                vec!["a".to_owned(), "b".to_owned()]
+            )
+        ],
+        "{:?}",
+        callsite.capability.escapes
+    );
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,

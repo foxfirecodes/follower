@@ -99,6 +99,24 @@ pub struct ComponentOpener {
     pub render_argument: Option<usize>,
 }
 
+/// A state library whose stores hold values that are written in one place and read in others.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateStore {
+    /// The library's store semantics; `zustand` reads `S.setState(...)` as a write and
+    /// `S(selector)`, `S.getState()`, and `useStore(S, selector)` as reads.
+    pub kind: StateStoreKind,
+    pub module: String,
+    /// The function that creates a store, as `create`.
+    pub export: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateStoreKind {
+    Zustand,
+}
+
 /// A component or function the project declares is rendered or run somewhere, so exploration
 /// starts there, as an entry does, when no path from an entry is found.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -164,6 +182,8 @@ pub struct ProjectConfig {
     pub render_roots: Vec<RenderRoot>,
     #[serde(default)]
     pub render_calls: Vec<RenderCall>,
+    #[serde(default)]
+    pub state_stores: Vec<StateStore>,
     #[serde(default)]
     pub inputs: BTreeMap<String, Vec<String>>,
     #[serde(default)]
@@ -320,6 +340,23 @@ impl ProjectConfig {
                     && model.export == export
             })
             .collect()
+    }
+
+    /// The store library a call creates a store with, as `create(...)` or the curried
+    /// `create<State>()(...)`.
+    pub fn state_store<'a>(
+        &'a self,
+        file: &FlowFileIr,
+        callee: &FlowExpression,
+    ) -> Option<&'a StateStore> {
+        let callee = match &callee.kind {
+            FlowExpressionKind::Call { callee, .. } => callee.as_ref(),
+            _ => callee,
+        };
+        let (module, export) = self.imported_export(file, callee)?;
+        self.state_stores
+            .iter()
+            .find(|store| store.module == module && store.export == export)
     }
 
     pub fn render_call<'a>(

@@ -140,6 +140,12 @@ source_excludes = ["**/web/**", "**/*.web.tsx", "**/*.android.tsx"]
 [import_aliases]
 "@sample/*" = "src/*"
 
+# Stores whose values are written in one place and read in others.
+[[state_stores]]
+kind = "zustand"
+module = "zustand"
+export = "create"
+
 [[callback_selector_imports]]
 module = "@sample/state"
 export = "selectFromStore"
@@ -524,7 +530,21 @@ a namespace, as in `export const { useNotice } = web` over `import * as web`, is
 re-exports. When a hook's or parameter's callers are not parsed, the walk asks the next round to
 parse the files that import it, and when a component or function it meets is in a file that is not
 parsed, such as one the text filter skipped, it asks for that file, within the root phase's file
-budget. Each call made with the result
+budget. A value stored and read back elsewhere is followed from the write to each read: what
+`useState` starts with or a setter or updater writes reaches the state in the same component, what
+`this.setState` writes reaches `this.state` in the class's methods, a context provider's `value`
+reaches each `useContext` of that context, and, for a store a `[[state_stores]]` entry describes,
+what `S.setState` writes reaches `S(selector)`, `S.getState()`, and `useStore(S, selector)`
+wherever they are, with the selector's property path taken into the state. A component an opener
+loads from a property of a value the walk cannot trace, as `selected.importer` for an entry picked
+from a table, is any value the caller's file writes under that property; those calls are
+`inferred`. In the same way, when the contexts explored through an instance give no known elements
+for a factory argument, what the instance's caller writes for it is evaluated with such a property
+read taken as each value the file writes under it, so `contentTypes={[selected.id]}` requests every
+`id` the table names. A prop the entered site spreads from its own props, as `<Sheet {...props} />`, is
+followed to where that component's caller wrote it. An argument read from a ref, as
+`pending.current`, takes the ref's initial value and the values the file assigns to it when nothing
+else is known. Each call made with the result
 is in `calls`, with the functions it sits in (`context`, such as `the onClose prop of <Panel>`), how
 the result reached it (`via`, such as `prop onClose of <Panel>` or `returned by useNotice to
 Banner`), and the values of each projected invocation argument. An argument that reads no local

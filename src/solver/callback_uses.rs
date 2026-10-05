@@ -25,8 +25,8 @@ use crate::{
 use crate::query::QueryCallPathKind;
 
 use super::{
-    Environment, FactoryCallCandidate, FunctionKey, Solver, TrackedValue, UseEdge, UseNode,
-    callee_text, query_value,
+    AbstractValue, Environment, FactoryCallCandidate, FunctionKey, Solver, TrackedValue, UseEdge,
+    UseNode, callee_text, query_value,
 };
 
 /// Scopes and targets one callsite's walk may visit.
@@ -39,6 +39,15 @@ const MAX_CALLERS: usize = 32;
 /// A property name, or `[index]` for an array element, on the way from a value to the factory
 /// result inside it.
 type Step = String;
+
+/// The site the walk entered a scope through: the scope that holds it, and the site the walk
+/// entered that scope through, so a value spread on from the scope's own props can be found
+/// where its caller wrote it.
+struct Entered {
+    user: UseNode,
+    site: SourceSpan,
+    parent: Option<Rc<Entered>>,
+}
 
 /// What the walk follows in one scope.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -113,6 +122,21 @@ enum Lead<'e> {
         context: Vec<String>,
     },
     Callers(Vec<Step>),
+    /// Stored in a class component's state, which its methods read as `this.state`.
+    ClassState {
+        class: String,
+        steps: Vec<Step>,
+    },
+    /// Stored in a configured state library's store.
+    Store {
+        store: LinkedSymbol,
+        steps: Vec<Step>,
+    },
+    /// Provided as a React context's value.
+    Context {
+        context: LinkedSymbol,
+        steps: Vec<Step>,
+    },
     /// Passed to a call of `root` at `path`, which may be a parameter whose callers pass a
     /// function.
     ParameterCall {
@@ -874,9 +898,10 @@ impl Solver<'_> {
         code: &ScopeCode<'_>,
         imports: &Imports,
         scope: &UseNode,
-        entered: Option<&(UseNode, SourceSpan)>,
+        entered: Option<&Entered>,
         component: &FlowExpression,
         unparsed: &mut BTreeSet<PathBuf>,
+        guessed: &mut bool,
     ) -> Vec<UseNode> {
         let (expression, called) = match &component.kind {
             FlowExpressionKind::Call { callee, arguments } if arguments.is_empty() => {
@@ -893,26 +918,158 @@ impl Solver<'_> {
         {
             // Without the site, the value is any caller's, which would open every caller's
             // component on this path.
-            let Some((user, site)) = entered else {
+            let Some(entered) = entered else {
                 return Vec::new();
             };
             let (index, inner) = binding;
             let steps = inner.into_iter().chain(path).collect();
             return self
-                .passed_values(user, site, scope, &[(root, (index, steps))])
-                .and_then(|(caller_file, passed)| {
-                    let (_, value) = passed.into_iter().next()?;
-                    Some(self.component_scopes(
-                        caller_file,
-                        &Imports::new(),
-                        &value,
-                        called,
-                        unparsed,
-                    ))
+                .entered_value(entered, scope, index, steps, 0)
+                .map(|(caller_file, value)| {
+                    let imports = self
+                        .scope_code(&entered.user)
+                        .map_or_else(Imports::new, |code| local_imports(&code.body));
+                    self.component_scopes(caller_file, &imports, &value, called, unparsed, guessed)
                 })
                 .unwrap_or_default();
         }
-        self.component_scopes(code.file_id, imports, expression, called, unparsed)
+        self.component_scopes(code.file_id, imports, expression, called, unparsed, guessed)
+    }
+
+    /// What the site the walk entered `scope` through passes for its parameter at `index` and
+    /// `steps`, following a prop the site spreads from its own scope's props, as
+    /// `<Sheet {...props} />`, to where that scope's caller wrote it.
+    fn entered_value(
+        &self,
+        entered: &Entered,
+        scope: &UseNode,
+        index: usize,
+        steps: Vec<Step>,
+        depth: usize,
+    ) -> Option<(FileId, FlowExpression)> {
+        if let Some((caller_file, passed)) = self.passed_values(
+            &entered.user,
+            &entered.site,
+            scope,
+            &[(String::new(), (index, steps.clone()))],
+        ) {
+            return passed
+                .into_iter()
+                .next()
+                .map(|(_, value)| (caller_file, value));
+        }
+        let parent = entered.parent.as_deref().filter(|_| depth < MAX_HOPS)?;
+        let user = self.scope_code(&entered.user)?;
+        let FlowExpressionKind::JsxElement { props, .. } =
+            &self.site_expression(&entered.user, &entered.site)?.kind
+        else {
+            return None;
+        };
+        // The last spread of the user's own props is the one that supplies the prop.
+        props.iter().rev().find_map(|prop| {
+            let FlowJsxProp::Spread { value, .. } = prop else {
+                return None;
+            };
+            let (root, path) = read_path(value)?;
+            let (parent_index, inner) =
+                user.params
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, param)| {
+                        pattern_path(param, &root).map(|inner| (position, inner))
+                    })?;
+            let steps = inner
+                .into_iter()
+                .chain(path)
+                .chain(steps.iter().cloned())
+                .collect();
+            self.entered_value(parent, &entered.user, parent_index, steps, depth + 1)
+        })
+    }
+
+    /// The expression at a site in a scope's body.
+    fn site_expression(&self, scope: &UseNode, site: &SourceSpan) -> Option<FlowExpression> {
+        let code = self.scope_code(scope)?;
+        let mut at_site = None;
+        let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
+            let expression = frames.last().expect("visited frame").expression;
+            if at_site.is_none() && expression.span == *site {
+                at_site = Some(expression.clone());
+            }
+        };
+        visit_body(&code.body, &mut found);
+        at_site
+    }
+
+    /// The values a file gives a ref by name: what `useRef` starts it with and what is assigned
+    /// to its `current`.
+    fn ref_values(&self, file_id: FileId, name: &str) -> Vec<FlowExpression> {
+        let mut values = Vec::new();
+        for (_, function) in self
+            .functions
+            .iter()
+            .filter(|(key, _)| key.file_id == file_id)
+        {
+            let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
+                let frame = frames.last().expect("visited frame");
+                match (&frame.role, &frame.expression.kind) {
+                    (
+                        Role::Bind(FlowPattern {
+                            kind: FlowPatternKind::Identifier { name: bound },
+                            ..
+                        }),
+                        FlowExpressionKind::Call { callee, arguments },
+                    ) if bound == name
+                        && callee_text(callee).rsplit('.').next() == Some("useRef") =>
+                    {
+                        values.extend(arguments.first().cloned());
+                    }
+                    (Role::Assign(FlowAssignmentTarget::StaticMember { object, property }), _)
+                        if property == "current"
+                            && matches!(&object.kind, FlowExpressionKind::Identifier { name: assigned, .. } if assigned == name) =>
+                    {
+                        values.push(frame.expression.clone());
+                    }
+                    _ => {}
+                }
+            };
+            visit_body(&ScopeBody::Statements(&function.body), &mut found);
+        }
+        values
+    }
+
+    /// Every value a file writes under a property in a record literal, as the `importer` of each
+    /// entry in a table of sheets.
+    fn file_property_values(&self, file_id: FileId, property: &str) -> Vec<FlowExpression> {
+        let mut values = Vec::new();
+        let bodies = self
+            .functions
+            .iter()
+            .filter(|(key, _)| key.file_id == file_id)
+            .map(|(_, function)| ScopeBody::Statements(&function.body))
+            .chain(
+                self.globals_ir
+                    .iter()
+                    .filter(|(binding_file, _)| *binding_file == file_id)
+                    .map(|(_, binding)| ScopeBody::Expression(&binding.value)),
+            )
+            .collect::<Vec<_>>();
+        for body in &bodies {
+            let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
+                if let FlowExpressionKind::Record { fields } =
+                    &frames.last().expect("visited frame").expression.kind
+                {
+                    values.extend(
+                        fields
+                            .iter()
+                            .filter(|field| !field.spread && field.property == property)
+                            .map(|field| field.value.clone()),
+                    );
+                }
+            };
+            visit_body(body, &mut found);
+        }
+        values
     }
 
     /// The scopes of a component written in a file, or of the component a module import or a
@@ -925,6 +1082,7 @@ impl Solver<'_> {
         expression: &FlowExpression,
         called: bool,
         unparsed: &mut BTreeSet<PathBuf>,
+        guessed: &mut bool,
     ) -> Vec<UseNode> {
         let mut export_scopes = |file_id: FileId, module: &str, export: &str| {
             self.module_export_scopes(file_id, module, export)
@@ -959,6 +1117,33 @@ impl Solver<'_> {
         });
         if let Some((file_id, (module, export))) = loader {
             return export_scopes(file_id, &module, &export);
+        }
+        // A property of a local the walk cannot trace, as `selected.importer` for an entry picked
+        // from a table, may be any value the file writes under that property.
+        if scopes.is_empty()
+            && let FlowExpressionKind::StaticMember { object, property } = &expression.kind
+            && let FlowExpressionKind::Identifier { name, .. } = &object.kind
+            && !imports.contains_key(name)
+            && !matches!(
+                self.symbol_linker.resolve_binding(file_id, name),
+                ValueResolution::Resolved(_)
+            )
+        {
+            let mut found = Vec::new();
+            for value in self.file_property_values(file_id, property) {
+                if matches!(value.kind, FlowExpressionKind::StaticMember { .. }) {
+                    continue;
+                }
+                for scope in
+                    self.component_scopes(file_id, imports, &value, called, unparsed, guessed)
+                {
+                    if !found.contains(&scope) {
+                        found.push(scope);
+                    }
+                }
+            }
+            *guessed |= !found.is_empty();
+            return found;
         }
         if called { Vec::new() } else { scopes }
     }
@@ -1000,6 +1185,7 @@ impl Solver<'_> {
                     value,
                     true,
                     &mut BTreeSet::new(),
+                    &mut false,
                 );
                 (!scopes.is_empty()).then_some(scopes)
             }
@@ -1083,7 +1269,7 @@ impl Solver<'_> {
         {
             let others = Imports {
                 modules: imports.modules.clone(),
-                choices: HashMap::new(),
+                ..Imports::default()
             };
             return names
                 .iter()
@@ -1164,6 +1350,23 @@ impl Solver<'_> {
                     return Lead::Used;
                 };
                 let text = callee_text(callee);
+                if let Some(lead) = self.state_write(file_id, imports, callee, *position, &steps) {
+                    return lead;
+                }
+                // `useState(value)` holds its argument as the pair's first element, as
+                // `useReducer(reducer, value)` holds its second.
+                let hook = text.rsplit('.').next();
+                if (hook == Some("useState") && *position == 0)
+                    || (hook == Some("useReducer") && *position == 1)
+                {
+                    return self.follow(
+                        file_id,
+                        imports,
+                        frames,
+                        index - 1,
+                        std::iter::once("[0]".to_owned()).chain(steps).collect(),
+                    );
+                }
                 if *position > 0 && takes_dependencies(&text) {
                     return Lead::Used;
                 }
@@ -1273,6 +1476,17 @@ impl Solver<'_> {
                     Role::Prop(name) => Some(*name),
                     _ => None,
                 };
+                // `<Ctx.Provider value={...}>` provides the value to every `useContext(Ctx)`.
+                if prop == Some("value")
+                    && let FlowJsxTag::Member {
+                        object, property, ..
+                    } = tag
+                    && property == "Provider"
+                    && let ValueResolution::Resolved(LinkedValue::Declaration(context)) =
+                        self.symbol_linker.resolve_binding(file_id, object)
+                {
+                    return Lead::Context { context, steps };
+                }
                 let steps = prop.map_or(steps.clone(), |prop| {
                     std::iter::once(prop.to_owned())
                         .chain(steps.iter().cloned())
@@ -1406,6 +1620,178 @@ impl Solver<'_> {
         }
     }
 
+    /// What passing a value as a call's argument stores, when the callee sets state: a
+    /// `useState` setter, a class's `this.setState`, or a configured store's `setState`.
+    fn state_write<'e>(
+        &self,
+        file_id: FileId,
+        imports: &Imports,
+        callee: &FlowExpression,
+        position: usize,
+        steps: &[Step],
+    ) -> Option<Lead<'e>> {
+        if position != 0 {
+            return None;
+        }
+        match &callee.kind {
+            FlowExpressionKind::Identifier { name, .. } => {
+                if let Some(state) = imports.setters.get(name) {
+                    return Some(Lead::Same(Target::Name(state.clone(), steps.to_vec())));
+                }
+                // `this.setState(...)` lowers to a call of `Class.setState`.
+                let class = name.strip_suffix(".setState")?;
+                self.class_scopes(file_id, class)
+                    .next()
+                    .map(|_| Lead::ClassState {
+                        class: class.to_owned(),
+                        steps: steps.to_vec(),
+                    })
+            }
+            FlowExpressionKind::StaticMember { object, property } if property == "setState" => {
+                let FlowExpressionKind::Identifier { name, .. } = &object.kind else {
+                    return None;
+                };
+                self.store_symbol(file_id, name).map(|store| Lead::Store {
+                    store,
+                    steps: steps.to_vec(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// A class component's scopes in a file: the class and its methods.
+    fn class_scopes<'s>(
+        &'s self,
+        file_id: FileId,
+        class: &'s str,
+    ) -> impl Iterator<Item = &'s FunctionKey> + 's {
+        self.functions.keys().filter(move |key| {
+            key.file_id == file_id
+                && (key.name == class
+                    || key
+                        .name
+                        .strip_prefix(class)
+                        .is_some_and(|rest| rest.starts_with('.')))
+        })
+    }
+
+    /// The store a name in a file refers to, when its binding is created by a configured state
+    /// library.
+    fn store_symbol(&self, file_id: FileId, name: &str) -> Option<LinkedSymbol> {
+        let ValueResolution::Resolved(LinkedValue::Declaration(symbol)) =
+            self.symbol_linker.resolve_binding(file_id, name)
+        else {
+            return None;
+        };
+        let index = *self.global_bindings.get(&symbol)?;
+        let (binding_file, binding) = self.globals_ir.get(index)?;
+        let FlowExpressionKind::Call { callee, .. } = &binding.value.kind else {
+            return None;
+        };
+        let file = self.symbol_linker.file(*binding_file)?;
+        self.project
+            .config
+            .state_store(&file.flow, callee)
+            .map(|_| symbol)
+    }
+
+    /// Every scope the walk can visit, with the calls in it.
+    fn scope_calls(&self) -> Vec<(UseNode, FileId, Vec<&FlowExpression>)> {
+        self.functions
+            .iter()
+            .map(|(key, function)| {
+                (
+                    UseNode::Function(key.clone()),
+                    key.file_id,
+                    calls_in(&function.body, None),
+                )
+            })
+            .chain(
+                self.globals_ir
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (file_id, binding))| {
+                        (
+                            UseNode::Global(index),
+                            *file_id,
+                            calls_in(&[], Some(&binding.value)),
+                        )
+                    }),
+            )
+            .collect()
+    }
+
+    /// Where a store's state is read, with the steps each read takes into the state: `S(s =>
+    /// s.key)` reads `key`, and `S()`, `S.getState()`, or a selector that is not a property path
+    /// reads the whole state.
+    fn store_reads(&self, store: &LinkedSymbol) -> Vec<(UseNode, SourceSpan, Vec<Step>)> {
+        let mut reads = Vec::new();
+        for (scope, file_id, calls) in self.scope_calls() {
+            for call in calls {
+                let FlowExpressionKind::Call { callee, arguments } = &call.kind else {
+                    continue;
+                };
+                let (name, selector) = match &callee.kind {
+                    FlowExpressionKind::Identifier { name, .. } if name == "useStore" => {
+                        match arguments.first().map(|argument| &argument.kind) {
+                            Some(FlowExpressionKind::Identifier { name, .. }) => {
+                                (name, arguments.get(1))
+                            }
+                            _ => continue,
+                        }
+                    }
+                    FlowExpressionKind::Identifier { name, .. } => (name, arguments.first()),
+                    FlowExpressionKind::StaticMember { object, property }
+                        if property == "getState" =>
+                    {
+                        match &object.kind {
+                            FlowExpressionKind::Identifier { name, .. } => (name, None),
+                            _ => continue,
+                        }
+                    }
+                    _ => continue,
+                };
+                if self.store_symbol(file_id, name).as_ref() != Some(store) {
+                    continue;
+                }
+                let path = selector.and_then(selector_path).unwrap_or_default();
+                reads.push((scope.clone(), call.span.clone(), path));
+            }
+        }
+        reads
+    }
+
+    /// Where a context's value is read: `useContext(Ctx)` and `use(Ctx)`.
+    fn context_reads(&self, context: &LinkedSymbol) -> Vec<(UseNode, SourceSpan)> {
+        let mut reads = Vec::new();
+        for (scope, file_id, calls) in self.scope_calls() {
+            for call in calls {
+                let FlowExpressionKind::Call { callee, arguments } = &call.kind else {
+                    continue;
+                };
+                if !matches!(
+                    callee_text(callee).rsplit('.').next(),
+                    Some("useContext" | "use")
+                ) {
+                    continue;
+                }
+                let Some(FlowExpressionKind::Identifier { name, .. }) =
+                    arguments.first().map(|argument| &argument.kind)
+                else {
+                    continue;
+                };
+                if matches!(
+                    self.symbol_linker.resolve_binding(file_id, name),
+                    ValueResolution::Resolved(LinkedValue::Declaration(symbol)) if &symbol == context
+                ) {
+                    reads.push((scope.clone(), call.span.clone()));
+                }
+            }
+        }
+        reads
+    }
+
     /// Follows the value an arrow returns: only `useMemo` hands it on.
     fn follow_arrow_result<'e>(
         &self,
@@ -1426,6 +1812,10 @@ impl Solver<'_> {
             {
                 self.follow(file_id, imports, frames, arrow - 1, steps)
             }
+            // An updater, as `setItems((items) => [...items, item])`, writes what it returns.
+            (Role::Argument(0), Some(FlowExpressionKind::Call { callee, .. })) => self
+                .state_write(file_id, imports, callee, 0, &steps)
+                .unwrap_or(Lead::Used),
             _ => Lead::Used,
         }
     }
@@ -1469,10 +1859,13 @@ impl Solver<'_> {
             direct,
             Rc::new(Vec::<OwnedGuard>::new()),
             None::<SourceSpan>,
-            None::<Rc<(UseNode, SourceSpan)>>,
+            None::<Rc<Entered>>,
         )]);
         let mut seen = HashSet::new();
         let mut locals_cache = HashMap::<UseNode, Rc<BTreeSet<String>>>::new();
+        let mut store_reads =
+            BTreeMap::<LinkedSymbol, Vec<(UseNode, SourceSpan, Vec<Step>)>>::new();
+        let mut context_reads = BTreeMap::<LinkedSymbol, Vec<(UseNode, SourceSpan)>>::new();
         let mut recorded = HashSet::new();
         // Each entry is a scope and what to follow in it, with the path so far, how calls map to
         // the result's arguments, the conditions carried in, the caller site that supplied the
@@ -1487,7 +1880,7 @@ impl Solver<'_> {
                     target.clone(),
                     inner,
                     guard_key(&carried),
-                    entered.as_ref().map(|entered| span_key(&entered.1)),
+                    entered.as_ref().map(|entered| span_key(&entered.site)),
                 ))
             {
                 continue;
@@ -1508,6 +1901,7 @@ impl Solver<'_> {
                         text: String,
                         context: Vec<String>| {
                 let mut unparsed = BTreeSet::new();
+                let mut guessed = false;
                 let scopes = self.opened_scopes(
                     &code,
                     imports,
@@ -1515,6 +1909,7 @@ impl Solver<'_> {
                     entered.as_deref(),
                     component,
                     &mut unparsed,
+                    &mut guessed,
                 );
                 if scopes.is_empty() {
                     OwnedLead::Escape {
@@ -1530,7 +1925,14 @@ impl Solver<'_> {
                         scopes,
                         parameter: 0,
                         steps,
-                        hop: format!("props of the component {text} opens"),
+                        // A component taken from the values a property may hold is inferred.
+                        hop: if guessed {
+                            format!(
+                                "props passed with the component {text} opens, which may be any the caller's file names for it"
+                            )
+                        } else {
+                            format!("props of the component {text} opens")
+                        },
                         site: span,
                     }
                 }
@@ -1768,7 +2170,11 @@ impl Solver<'_> {
                             };
                             let mut targets = Vec::new();
                             bind_targets(param, &steps, &mut targets);
-                            let entered = Rc::new((scope.clone(), site.clone()));
+                            let entered = Rc::new(Entered {
+                                user: scope.clone(),
+                                site: site.clone(),
+                                parent: entered.clone(),
+                            });
                             for target in targets {
                                 queue.push_back((
                                     next.clone(),
@@ -1780,6 +2186,93 @@ impl Solver<'_> {
                                     Some(entered.clone()),
                                 ));
                             }
+                        }
+                    }
+                    OwnedLead::ClassState { class, steps } => {
+                        walk.used = true;
+                        if via.len() >= MAX_HOPS {
+                            continue;
+                        }
+                        let mut next_via = via.clone();
+                        next_via.push(format!("stored in the state of {class}"));
+                        let state = format!("{class}.state");
+                        for key in self.class_scopes(file_id, &class) {
+                            queue.push_back((
+                                UseNode::Function(key.clone()),
+                                Target::Name(state.clone(), steps.clone()),
+                                next_via.clone(),
+                                forward.clone(),
+                                here.clone(),
+                                instance.clone(),
+                                None,
+                            ));
+                        }
+                    }
+                    OwnedLead::Store { store, steps } => {
+                        walk.used = true;
+                        // Readers in files that are not parsed come in the next round.
+                        if let Some(file) = self.symbol_linker.file(store.file_id) {
+                            walk.importer_requests.insert(file.path.clone());
+                        }
+                        if via.len() >= MAX_HOPS {
+                            continue;
+                        }
+                        let reads = store_reads
+                            .entry(store.clone())
+                            .or_insert_with(|| self.store_reads(&store))
+                            .clone();
+                        for (reader, span, path) in reads {
+                            // A read takes the steps its selector names into the state.
+                            let Some(rest) = steps.strip_prefix(path.as_slice()) else {
+                                continue;
+                            };
+                            let mut next_via = via.clone();
+                            next_via.push(format!(
+                                "stored in {} and read by {}",
+                                store.name,
+                                self.scope_code(&reader)
+                                    .map_or_else(String::new, |code| code.name)
+                            ));
+                            queue.push_back((
+                                reader,
+                                Target::Site(span.start, span.end, None, rest.to_vec()),
+                                next_via,
+                                forward.clone(),
+                                here.clone(),
+                                instance.clone(),
+                                None,
+                            ));
+                        }
+                    }
+                    OwnedLead::Context { context, steps } => {
+                        walk.used = true;
+                        if let Some(file) = self.symbol_linker.file(context.file_id) {
+                            walk.importer_requests.insert(file.path.clone());
+                        }
+                        if via.len() >= MAX_HOPS {
+                            continue;
+                        }
+                        let reads = context_reads
+                            .entry(context.clone())
+                            .or_insert_with(|| self.context_reads(&context))
+                            .clone();
+                        for (reader, span) in reads {
+                            let mut next_via = via.clone();
+                            next_via.push(format!(
+                                "provided as {} and read by {}",
+                                context.name,
+                                self.scope_code(&reader)
+                                    .map_or_else(String::new, |code| code.name)
+                            ));
+                            queue.push_back((
+                                reader,
+                                Target::Site(span.start, span.end, None, steps.clone()),
+                                next_via,
+                                forward.clone(),
+                                here.clone(),
+                                instance.clone(),
+                                None,
+                            ));
                         }
                     }
                     OwnedLead::Callers(steps) => {
@@ -2163,6 +2656,95 @@ impl Solver<'_> {
             self.query_gap_keys.remove(&(gap, choice));
         }
         value
+    }
+
+    /// The elements an instance's caller writes for a factory argument that is one of the
+    /// callsite scope's parameters, as `contentTypes={[selected.id]}`. A property of a local the
+    /// walk cannot trace, as `selected.id` for an entry picked from a table, may be any value the
+    /// caller's file writes under that property.
+    fn written_instance_elements(
+        &mut self,
+        candidate: &FactoryCallCandidate,
+        graph: &HashMap<UseNode, Vec<UseEdge>>,
+        instance: &SourceSpan,
+        position: usize,
+    ) -> Option<Vec<QueryValue>> {
+        let scope = self.candidate_scope(candidate)?;
+        let FlowExpressionKind::Identifier { name, .. } = &candidate.arguments.get(position)?.kind
+        else {
+            return None;
+        };
+        let binding = self
+            .scope_code(&scope)?
+            .params
+            .iter()
+            .enumerate()
+            .find_map(|(index, param)| pattern_path(param, name).map(|steps| (index, steps)))?;
+        let edge = graph
+            .get(&scope)?
+            .iter()
+            .find(|edge| edge.site == *instance)?;
+        let (caller_file, passed) =
+            self.passed_values(&edge.user, &edge.site, &scope, &[(name.clone(), binding)])?;
+        let (_, written) = passed.into_iter().next()?;
+        let caller_locals = self.scope_locals(&edge.user)?;
+        // The locals the written value reads properties of, and which properties.
+        let mut reads = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
+            if let FlowExpressionKind::StaticMember { object, property } =
+                &frames.last().expect("visited frame").expression.kind
+                && let FlowExpressionKind::Identifier { name, .. } = &object.kind
+                && caller_locals.contains(name)
+            {
+                reads
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(property.clone());
+            }
+        };
+        visit_body(&ScopeBody::Expression(&written), &mut found);
+        let mut locals = Vec::new();
+        for (local, properties) in reads {
+            // One record per value the file writes under each property the local is read for.
+            let mut choices = Vec::new();
+            for property in properties {
+                for value in self.file_property_values(caller_file, &property) {
+                    let value = self.eval_with(caller_file, &value, Vec::new());
+                    choices.push(TrackedValue::plain(AbstractValue::open_record(
+                        BTreeMap::from([(property.clone(), value)]),
+                        "property_choice",
+                    )));
+                }
+            }
+            if choices.is_empty() {
+                return None;
+            }
+            locals.push((
+                local,
+                TrackedValue::plain(AbstractValue::Union(Rc::new(choices))),
+            ));
+        }
+        if locals.is_empty() {
+            return None;
+        }
+        let value = query_value(&self.eval_with(caller_file, &written, locals));
+        let mut elements = Vec::new();
+        collect_array_elements(&value, &mut elements);
+        // An element that may be any of several values is each of them.
+        let elements = elements
+            .into_iter()
+            .flat_map(|element| match element {
+                QueryValue::Alternatives { values } => values,
+                element => vec![element],
+            })
+            .filter(value_is_known)
+            .fold(Vec::new(), |mut elements, element| {
+                if !elements.contains(&element) {
+                    elements.push(element);
+                }
+                elements
+            });
+        (!elements.is_empty()).then_some(elements)
     }
 
     /// For a local array built from literal elements and `push` calls, such as
@@ -2629,6 +3211,20 @@ impl Solver<'_> {
             .map(span_key)
             .collect::<BTreeSet<_>>();
         covered.extend(wrapped.iter().copied());
+        // What each instance's caller writes for the factory arguments, for an instance whose
+        // explored elements are not known.
+        let mut written_elements = BTreeMap::new();
+        for instance in walk.calls.iter().filter_map(|call| call.instance.clone()) {
+            for (label, &position) in &label_positions {
+                let key = (span_key(&instance), label.clone());
+                if written_elements.contains_key(&key) {
+                    continue;
+                }
+                let elements =
+                    self.written_instance_elements(candidate, graph, &instance, position);
+                written_elements.insert(key, elements);
+            }
+        }
         for call in walk.calls {
             let key = span_key(&call.span);
             if call.forwards && wrapped.contains(&key) {
@@ -2675,6 +3271,29 @@ impl Solver<'_> {
                         }
                     }
                 }
+                // A ref's `current`, as `pending.current`, is its initial value or any value the
+                // file assigns to it, when nothing else gave a known value.
+                if !values.iter().any(value_is_known)
+                    && let Some(WrittenArgument {
+                        file_id,
+                        expression: Some(expression),
+                        ..
+                    }) = argument
+                    && let FlowExpressionKind::StaticMember { object, property } = &expression.kind
+                    && property == "current"
+                    && let FlowExpressionKind::Identifier { name, .. } = &object.kind
+                {
+                    let mut assigned = Vec::new();
+                    for written in self.ref_values(*file_id, name) {
+                        let value = self.evaluate_context_free(*file_id, &written);
+                        if value_is_known(&value) && !assigned.contains(&value) {
+                            assigned.push(value);
+                        }
+                    }
+                    if !assigned.is_empty() {
+                        values = assigned;
+                    }
+                }
                 if values.is_empty() {
                     values.push(QueryValue::Unknown {
                         reason: match argument {
@@ -2716,15 +3335,31 @@ impl Solver<'_> {
                 // An instance requests its own elements; the callsite's are every instance's. An
                 // argument that does not read the callsite's parameters is the same everywhere.
                 let from_instance = call.instance.as_ref().and_then(|span| {
-                    instance_elements(span, label_positions[label]).or_else(|| {
-                        let location = self.query_location(span);
-                        caller_elements.get(label).and_then(|callers| {
-                            callers
-                                .iter()
-                                .find(|(caller, _)| *caller == location)
-                                .map(|(_, elements)| elements.clone())
-                        })
-                    })
+                    let written = || {
+                        written_elements
+                            .get(&(span_key(span), label.clone()))
+                            .cloned()
+                            .flatten()
+                    };
+                    match instance_elements(span, label_positions[label]) {
+                        // Explored contexts that know nothing defer to what the caller writes.
+                        Some(explored) if !explored.iter().any(value_is_known) => {
+                            written().or(Some(explored))
+                        }
+                        Some(explored) => Some(explored),
+                        None => {
+                            let location = self.query_location(span);
+                            caller_elements
+                                .get(label)
+                                .and_then(|callers| {
+                                    callers
+                                        .iter()
+                                        .find(|(caller, _)| *caller == location)
+                                        .map(|(_, elements)| elements.clone())
+                                })
+                                .or_else(written)
+                        }
+                    }
                 });
                 let (source, complete) = match from_instance {
                     Some(source) => {
@@ -2907,6 +3542,18 @@ enum OwnedLead {
         site: SourceSpan,
     },
     Callers(Vec<Step>),
+    ClassState {
+        class: String,
+        steps: Vec<Step>,
+    },
+    Store {
+        store: LinkedSymbol,
+        steps: Vec<Step>,
+    },
+    Context {
+        context: LinkedSymbol,
+        steps: Vec<Step>,
+    },
     ParameterCall {
         root: String,
         path: Vec<Step>,
@@ -2956,6 +3603,9 @@ impl<'e> Lead<'e> {
                 context,
             } => open(component, steps, span, text, context),
             Lead::Callers(steps) => OwnedLead::Callers(steps),
+            Lead::ClassState { class, steps } => OwnedLead::ClassState { class, steps },
+            Lead::Store { store, steps } => OwnedLead::Store { store, steps },
+            Lead::Context { context, steps } => OwnedLead::Context { context, steps },
             Lead::ParameterCall {
                 root,
                 path,
@@ -3127,13 +3777,17 @@ fn pattern_path(pattern: &FlowPattern, name: &str) -> Option<Vec<Step>> {
     match &pattern.kind {
         FlowPatternKind::Identifier { name: bound } => (bound == name).then(Vec::new),
         FlowPatternKind::Default { target, .. } => pattern_path(target, name),
-        FlowPatternKind::Object { fields, .. } => fields.iter().find_map(|field| {
-            pattern_path(&field.target, name).map(|rest| {
-                std::iter::once(field.source_property.clone())
-                    .chain(rest)
-                    .collect()
+        FlowPatternKind::Object { fields, rest } => fields
+            .iter()
+            .find_map(|field| {
+                pattern_path(&field.target, name).map(|inner| {
+                    std::iter::once(field.source_property.clone())
+                        .chain(inner)
+                        .collect()
+                })
             })
-        }),
+            // The rest holds the other properties at the same steps.
+            .or_else(|| rest.as_ref().and_then(|rest| pattern_path(rest, name))),
         FlowPatternKind::Array { elements } => {
             elements.iter().enumerate().find_map(|(index, element)| {
                 let element = element.as_ref()?;
@@ -3238,6 +3892,8 @@ struct Imports {
     modules: HashMap<String, (String, Option<String>)>,
     /// Locals bound to one of several names, as `const List = compact ? Grid : Rows`.
     choices: HashMap<String, Vec<String>>,
+    /// `useState` setters and the state each sets, as `setOpen` for `const [open, setOpen]`.
+    setters: HashMap<String, String>,
 }
 
 impl Imports {
@@ -3284,6 +3940,24 @@ fn local_imports(body: &ScopeBody<'_>) -> Imports {
     let mut imports = Imports::new();
     let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
         let frame = frames.last().expect("visited frame");
+        // `const [open, setOpen] = useState(...)`.
+        if let (
+            Role::Bind(FlowPattern {
+                kind: FlowPatternKind::Array { elements },
+                ..
+            }),
+            FlowExpressionKind::Call { callee, .. },
+        ) = (&frame.role, &frame.expression.kind)
+            && callee_text(callee).rsplit('.').next() == Some("useState")
+            && let [Some(state), Some(setter), ..] = elements.as_slice()
+            && let (
+                FlowPatternKind::Identifier { name: state },
+                FlowPatternKind::Identifier { name: setter },
+            ) = (&state.kind, &setter.kind)
+        {
+            imports.setters.insert(setter.clone(), state.clone());
+            return;
+        }
         if let Role::Bind(FlowPattern {
             kind: FlowPatternKind::Identifier { name },
             ..
@@ -3360,6 +4034,36 @@ fn imported_module(argument: &FlowExpression, imports: &Imports) -> Option<(Stri
         FlowExpressionKind::Arrow { .. } => loaded_module(argument),
         _ => None,
     }
+}
+
+/// The properties a selector reads from the state it is given, as `[key]` for
+/// `(state) => state.key`.
+fn selector_path(selector: &FlowExpression) -> Option<Vec<Step>> {
+    let FlowExpressionKind::Arrow { params, body } = &selector.kind else {
+        return None;
+    };
+    let [
+        FlowPattern {
+            kind: FlowPatternKind::Identifier { name: state },
+            ..
+        },
+    ] = params.as_slice()
+    else {
+        return None;
+    };
+    let returned = match body {
+        FlowArrowBody::Expression { expression } => expression.as_ref(),
+        FlowArrowBody::Statements { statements } => match statements.as_slice() {
+            [
+                FlowStatement::Return {
+                    value: Some(value), ..
+                },
+            ] => value,
+            _ => return None,
+        },
+    };
+    let (root, path) = read_path(returned)?;
+    (&root == state).then_some(path)
 }
 
 /// A name and the properties read from it, as in `props.children` or `ref.current`.
