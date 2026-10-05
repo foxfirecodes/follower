@@ -65,6 +65,14 @@ pub struct ComponentConsumer {
     pub render_callback_names: Vec<String>,
     #[serde(default)]
     pub component_props: Vec<String>,
+    /// With a member, the export is a factory, and the contract applies to tags that are this
+    /// member of what it returns, as `Stack.Screen` for `const Stack = createStack()`.
+    #[serde(default)]
+    pub member: Option<String>,
+    /// Whether the factory returns a function whose result has the member, as
+    /// `createFactory(View)(config)`.
+    #[serde(default)]
+    pub curried: bool,
 }
 
 /// An imported function that opens a component outside the caller's render, such as a modal or
@@ -235,9 +243,34 @@ impl ProjectConfig {
         component: &FlowExpression,
     ) -> Option<&'a ComponentConsumer> {
         let (module, export) = self.imported_export(file, component)?;
+        self.component_consumers.iter().find(|model| {
+            model.member.is_none() && model.module == module && model.export == export
+        })
+    }
+
+    /// The members a call of a configured factory returns, as `Screen` and `Navigator` for
+    /// `createStack()`, or for `createFactory(View)(config)` when the contract is curried.
+    pub fn component_factory_members<'a>(
+        &'a self,
+        file: &FlowFileIr,
+        callee: &FlowExpression,
+    ) -> Vec<&'a ComponentConsumer> {
+        let (callee, curried) = match &callee.kind {
+            FlowExpressionKind::Call { callee, .. } => (callee.as_ref(), true),
+            _ => (callee, false),
+        };
+        let Some((module, export)) = self.imported_export(file, callee) else {
+            return Vec::new();
+        };
         self.component_consumers
             .iter()
-            .find(|model| model.module == module && model.export == export)
+            .filter(|model| {
+                model.member.is_some()
+                    && model.curried == curried
+                    && model.module == module
+                    && model.export == export
+            })
+            .collect()
     }
 
     pub fn component_opener<'a>(
@@ -483,6 +516,16 @@ fn validate_contracts(config: &ProjectConfig) -> Result<()> {
         }
     }
     for consumer in &config.component_consumers {
+        if consumer.curried && consumer.member.is_none() {
+            bail!("a curried component consumer needs a member");
+        }
+        if consumer
+            .member
+            .as_ref()
+            .is_some_and(|member| member.trim().is_empty())
+        {
+            bail!("component consumer members cannot be empty");
+        }
         if consumer.module.trim().is_empty()
             || consumer.export.trim().is_empty()
             || consumer

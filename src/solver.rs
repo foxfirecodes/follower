@@ -2528,6 +2528,33 @@ impl<'a> Solver<'a> {
                     component.evidence = Some(evidence);
                     return component;
                 }
+                // A configured factory's members are configured components, as `Stack.Screen` for
+                // `const Stack = createStack()`.
+                let members = self
+                    .symbol_linker
+                    .file(file_id)
+                    .map_or_else(Vec::new, |file| {
+                        self.project
+                            .config
+                            .component_factory_members(&file.flow, callee)
+                    });
+                if !members.is_empty() {
+                    let fields = members
+                        .into_iter()
+                        .filter_map(|model| {
+                            Some((
+                                model.member.clone()?,
+                                TrackedValue::plain(AbstractValue::ConfiguredComponent(
+                                    model.clone(),
+                                )),
+                            ))
+                        })
+                        .collect();
+                    return TrackedValue::plain(AbstractValue::open_record(
+                        fields,
+                        "configured_component_factory",
+                    ));
+                }
                 if let Some(file) = self.symbol_linker.file(file_id)
                     && let Some(property) = self
                         .project
@@ -2648,6 +2675,8 @@ impl<'a> Solver<'a> {
                                         render_props: Vec::new(),
                                         render_callback_names: Vec::new(),
                                         component_props: Vec::new(),
+                                        member: None,
+                                        curried: false,
                                     },
                                 ))
                             };
@@ -4033,6 +4062,8 @@ impl<'a> Solver<'a> {
             render_props: Vec::new(),
             render_callback_names: Vec::new(),
             component_props: Vec::new(),
+            member: None,
+            curried: false,
         })
     }
 
@@ -4051,6 +4082,7 @@ impl<'a> Solver<'a> {
         let hops = self.symbol_linker.linked_exports(file_id, local);
         consumers
             .iter()
+            .filter(|model| model.member.is_none())
             .find(|model| {
                 hops.iter().any(|(module, export)| {
                     model.module == *module
@@ -4375,7 +4407,9 @@ impl<'a> Solver<'a> {
                             vec![TrackedValue::unknown("component_render_props")],
                             element.span.clone(),
                         );
-                        self.render(returned);
+                        // It may return the element, or a component to render, as a screen's
+                        // `getComponent` does.
+                        self.render_assumed_prop(&returned, &element.span);
                     }
                 }
                 for prop in &model.component_props {

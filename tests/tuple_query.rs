@@ -1529,6 +1529,64 @@ fn require_gives_the_module_like_an_awaited_import() {
 }
 
 #[test]
+fn navigator_factory_members_render_their_screens() {
+    let screen = |name: &str| {
+        format!(
+            "import {{ useItemSelection }} from './hook'; export default function {name}() {{ const [, apply] = useItemSelection(['{name}']); apply('{name}_call'); return <div />; }}"
+        )
+    };
+    let tabs = screen("Tabs");
+    let settings = screen("Settings");
+    let inner = screen("Inner");
+    let fixture = TestProject::new(&[
+        HOOK,
+        ("src/Tabs.tsx", &tabs),
+        ("src/Settings.tsx", &settings),
+        ("src/Inner.tsx", &inner),
+        (
+            "src/App.tsx",
+            "import { createStack } from 'external-nav'; import { createNavigatorFactory } from 'external-nav-core'; import Settings from './Settings'; import Inner from './Inner'; const Root = createStack(); function PanelView() { return null; } const Panel = createNavigatorFactory(PanelView)({}); function getTabs() { return require('./Tabs').default; } export function App() { return <Root.Navigator><Root.Screen name=\"tabs\" getComponent={getTabs} /><Root.Group><Root.Screen name=\"settings\" component={Settings} /></Root.Group><Root.Screen name=\"main\">{() => <Panel.Navigator><Panel.Screen name=\"inner\" component={Inner} /></Panel.Navigator>}</Root.Screen></Root.Navigator>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n\
+         [[component_consumers]]\nmodule = 'external-nav'\nexport = 'createStack'\nmember = 'Navigator'\nforward_children = true\n\
+         [[component_consumers]]\nmodule = 'external-nav'\nexport = 'createStack'\nmember = 'Group'\nforward_children = true\n\
+         [[component_consumers]]\nmodule = 'external-nav'\nexport = 'createStack'\nmember = 'Screen'\ncomponent_props = ['component']\nrender_props = ['getComponent']\ninvoke_children = true\n\
+         [[component_consumers]]\nmodule = 'external-nav-core'\nexport = 'createNavigatorFactory'\nmember = 'Navigator'\ncurried = true\nforward_children = true\n\
+         [[component_consumers]]\nmodule = 'external-nav-core'\nexport = 'createNavigatorFactory'\nmember = 'Screen'\ncurried = true\ncomponent_props = ['component']\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n",
+    );
+    let report = fixture.report();
+    let mut reached = report
+        .callsites
+        .iter()
+        .map(|callsite| {
+            (
+                format!("{:?}", callsite.factory_arguments["items"]),
+                callsite.reachability,
+            )
+        })
+        .collect::<Vec<_>>();
+    reached.sort_by(|left, right| left.0.cmp(&right.0));
+    let items = |item: &str| format!("[Array {{ elements: [String {{ value: \"{item}\" }}] }}]");
+    // A screen's `component`, the component its `getComponent` returns through `require()`, and
+    // a screen's function child holding another navigator, from a curried factory, all render.
+    assert_eq!(
+        reached,
+        [
+            (items("Inner"), Reachability::Reachable),
+            (items("Settings"), Reachability::Reachable),
+            (items("Tabs"), Reachability::Reachable)
+        ]
+    );
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,

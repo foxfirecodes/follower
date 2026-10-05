@@ -284,10 +284,28 @@ props_path = ["props"]
 module = "@sample/overlay"
 export = "openModal"
 render_argument = 0
+
+# const Stack = createStack(); <Stack.Screen component={Panel} /> or getComponent={() => Panel}
+[[component_consumers]]
+module = "@sample/navigation"
+export = "createStack"
+member = "Screen"
+component_props = ["component"]
+render_props = ["getComponent"]
+invoke_children = true
+
+[[component_consumers]]
+module = "@sample/navigation"
+export = "createStack"
+member = "Navigator"
+forward_children = true
 ```
 
 A consumer contract explores the named render callback, component prop, children, or a
-function-valued child as a possible render. It applies to a JSX tag imported from its module and
+function-valued child as a possible render; a render callback may return the element or a component
+to render. With `member`, the export is a factory and the contract applies to tags that are that
+member of what it returns, as `Stack.Screen` for `const Stack = createStack()`; with
+`curried = true`, of what the call of its result returns, as `createFactory(View)(config)`. It applies to a JSX tag imported from its module and
 export, and to any tag whose import passes through that export on the way to its definition, so
 a contract on a package export also covers barrels that re-export it under the same name. A wrapper contract says the returned component may
 render the component at the given argument index; with `curried = true`, the export returns the
