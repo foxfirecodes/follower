@@ -43,6 +43,10 @@ pub struct ComponentWrapper {
     pub module: String,
     pub export: String,
     pub component_argument: usize,
+    /// Whether the export returns the wrapper, as in `connect(mapState)(Component)`, so
+    /// `component_argument` is a position in the call of its result.
+    #[serde(default)]
+    pub curried: bool,
 }
 
 /// An imported component that may render one or more of its props.
@@ -174,15 +178,20 @@ impl ProjectConfig {
             .map(|factory| factory.promise_property.as_str())
     }
 
+    /// The wrapper a call's callee is: the export itself, or for a curried wrapper, a call of it.
     pub fn component_wrapper<'a>(
         &'a self,
         file: &FlowFileIr,
         callee: &FlowExpression,
     ) -> Option<&'a ComponentWrapper> {
+        let (callee, curried) = match &callee.kind {
+            FlowExpressionKind::Call { callee, .. } => (callee.as_ref(), true),
+            _ => (callee, false),
+        };
         let (module, export) = self.imported_export(file, callee)?;
-        self.component_wrappers
-            .iter()
-            .find(|model| model.module == module && model.export == export)
+        self.component_wrappers.iter().find(|model| {
+            model.module == module && model.export == export && model.curried == curried
+        })
     }
 
     pub fn component_consumer<'a>(

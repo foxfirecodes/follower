@@ -1103,6 +1103,69 @@ fn callsite_walk_parses_the_files_the_text_filter_skipped() {
 }
 
 #[test]
+fn callsite_walk_follows_configured_component_wrappers() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/Panel.tsx",
+            "export default function Panel({ onDone }) { return <button onClick={() => onDone('panel')} />; }",
+        ),
+        (
+            "src/Card.tsx",
+            "export default function Card({ onDone }) { return <button onClick={() => onDone('card')} />; }",
+        ),
+        (
+            "src/Connected.tsx",
+            "import { connect } from 'external-store'; import Panel from './Panel'; export default connect([], () => ({}))(Panel);",
+        ),
+        (
+            "src/Themed.tsx",
+            "import { withTheme, connect } from 'external-store'; import Card from './Card'; export const Themed = withTheme(connect([])(Card));",
+        ),
+        (
+            "src/App.tsx",
+            "import Connected from './Connected'; import { Themed } from './Themed'; import { useItemSelection } from './hook'; function Shown() { const [, apply] = useItemSelection(['shown']); return <div><Connected onDone={apply} /><Themed onDone={apply} /></div>; } export function App() { return <Shown />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n[[component_wrappers]]\nmodule = 'external-store'\nexport = 'connect'\ncomponent_argument = 0\ncurried = true\n[[component_wrappers]]\nmodule = 'external-store'\nexport = 'withTheme'\ncomponent_argument = 0\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    let mut actions = callsite
+        .capability
+        .calls
+        .iter()
+        .flat_map(|call| &call.arguments["action"])
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>();
+    actions.sort();
+    assert_eq!(
+        actions,
+        [
+            "String { value: \"card\" }",
+            "String { value: \"panel\" }"
+        ]
+    );
+    // The props of a wrapped component are followed into the component, through a curried
+    // wrapper and through one wrapper around another.
+    assert!(
+        callsite.capability.escapes.is_empty(),
+        "{:?}",
+        callsite.capability.escapes
+    );
+    // Exploration renders the configured wrappers' components too.
+    assert!(callsite.capability.calls.iter().all(|call| call.explored));
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,

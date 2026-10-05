@@ -799,9 +799,11 @@ impl Solver<'_> {
         let Some(&index) = self.global_bindings.get(symbol) else {
             return Vec::new();
         };
-        // `export default Panel` binds the default export to another name.
+        // `export default Panel` binds the default export to another name, and
+        // `export default connect(mapState)(Panel)` to a component a configured wrapper renders.
         if let Some((file_id, binding)) = self.globals_ir.get(index)
-            && let FlowExpressionKind::Identifier { name, .. } = &binding.value.kind
+            && let FlowExpressionKind::Identifier { name, .. } =
+                &self.wrapped_component(*file_id, &binding.value).kind
             && name != &symbol.name
         {
             let scopes = self.resolve_scopes(*file_id, &Imports::new(), name, None);
@@ -811,6 +813,21 @@ impl Solver<'_> {
         }
         self.lazy_scopes(index)
             .unwrap_or_else(|| vec![UseNode::Global(index)])
+    }
+
+    /// The component a value renders through configured wrappers, as `Panel` in
+    /// `withTheme(connect(mapState)(Panel))`, or the value itself.
+    fn wrapped_component<'e>(&self, file_id: FileId, mut value: &'e FlowExpression) -> &'e FlowExpression {
+        let Some(file) = self.symbol_linker.file(file_id) else {
+            return value;
+        };
+        while let FlowExpressionKind::Call { callee, arguments } = &value.kind
+            && let Some(wrapper) = self.project.config.component_wrapper(&file.flow, callee)
+            && let Some(component) = arguments.get(wrapper.component_argument)
+        {
+            value = component;
+        }
+        value
     }
 
     /// For a module binding built by a loader, such as `lazy(() => import('./Panel'))` or

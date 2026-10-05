@@ -242,6 +242,12 @@ module = "@sample/auth"
 export = "withAccess"
 component_argument = 0
 
+[[component_wrappers]]
+module = "@sample/store"
+export = "connect"
+component_argument = 0
+curried = true
+
 [[lazy_component_factories]]
 module = "@sample/lazy"
 export = "loadComponent"
@@ -252,7 +258,10 @@ A consumer contract explores the named render callback, component prop, children
 function-valued child as a possible render. It applies to a JSX tag imported from its module and
 export, and to any tag whose import passes through that export on the way to its definition, so
 a contract on a package export also covers barrels that re-export it under the same name. A wrapper contract says the returned component may
-render the component at the given argument index. A lazy factory contract recognizes a callback
+render the component at the given argument index; with `curried = true`, the export returns the
+wrapper, as in `connect(mapState)(Panel)`, and the index is in the call of its result. The callsite
+walk follows props of a wrapped component, such as `export default connect(mapState)(Panel)`,
+into `Panel`. A lazy factory contract recognizes a callback
 returning a literal `import()` and links its default export. These contracts describe possible
 paths, not guaranteed
 route matches, authorization, loading, or runtime rendering. Unconfigured imports and dynamic
