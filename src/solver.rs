@@ -807,6 +807,8 @@ struct Solver<'a> {
     corridor_files: BTreeSet<FileId>,
     /// Functions found by the backward use walk. Empty when no walk ran.
     use_chain: BTreeSet<FunctionKey>,
+    /// Closures by span, and whether their bodies name a function on the use chain.
+    closures_toward_factory: std::collections::HashMap<(u32, u32), bool>,
     /// Components already explored under an assumption, keyed by choice, component, and props.
     assumed_component_renders: BTreeSet<(Option<String>, String, u64)>,
     /// What exact paths from configured roots reached, for explaining unreached callsites.
@@ -982,6 +984,7 @@ impl<'a> Solver<'a> {
             entry_corridor: BTreeSet::new(),
             corridor_files: BTreeSet::new(),
             use_chain: BTreeSet::new(),
+            closures_toward_factory: std::collections::HashMap::new(),
             assumed_component_renders: BTreeSet::new(),
             reach: ExactReach::default(),
             interned_creations: std::collections::HashMap::new(),
@@ -2807,7 +2810,10 @@ impl<'a> Solver<'a> {
                     choice: self.current_choice.clone(),
                     heap_id: None,
                 };
-                if self.model.scan_callback_bodies && contains_capability(&value) {
+                if self.model.scan_callback_bodies
+                    && (contains_capability(&value)
+                        || self.closure_leads_toward_factory(file_id, &expression.span, body))
+                {
                     self.pending_callbacks.push(closure);
                 }
                 value
@@ -5505,6 +5511,36 @@ impl<'a> Solver<'a> {
             }
             _ => self.render(value.clone()),
         }
+    }
+
+    /// Whether a closure's body names a function on the use chain toward a factory callsite, such
+    /// as a click handler that opens a modal holding one. Running it may reach the callsite.
+    fn closure_leads_toward_factory(
+        &mut self,
+        file_id: FileId,
+        span: &SourceSpan,
+        body: &FlowArrowBody,
+    ) -> bool {
+        if self.use_chain.is_empty() {
+            return false;
+        }
+        let key = (span.file_id.0, span.start);
+        if let Some(&leads) = self.closures_toward_factory.get(&key) {
+            return leads;
+        }
+        let leads = callback_uses::body_names(body).iter().any(|name| {
+            match self.symbol_linker.resolve_binding(file_id, name) {
+                ValueResolution::Resolved(LinkedValue::Declaration(symbol)) => {
+                    self.use_chain.contains(&FunctionKey {
+                        file_id: symbol.file_id,
+                        name: symbol.name,
+                    })
+                }
+                _ => false,
+            }
+        });
+        self.closures_toward_factory.insert(key, leads);
+        leads
     }
 
     fn leads_toward_factory(&self, key: &FunctionKey) -> bool {

@@ -2942,6 +2942,38 @@ fn loaded_module(callback: &FlowExpression) -> Option<(String, String)> {
     }
 }
 
+/// The names a function body reads, calls, or renders as a JSX tag.
+pub(super) fn body_names(body: &FlowArrowBody) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| match &frames
+        .last()
+        .expect("visited frame")
+        .expression
+        .kind
+    {
+        FlowExpressionKind::Identifier { name, .. }
+        | FlowExpressionKind::JsxElement {
+            tag:
+                FlowJsxTag::Identifier {
+                    name,
+                    intrinsic: false,
+                    ..
+                }
+                | FlowJsxTag::Member { object: name, .. },
+            ..
+        } => {
+            names.insert(name.clone());
+        }
+        _ => {}
+    };
+    let body = match body {
+        FlowArrowBody::Statements { statements } => ScopeBody::Statements(statements),
+        FlowArrowBody::Expression { expression } => ScopeBody::Expression(expression),
+    };
+    visit_body(&body, &mut found);
+    names
+}
+
 /// The module and export a function body's first `return` loads.
 pub(super) fn statements_module(statements: &[FlowStatement]) -> Option<(String, String)> {
     statements

@@ -1383,6 +1383,43 @@ fn lazy_factories_follow_loaders_declared_by_name() {
 }
 
 #[test]
+fn handlers_that_lead_toward_a_callsite_run_as_possible_callbacks() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/ShareModal.tsx",
+            "import { useItemSelection } from './hook'; export function ShareModal() { const [, apply] = useItemSelection(['invite']); return <button onClick={() => apply('invited')} />; }",
+        ),
+        // Nothing in the model calls the handler: it goes to an unmodeled button.
+        (
+            "src/App.tsx",
+            "import * as React from 'react'; import { Button, openDialogDeferred } from 'external-ui'; import { ShareModal } from './ShareModal'; function openShare() { openDialogDeferred(() => Promise.resolve((props) => <ShareModal {...props} />)); } export function App() { const showModal = React.useCallback(() => { openShare(); }, []); return <Button onClick={showModal} />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n[[component_openers]]\nmodule = 'external-ui'\nexport = 'openDialogDeferred'\nrender_argument = 0\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\nscan_callback_bodies = true\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    // The handler renders no JSX itself, but it calls `openShare`, which is on the use chain
+    // toward the callsite, so it runs as a possible handler and the modal it opens renders.
+    assert_eq!(
+        callsite.reachability,
+        Reachability::Possible,
+        "{:?}",
+        report.unreached_callsites
+    );
+    assert!(callsite.capability.calls.iter().all(|call| call.explored));
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,

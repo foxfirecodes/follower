@@ -90,7 +90,9 @@ callbacks handed to opaque libraries or component props. Those calls are candida
 keeps a coverage gap because the consumer might never invoke the callback. The option also runs,
 after each component renders, the callbacks created during the render that carry the factory
 result and that nothing in the model called, such as handlers in intrinsic props other than
-`onClick` or in records passed elsewhere. They run with unknown arguments and at most possible
+`onClick` or in records passed elsewhere. When the backward use walk found a chain from a factory
+callsite toward the entry, a callback that names a function on that chain runs too, such as a
+click handler that calls a function opening a modal that holds a callsite. They run with unknown arguments and at most possible
 reachability, and invocation paths mark the step as `uncalled_callback`. A call that a budget cut
 short does not count as a call, and an unreached callsite's callbacks get their own render
 budget, so a large subtree cannot use it all first.
