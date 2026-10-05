@@ -342,7 +342,8 @@ route matches, authorization, loading, or runtime rendering. Exploration takes a
 as the value itself, so `import('./Panel')` gives the module's namespace when the module is parsed
 (and requests it otherwise), as `require('./Panel')` does: `const { default: Panel } = await import('./Panel')` and
 `import('./Panel').then((module) => module.Panel)` give the component, which a render-function
-opener contract then renders; `Promise.resolve(value)` gives the value. Unconfigured imports remain unknown. The backward walk still parses
+opener contract then renders; `Promise.resolve(value)` gives the value, and so does
+`Object.freeze(value)`. Unconfigured imports remain unknown. The backward walk still parses
 only candidate importer paths;
 class `render()` methods and direct `this.method()` calls can supply use edges without indexing
 every file.

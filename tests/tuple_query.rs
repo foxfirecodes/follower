@@ -1625,6 +1625,15 @@ fn declared_render_roots_and_calls_reach_what_no_entry_renders() {
             "src/StatusCategory.tsx",
             "import { createSection } from 'external-settings'; import { useNotice } from './useNotice'; export const StatusCategory = createSection('status', { useStatusLine: useNotice });",
         ),
+        // A frozen registry record whose fields hold a component.
+        (
+            "src/Banner.tsx",
+            "import { useItemSelection } from './hook'; export function Banner() { const [, apply] = useItemSelection(['banner']); return <button onClick={() => apply('banner_close')} />; }",
+        ),
+        (
+            "src/registry.tsx",
+            "import { Banner } from './Banner'; export const REGISTRY = Object.freeze({ banner: { component: Banner } });",
+        ),
         ("src/App.tsx", "export function App() { return null; }"),
     ]);
     fixture.write(
@@ -1632,6 +1641,7 @@ fn declared_render_roots_and_calls_reach_what_no_entry_renders() {
         "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n\
          [[render_roots]]\nmodule = 'src/SettingsModal.tsx'\nexport = 'default'\n\
          [[render_roots]]\nmodule = 'src/showSheet.tsx'\nexport = 'showSheet'\n\
+         [[render_roots]]\nmodule = 'src/registry.tsx'\nexport = 'REGISTRY'\n\
          [[render_calls]]\nmodule = 'external-settings'\nexport = 'createSection'\narguments = [1]\n\
          [[component_openers]]\nmodule = 'external-ui'\nexport = 'openSheet'\ncomponent_argument = 0\nprops_argument = 1\n",
     );
@@ -1658,6 +1668,7 @@ fn declared_render_roots_and_calls_reach_what_no_entry_renders() {
     assert_eq!(
         reached,
         [
+            (items("banner"), Reachability::Declared, true),
             (items("modal"), Reachability::Declared, true),
             (items("notice"), Reachability::Declared, true),
             (items("sheet"), Reachability::Declared, true)

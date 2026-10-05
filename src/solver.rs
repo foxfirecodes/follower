@@ -2727,6 +2727,15 @@ impl<'a> Solver<'a> {
                         file_id,
                     );
                 }
+                // `Object.freeze(value)` gives the value itself.
+                if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
+                    && property == "freeze"
+                    && matches!(&object.kind, FlowExpressionKind::Identifier { name, .. } if name == "Object")
+                    && !environment.contains_key("Object")
+                    && let Some(value) = arguments.first()
+                {
+                    return self.eval(value, environment, file_id);
+                }
                 // `Promise.resolve(value)` is the value, as `await` gives it.
                 if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
                     && property == "resolve"
