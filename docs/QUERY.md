@@ -73,8 +73,8 @@ are one row each without an item; when it has none, each item it requests gets t
 owner-readable page built from the CSV alone, so it shows exactly what an agent reading the CSV
 sees. It groups rows by item by default and can group by callsite, call file, argument, status, or
 enclosing function, with search over the shown columns, filters, a needs-review view (rows whose
-answer is not complete: a result not called or escaping, an unknown argument, or items not all
-known), and a column picker. A search that narrows to three groups or fewer opens them, and
+answer is not complete: a result not called or escaping, an escape whose calls are missing even at
+a callsite with calls, an unknown argument, or items not all known), and a column picker. A search that narrows to three groups or fewer opens them, and
 `report.html#q=Kind.A&group=callsite` opens with that search and grouping.
 
 Add `--html-report` to write an interactive, self-contained report to a new owner-readable file

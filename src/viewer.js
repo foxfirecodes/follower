@@ -36,8 +36,9 @@
     row.callsite = place(row.callsite_path, row.callsite_line);
     row.call = place(row.call_path, row.call_line);
   });
-  // A row needs review when the answer it gives is not complete.
-  const review = row => row.status !== 'called' || row.arguments_resolved === 'false' || row.item_complete === 'false' || row.row_kind === 'no_call';
+  // A row needs review when the answer it gives is not complete. An escape does too, even at a
+  // callsite with calls: the calls it leads to are missing from the list.
+  const review = row => row.status !== 'called' || row.arguments_resolved === 'false' || row.item_complete === 'false' || row.row_kind === 'no_call' || row.row_kind === 'escape';
 
   const app = document.getElementById('app');
   app.innerHTML = `<main class="shell">
@@ -83,7 +84,7 @@
   });
   const statuses = {};
   new Map(rows.map(row => [row.callsite, row.status])).forEach(status => { statuses[status] = (statuses[status] || 0) + 1; });
-  $('#triage').textContent = `Callsites by result: ${Object.entries(statuses).sort((a, b) => b[1] - a[1]).map(([status, count]) => `${count} ${status.replaceAll('_', ' ')}`).join(', ')}. "Needs review" shows rows whose answer is not complete: a result not called or escaping, an unknown argument, or items that are not all known.`;
+  $('#triage').textContent = `Callsites by result: ${Object.entries(statuses).sort((a, b) => b[1] - a[1]).map(([status, count]) => `${count} ${status.replaceAll('_', ' ')}`).join(', ')}. "Needs review" shows rows whose answer is not complete: a result not called or escaping, an escape whose calls are missing, an unknown argument, or items that are not all known.`;
 
   // Columns: the callsite and call places stand for their path and line columns.
   const allColumns = ['row_kind', ...(itemColumn ? [itemColumn, 'item_complete'] : []), 'callsite', 'enclosing', 'reachability', 'unreached_reason', 'status', 'call', ...argColumns, 'arguments_resolved', 'found', 'context', 'via', 'instance', 'conditions', 'unfollowed', 'note', ...header.filter(column => column.startsWith('factory.'))].filter(column => has(column) || column === 'callsite' || column === 'call');
