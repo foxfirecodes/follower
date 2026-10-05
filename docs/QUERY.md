@@ -424,7 +424,9 @@ props of the component the module exports; the path step names the call and modu
 inferred from the call's shape. Callers match through any import name, and a name destructured from
 a namespace, as in `export const { useNotice } = web` over `import * as web`, is the declaration it
 re-exports. When a hook's or parameter's callers are not parsed, the walk asks the next round to
-parse the files that import it, within the root phase's file budget. Each call made with the result
+parse the files that import it, and when a component or function it meets is in a file that is not
+parsed, such as one the text filter skipped, it asks for that file, within the root phase's file
+budget. Each call made with the result
 is in `calls`, with the functions it sits in (`context`, such as `the onClose prop of <Panel>`), how
 the result reached it (`via`, such as `prop onClose of <Panel>` or `returned by useNotice to
 Banner`), and the values of each projected invocation argument. An argument that reads no local

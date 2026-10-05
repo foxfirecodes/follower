@@ -1023,6 +1023,86 @@ fn callsite_walk_follows_function_children_refs_loaders_and_aliases() {
 }
 
 #[test]
+fn callsite_walk_parses_the_files_the_text_filter_skipped() {
+    // A chain of hooks that outlasts discovery's rounds, so the hook's last caller is parsed in
+    // the root phase, which follows only what root paths and the walk ask for. No file past the
+    // hook holds the filter term.
+    let mut files = vec![
+        (
+            "src/hook.ts".to_owned(),
+            HOOK.1.to_owned(),
+        ),
+        (
+            "src/useL0.ts".to_owned(),
+            "import { useItemSelection } from './hook'; export function useL0() { const [, apply] = useItemSelection(['shown']); return apply; }".to_owned(),
+        ),
+    ];
+    for level in 1..=7 {
+        files.push((
+            format!("src/useL{level}.ts"),
+            format!(
+                "import {{ useL{0} }} from './useL{0}'; export function useL{level}() {{ return useL{0}(); }}",
+                level - 1
+            ),
+        ));
+    }
+    files.extend(
+        [
+            (
+                "src/Menu.tsx",
+                "import Child from './Child'; import { useOpen } from './barrel'; import { useL7 } from './useL7'; export function Menu() { const close = useL7(); useOpen({ close }); return <Child onDone={close} />; }",
+            ),
+            (
+                "src/Child.tsx",
+                "export default function Child({ onDone }) { return <button onClick={() => onDone('child')} />; }",
+            ),
+            ("src/barrel.ts", "export { useOpen } from './useOpen';"),
+            (
+                "src/useOpen.ts",
+                "export function useOpen({ close }) { close('opened'); }",
+            ),
+            ("src/App.tsx", "export function App() { return null; }"),
+        ]
+        .map(|(path, source)| (path.to_owned(), source.to_owned())),
+    );
+    let files = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = TestProject::new(&files);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    let mut actions = callsite
+        .capability
+        .calls
+        .iter()
+        .flat_map(|call| &call.arguments["action"])
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>();
+    actions.sort();
+    assert_eq!(
+        actions,
+        [
+            "String { value: \"child\" }",
+            "String { value: \"opened\" }"
+        ],
+        "{:?}",
+        callsite.capability.escapes
+    );
+    assert!(callsite.capability.escapes.is_empty());
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,

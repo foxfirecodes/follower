@@ -991,6 +991,7 @@ impl Analyzer {
                 producer_paths: producers,
                 reachable_seed_callsites,
                 importer_requests,
+                walk_file_requests,
             } = crate::solver::execute_query(
                 &self.project,
                 &snapshot,
@@ -1013,8 +1014,10 @@ impl Analyzer {
                 );
             }
             // Importers the callsite walk needs, such as the callers of a hook that returns the
-            // factory result, are parsed like root requests.
-            let walk_requests = catalog.importers(&linker, &importer_requests, true);
+            // factory result, and files it needs, such as a component's module, are parsed like
+            // root requests.
+            let mut walk_requests = catalog.importers(&linker, &importer_requests, true);
+            walk_requests.extend(walk_file_requests);
             if let Some(phase) = &mut root_phase {
                 // Follow only what root paths read, plus components on the entry corridor.
                 let mut additions = Vec::new();

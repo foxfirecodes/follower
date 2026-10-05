@@ -5,6 +5,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    path::PathBuf,
     rc::Rc,
 };
 
@@ -117,6 +118,8 @@ enum Lead<'e> {
         span: SourceSpan,
         detail: String,
         context: Vec<String>,
+        /// Files outside the snapshot that following it needs, such as a component's module.
+        unparsed: BTreeSet<PathBuf>,
     },
     /// A use that is not a call, such as a comparison.
     Used,
@@ -222,7 +225,9 @@ struct Walk {
     /// Whether the result was used anywhere after the factory callsite binds it.
     used: bool,
     /// Files whose importers the walk needs but are not parsed, such as a hook's callers.
-    importer_requests: BTreeSet<std::path::PathBuf>,
+    importer_requests: BTreeSet<PathBuf>,
+    /// Files the walk needs but are not parsed, such as the module of a component it meets.
+    file_requests: BTreeSet<PathBuf>,
 }
 
 /// The parameters and body of a scope the walk can enter.
@@ -692,6 +697,7 @@ impl Solver<'_> {
         for candidate in &candidates {
             let mut walk = self.walk_capability(candidate, query, &graph);
             self.importer_requests.append(&mut walk.importer_requests);
+            self.walk_file_requests.append(&mut walk.file_requests);
             results.push(self.summarize_callsite(candidate, query, walk, &graph));
         }
         results
@@ -1024,6 +1030,7 @@ impl Solver<'_> {
                             span: span.clone(),
                             detail: format!("passed to {text}, which the walk does not follow"),
                             context: context_of(frames, index),
+                            unparsed: BTreeSet::new(),
                         },
                     }
                 } else {
@@ -1085,10 +1092,20 @@ impl Solver<'_> {
                     |prop| format!("prop {prop} of <{}>", tag_text(tag)),
                 );
                 if scopes.is_empty() {
+                    let unparsed = match tag {
+                        FlowJsxTag::Identifier { name, .. } => {
+                            self.unparsed_targets(file_id, imports, name)
+                        }
+                        FlowJsxTag::Member { object, .. } => {
+                            self.unparsed_targets(file_id, imports, object)
+                        }
+                        FlowJsxTag::Unsupported { .. } => BTreeSet::new(),
+                    };
                     Lead::Escape {
                         span: span.clone(),
                         detail: format!("{shown}, whose component the walk does not follow"),
                         context: context_of(frames, index),
+                        unparsed,
                     }
                 } else {
                     Lead::Enter {
@@ -1154,6 +1171,7 @@ impl Solver<'_> {
                             detail: "stored in a property, which the walk does not follow"
                                 .to_owned(),
                             context: context_of(frames, index),
+                            unparsed: BTreeSet::new(),
                         },
                     }
                 }
@@ -1161,6 +1179,7 @@ impl Solver<'_> {
                     span: frame.expression.span.clone(),
                     detail: "stored in a property, which the walk does not follow".to_owned(),
                     context: context_of(frames, index),
+                    unparsed: BTreeSet::new(),
                 },
             },
             Role::Other => Lead::Used,
@@ -1203,6 +1222,7 @@ impl Solver<'_> {
             escapes: Vec::new(),
             used: false,
             importer_requests: BTreeSet::new(),
+            file_requests: BTreeSet::new(),
         };
         let Some(start) = self.candidate_scope(candidate) else {
             return walk;
@@ -1551,6 +1571,8 @@ impl Solver<'_> {
                                 context,
                                 via,
                             ));
+                            walk.file_requests
+                                .append(&mut self.unparsed_targets(file_id, imports, &root));
                             continue;
                         };
                         if via.len() >= MAX_HOPS {
@@ -1659,9 +1681,11 @@ impl Solver<'_> {
                         span,
                         detail,
                         context,
+                        mut unparsed,
                     } => {
                         walk.used = true;
                         walk.escapes.push((span, detail, context, via));
+                        walk.file_requests.append(&mut unparsed);
                     }
                     OwnedLead::Used => walk.used |= !is_start,
                     OwnedLead::Unrelated => {}
@@ -1731,6 +1755,25 @@ impl Solver<'_> {
         if let Some(file) = self.symbol_linker.file(file_id) {
             walk.importer_requests.insert(file.path.clone());
         }
+    }
+
+    /// The files outside the snapshot that resolving a name from a file needs: the module a local
+    /// bound to `import()` loads, or the modules that linking the name reached.
+    fn unparsed_targets(&self, file_id: FileId, imports: &Imports, name: &str) -> BTreeSet<PathBuf> {
+        let Some((module, _)) = imports.get(name) else {
+            return self.symbol_linker.unparsed_link_targets(file_id, name);
+        };
+        self.symbol_linker
+            .file(file_id)
+            .and_then(|file| {
+                self.symbol_linker
+                    .import_resolutions(&file.path)
+                    .filter(|resolution| &resolution.specifier == module)
+                    .find_map(|resolution| resolution.resolved_path.clone())
+            })
+            .filter(|path| self.symbol_linker.file_at(path).is_none())
+            .into_iter()
+            .collect()
     }
 
     fn scope_span(&self, scope: &UseNode) -> SourceSpan {
@@ -2585,6 +2628,7 @@ enum OwnedLead {
         span: SourceSpan,
         detail: String,
         context: Vec<String>,
+        unparsed: BTreeSet<PathBuf>,
     },
     Used,
     Unrelated,
@@ -2627,10 +2671,12 @@ impl Lead<'_> {
                 span,
                 detail,
                 context,
+                unparsed,
             } => OwnedLead::Escape {
                 span,
                 detail,
                 context,
+                unparsed,
             },
             Lead::Call { .. } | Lead::Handler { .. } | Lead::Used => OwnedLead::Used,
             Lead::Unrelated => OwnedLead::Unrelated,

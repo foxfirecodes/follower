@@ -587,6 +587,8 @@ pub struct QueryPass {
     /// Files whose importers the callsite walk needs, such as a hook whose callers are not
     /// parsed.
     pub importer_requests: BTreeSet<std::path::PathBuf>,
+    /// Files the callsite walk needs, such as the module of a component the text filter skipped.
+    pub walk_file_requests: BTreeSet<std::path::PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -736,6 +738,7 @@ pub fn execute_query(
     let phase_start = Instant::now();
     solver.callsite_values = solver.callsite_values(query);
     let importer_requests = std::mem::take(&mut solver.importer_requests);
+    let walk_file_requests = std::mem::take(&mut solver.walk_file_requests);
     if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
         eprintln!(
             "query callsite values: {} ms",
@@ -757,6 +760,7 @@ pub fn execute_query(
         producer_paths,
         reachable_seed_callsites,
         importer_requests,
+        walk_file_requests,
     })
 }
 
@@ -822,6 +826,8 @@ struct Solver<'a> {
     callsite_values: Vec<QueryCallsiteValues>,
     /// Files whose importers the callsite walk needs.
     importer_requests: BTreeSet<std::path::PathBuf>,
+    /// Files the callsite walk needs.
+    walk_file_requests: BTreeSet<std::path::PathBuf>,
     /// Calls of each function in progress.
     active_functions: std::collections::HashMap<FunctionKey, usize>,
     /// Closures carrying a factory result, in creation order, until the render that created
@@ -985,6 +991,7 @@ impl<'a> Solver<'a> {
             unreached_callsites: Vec::new(),
             callsite_values: Vec::new(),
             importer_requests: BTreeSet::new(),
+            walk_file_requests: BTreeSet::new(),
             active_functions: std::collections::HashMap::new(),
             pending_callbacks: Vec::new(),
             uncalled_runs: std::collections::HashSet::new(),
