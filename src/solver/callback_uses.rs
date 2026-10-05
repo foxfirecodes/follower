@@ -147,6 +147,8 @@ struct FoundCall {
     via: Vec<String>,
     /// The call of the result inside the first wrapper this call goes through.
     inner: Option<SourceSpan>,
+    /// The last forwarding call the path went through, which this call replaces.
+    through: Option<SourceSpan>,
     /// Whether this call passes a wrapper's parameter on, so calls of the wrapper replace it.
     forwards: bool,
     /// The conditions the call runs under, along the whole path from the callsite.
@@ -219,6 +221,9 @@ struct Forward {
     sources: Vec<ArgumentSource>,
     /// The call of the result inside the first wrapper, where explored invocations are.
     inner: Option<SourceSpan>,
+    /// The last call on the way that passes a wrapper's parameter on; calls found through it
+    /// replace it.
+    through: Option<SourceSpan>,
 }
 
 /// An occurrence's outcome in the walk loop.
@@ -1072,6 +1077,19 @@ impl Solver<'_> {
         name: &str,
         member: Option<&str>,
     ) -> Vec<UseNode> {
+        // A local bound to a choice of names is any of them.
+        if member.is_none()
+            && let Some(names) = imports.choices.get(name)
+        {
+            let others = Imports {
+                modules: imports.modules.clone(),
+                choices: HashMap::new(),
+            };
+            return names
+                .iter()
+                .flat_map(|chosen| self.resolve_scopes(file_id, &others, chosen, None))
+                .collect();
+        }
         if let Some((module, export)) = imports.get(name) {
             let export = match (export, member) {
                 (None, Some(member)) => member,
@@ -1437,6 +1455,7 @@ impl Solver<'_> {
                 .map(|projection| ArgumentSource::Position(projection.index, None))
                 .collect(),
             inner: None,
+            through: None,
         });
         let mut queue = VecDeque::from([(
             start,
@@ -1614,6 +1633,7 @@ impl Solver<'_> {
                             context,
                             via: via.clone(),
                             inner: forward.inner.clone(),
+                            through: forward.through.clone(),
                             forwards: forwarded,
                             guards: here(),
                             instance: instance.clone(),
@@ -1629,6 +1649,7 @@ impl Solver<'_> {
                                     inner: Some(
                                         forward.inner.clone().unwrap_or_else(|| call.span.clone()),
                                     ),
+                                    through: Some(call.span.clone()),
                                 }),
                                 Some(format!("through {}", describe_arrow(frames, arrow))),
                                 here(),
@@ -1659,6 +1680,7 @@ impl Solver<'_> {
                             context,
                             via: via.clone(),
                             inner: forward.inner.clone(),
+                            through: forward.through.clone(),
                             forwards: false,
                             guards: here(),
                             instance: instance.clone(),
@@ -2597,11 +2619,14 @@ impl Solver<'_> {
             .collect::<BTreeMap<_, _>>();
         let mut calls = Vec::new();
         let mut covered = BTreeSet::new();
-        // A call that passes a wrapper's parameter on is replaced by the calls of the wrapper.
+        // A call that passes a wrapper's parameter on is replaced by the calls of the wrapper,
+        // at each level of wrappers.
         let wrapped = walk
             .calls
             .iter()
-            .filter_map(|call| call.inner.as_ref().map(span_key))
+            .flat_map(|call| [call.inner.as_ref(), call.through.as_ref()])
+            .flatten()
+            .map(span_key)
             .collect::<BTreeSet<_>>();
         covered.extend(wrapped.iter().copied());
         for call in walk.calls {
@@ -3205,14 +3230,76 @@ fn collect_array_elements(value: &QueryValue, elements: &mut Vec<QueryValue>) {
     }
 }
 
-/// Local names bound to a module loaded with `import()`: the module, and the export the name
-/// holds, or `None` for the namespace, as in `const module = await import('./Panel')`.
-type Imports = HashMap<String, (String, Option<String>)>;
+/// What a scope's locals name, for resolving them as components or modules.
+#[derive(Default)]
+struct Imports {
+    /// Locals bound to a module loaded with `import()`: the module, and the export the name
+    /// holds, or `None` for the namespace, as in `const module = await import('./Panel')`.
+    modules: HashMap<String, (String, Option<String>)>,
+    /// Locals bound to one of several names, as `const List = compact ? Grid : Rows`.
+    choices: HashMap<String, Vec<String>>,
+}
+
+impl Imports {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, name: &str) -> Option<&(String, Option<String>)> {
+        self.modules.get(name)
+    }
+
+    fn contains_key(&self, name: &str) -> bool {
+        self.modules.contains_key(name)
+    }
+
+    fn insert(&mut self, name: String, module: (String, Option<String>)) {
+        self.modules.insert(name, module);
+    }
+}
+
+/// The names an expression is one of, as `Grid` and `Rows` for `compact ? Grid : Rows`, when
+/// every alternative is a name.
+fn chosen_names(expression: &FlowExpression, names: &mut Vec<String>) -> bool {
+    match &expression.kind {
+        FlowExpressionKind::Identifier { name, .. } => {
+            names.push(name.clone());
+            true
+        }
+        FlowExpressionKind::Conditional {
+            consequent,
+            alternate,
+            ..
+        } => chosen_names(consequent, names) && chosen_names(alternate, names),
+        FlowExpressionKind::Logical {
+            left,
+            right,
+            operator: FlowLogicalOperator::Coalesce | FlowLogicalOperator::Or,
+        } => chosen_names(left, names) && chosen_names(right, names),
+        _ => false,
+    }
+}
 
 fn local_imports(body: &ScopeBody<'_>) -> Imports {
     let mut imports = Imports::new();
     let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
         let frame = frames.last().expect("visited frame");
+        if let Role::Bind(FlowPattern {
+            kind: FlowPatternKind::Identifier { name },
+            ..
+        }) = &frame.role
+            && matches!(
+                frame.expression.kind,
+                FlowExpressionKind::Conditional { .. } | FlowExpressionKind::Logical { .. }
+            )
+        {
+            let mut names = Vec::new();
+            if chosen_names(frame.expression, &mut names) {
+                names.retain(|chosen| chosen != name);
+                imports.choices.insert(name.clone(), names);
+            }
+            return;
+        }
         // `const Panel = require('./Panel').default` binds the export.
         if let (
             Role::Bind(FlowPattern {

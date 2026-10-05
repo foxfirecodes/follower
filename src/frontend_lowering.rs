@@ -1186,6 +1186,10 @@ impl Lowerer<'_> {
         if let Expression::StaticMemberExpression(member) = &call.callee
             && matches!(&member.object, Expression::ThisExpression(_))
             && let Some(class) = &self.current_class
+            // Only the class's own methods get the instance's props; `this.setState(...)` and
+            // other inherited methods are calls like any other.
+            && (self.class_members.contains_key(member.property.name.as_str())
+                || member.property.name == "render")
         {
             arguments.insert(
                 0,

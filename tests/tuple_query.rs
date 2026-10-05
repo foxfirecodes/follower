@@ -1758,6 +1758,76 @@ fn a_render_root_that_does_not_resolve_is_an_error() {
 }
 
 #[test]
+fn callsite_walk_ignores_set_state_follows_chosen_components_and_nested_wrappers() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        // A class that calls `this.setState`, which does not take the instance's props.
+        (
+            "src/Sidebar.tsx",
+            "import * as React from 'react'; import { Tooltips } from './Tooltips'; export class Sidebar extends React.Component { componentDidMount() { this.setState({ open: true }); } render() { return <Tooltips descriptor={this.props.descriptor} />; } }",
+        ),
+        (
+            "src/Tooltips.tsx",
+            "export function Tooltips({ descriptor }) { return <button onClick={() => descriptor.apply('tooltip')} />; }",
+        ),
+        (
+            "src/Grid.tsx",
+            "export function Grid({ onDone }) { return <button onClick={() => onDone('grid')} />; }",
+        ),
+        (
+            "src/Rows.tsx",
+            "export function Rows({ onDone }) { return <button onClick={() => onDone('rows')} />; }",
+        ),
+        // Two wrappers that each pass their parameter on.
+        (
+            "src/Sheet.tsx",
+            "export function Sheet({ onDone }) { const handle = (kind) => onDone(kind); return <button onClick={() => handle('sheet')} />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Sidebar } from './Sidebar'; import { Grid } from './Grid'; import { Rows } from './Rows'; import { Sheet } from './Sheet'; import { useItemSelection } from './hook'; function Shown({ compact }) { const [, apply] = useItemSelection(['shown']); const List = compact ? Grid : Rows; const outer = (kind) => apply(kind); return <div><Sidebar descriptor={{ apply }} /><List onDone={apply} /><Sheet onDone={outer} /></div>; } export function App() { return <Shown />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    let mut actions = callsite
+        .capability
+        .calls
+        .iter()
+        .map(|call| format!("{:?}", call.arguments["action"]))
+        .collect::<Vec<_>>();
+    actions.sort();
+    // The calls inside both wrappers are replaced by the wrappers' calls, both components a
+    // local may be are followed, and `this.setState` is not an escape.
+    assert_eq!(
+        actions,
+        [
+            "[String { value: \"grid\" }]",
+            "[String { value: \"rows\" }]",
+            "[String { value: \"sheet\" }]",
+            "[String { value: \"tooltip\" }]"
+        ],
+        "{:?}",
+        callsite.capability.escapes
+    );
+    assert!(
+        callsite.capability.escapes.is_empty(),
+        "{:?}",
+        callsite.capability.escapes
+    );
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,
