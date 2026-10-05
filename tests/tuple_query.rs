@@ -1680,6 +1680,60 @@ fn declared_render_roots_and_calls_reach_what_no_entry_renders() {
 }
 
 #[test]
+fn declared_render_roots_reach_callsites_off_the_entry_chain() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/Inner.tsx",
+            "import { useItemSelection } from './hook'; export function Inner() { const [, apply] = useItemSelection(['inner']); return <button onClick={() => apply('inner_close')} />; }",
+        ),
+        // No filter term, and nothing the entry renders uses it.
+        (
+            "src/Outer.tsx",
+            "import { Inner } from './Inner'; export function Outer() { return <div><Inner /></div>; }",
+        ),
+        (
+            "src/Other.tsx",
+            "import { useItemSelection } from './hook'; export function Other() { const [, apply] = useItemSelection(['other']); return <button onClick={() => apply('other_close')} />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Other } from './Other'; export function App() { return <Other />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n[[render_roots]]\nmodule = 'src/Outer.tsx'\nexport = 'Outer'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n",
+    );
+    let report = fixture.report();
+    let mut reached = report
+        .callsites
+        .iter()
+        .map(|callsite| {
+            (
+                format!("{:?}", callsite.factory_arguments["items"]),
+                callsite.reachability,
+            )
+        })
+        .collect::<Vec<_>>();
+    reached.sort_by(|left, right| left.0.cmp(&right.0));
+    let items = |item: &str| format!("[Array {{ elements: [String {{ value: \"{item}\" }}] }}]");
+    // The entry's path explores only toward callsites the backward walk tied to it; a declared
+    // root explores what statically leads to any callsite.
+    assert_eq!(
+        reached,
+        [
+            (items("inner"), Reachability::Declared),
+            (items("other"), Reachability::Reachable)
+        ]
+    );
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,

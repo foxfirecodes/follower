@@ -859,6 +859,8 @@ struct Solver<'a> {
     /// Whether exploration runs from a render root or render call the project declares, so what
     /// it reaches is declared rather than reached from an entry.
     declared_render: bool,
+    /// During declared renders, the functions that lead to a factory callsite by static uses.
+    factory_ancestors: std::collections::HashSet<FunctionKey>,
     assumed_renders: Vec<(SourceSpan, Assumption)>,
     /// Boundary keys for `assumed_renders`, one per entry.
     assumed_boundaries: Vec<Rc<str>>,
@@ -1015,6 +1017,7 @@ impl<'a> Solver<'a> {
             current_choice: None,
             current_reachability: Reachability::Reachable,
             declared_render: false,
+            factory_ancestors: std::collections::HashSet::new(),
             assumed_renders: Vec::new(),
             assumed_boundaries: Vec::new(),
             boundaries: BTreeMap::new(),
@@ -1153,6 +1156,9 @@ impl<'a> Solver<'a> {
             starts.push((resolution, span));
         }
         let calls = self.declared_render_calls();
+        // No path from an entry leads here, so the backward walk's chain may not either; prune
+        // by what statically leads to a callsite instead.
+        self.factory_ancestors = self.factory_ancestors();
         self.prepare_globals(None);
         self.current_choice = Some("<declared>".to_owned());
         self.current_reachability = Reachability::Possible;
@@ -5734,6 +5740,9 @@ impl<'a> Solver<'a> {
     }
 
     fn leads_toward_factory(&self, key: &FunctionKey) -> bool {
+        if self.declared_render && self.factory_ancestors.contains(key) {
+            return true;
+        }
         if !self.use_chain.is_empty() {
             return self.use_chain.contains(key) || self.corridor_files.is_empty();
         }

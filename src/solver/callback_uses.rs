@@ -713,6 +713,33 @@ impl Solver<'_> {
         results
     }
 
+    /// The functions that, by the static uses in the parsed files, lead to a matching factory
+    /// callsite: each callsite's function and every function that uses one of those.
+    pub(super) fn factory_ancestors(&self) -> HashSet<FunctionKey> {
+        let graph = self.use_graph();
+        let mut seen = HashSet::new();
+        let mut queue = self
+            .factory_candidates()
+            .into_iter()
+            .filter(|candidate| self.expression_matches_model(candidate.file_id, &candidate.callee))
+            .filter_map(|candidate| self.candidate_scope(&candidate))
+            .collect::<VecDeque<_>>();
+        while let Some(node) = queue.pop_front() {
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            for edge in graph.get(&node).into_iter().flatten() {
+                queue.push_back(edge.user.clone());
+            }
+        }
+        seen.into_iter()
+            .filter_map(|node| match node {
+                UseNode::Function(key) => Some(key),
+                UseNode::Global(_) => None,
+            })
+            .collect()
+    }
+
     /// The scope that holds a factory callsite.
     fn candidate_scope(&self, candidate: &FactoryCallCandidate) -> Option<UseNode> {
         candidate.enclosing_function.clone().map_or_else(
