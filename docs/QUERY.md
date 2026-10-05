@@ -133,6 +133,9 @@ source_roots = [
   "generated/itemKinds.ts",
 ]
 source_contains_any = ["useItemSelection", "applyAction"]
+# For a React Native run: try `Panel.ios.tsx`, then `Panel.native.tsx`, then `Panel.tsx`.
+platform_extensions = [".ios", ".native"]
+source_excludes = ["**/web/**", "**/*.web.tsx", "**/*.android.tsx"]
 
 [import_aliases]
 "@sample/*" = "src/*"
@@ -144,7 +147,13 @@ callback_argument = 1
 ```
 
 Alias targets are relative to the project TOML directory unless absolute. Both exact names and
-single-`*` patterns are supported. Source roots can be directories or individual TS/JS files;
+single-`*` patterns are supported. `platform_extensions` lists the suffixes an import tries, in
+order, before the plain file, as a bundler for one platform does, so code with `Panel.web.tsx` and
+`Panel.native.tsx` beside each other runs once per platform with its own project config. Without
+them, `./Panel` resolves only to `Panel.tsx`, which in such code may be a type-checking stand-in
+that re-exports one platform's file. `source_excludes` skips files in the directory walk by glob,
+where `**` matches any number of path segments and `*` any characters within one, matched against
+the full path; an excluded file is still parsed when an import resolves to it. Source roots can be directories or individual TS/JS files;
 they are canonicalized before symbol linkage. `source_contains_any` is a fast text prefilter for
 directory roots; explicitly listed files are always included. It lets a query search a
 broad directory without parsing every source file. During a query, callback-bearing calls and JSX

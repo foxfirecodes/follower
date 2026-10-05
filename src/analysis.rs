@@ -299,14 +299,16 @@ impl SourceCatalog {
                     if dotted && let Some((first, _)) = stem.split_once('.') {
                         names.push(first.to_owned());
                     }
-                    if stem == "index" {
-                        if let Some(parent) = path
+                    if let Some(unsuffixed) = linker.unsuffixed_stem(stem) {
+                        names.push(unsuffixed.to_owned());
+                    }
+                    if stem == "index"
+                        && let Some(parent) = path
                             .parent()
                             .and_then(Path::file_name)
                             .and_then(|name| name.to_str())
-                        {
-                            names.push(parent.to_owned());
-                        }
+                    {
+                        names.push(parent.to_owned());
                     }
                 }
                 names

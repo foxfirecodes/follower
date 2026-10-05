@@ -43,22 +43,34 @@ pub struct ModuleLinker {
     project_root: PathBuf,
     import_aliases: std::collections::BTreeMap<String, String>,
     canonical_paths: RefCell<HashMap<PathBuf, PathBuf>>,
+    platform_extensions: Vec<String>,
 }
+
+const SOURCE_EXTENSIONS: [&str; 9] = [
+    ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json",
+];
 
 impl ModuleLinker {
     pub fn new(project: &Project) -> Self {
+        // Each platform suffix in order, then the plain file, as React Native and web bundlers
+        // resolve `./Panel` to `Panel.native.tsx` or `Panel.web.tsx` before `Panel.tsx`.
+        let extensions = project
+            .config
+            .platform_extensions
+            .iter()
+            .flat_map(|platform| {
+                SOURCE_EXTENSIONS
+                    .iter()
+                    .map(move |extension| format!("{platform}{extension}"))
+            })
+            .chain(
+                SOURCE_EXTENSIONS
+                    .iter()
+                    .map(|&extension| extension.to_owned()),
+            )
+            .collect();
         let options = ResolveOptions {
-            extensions: vec![
-                ".ts".into(),
-                ".tsx".into(),
-                ".mts".into(),
-                ".cts".into(),
-                ".js".into(),
-                ".jsx".into(),
-                ".mjs".into(),
-                ".cjs".into(),
-                ".json".into(),
-            ],
+            extensions,
             condition_names: project.config.resolution_conditions.clone(),
             ..ResolveOptions::default()
         };
@@ -67,7 +79,16 @@ impl ModuleLinker {
             project_root: project.root.clone(),
             import_aliases: project.config.import_aliases.clone(),
             canonical_paths: RefCell::new(HashMap::new()),
+            platform_extensions: project.config.platform_extensions.clone(),
         }
+    }
+
+    /// A file stem without its platform suffix, as `Panel` for `Panel.native`, which is how
+    /// importers name the file.
+    pub fn unsuffixed_stem<'s>(&self, stem: &'s str) -> Option<&'s str> {
+        self.platform_extensions
+            .iter()
+            .find_map(|platform| stem.strip_suffix(platform.as_str()))
     }
 
     fn canonical_path(&self, path: PathBuf) -> PathBuf {

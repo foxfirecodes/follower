@@ -1420,6 +1420,66 @@ fn handlers_that_lead_toward_a_callsite_run_as_possible_callbacks() {
 }
 
 #[test]
+fn platform_extensions_resolve_imports_to_one_platform() {
+    let files = [
+        HOOK,
+        (
+            "src/Panel.web.tsx",
+            "import { useItemSelection } from './hook'; export function Panel() { const [, apply] = useItemSelection(['web']); apply('web_call'); return null; }",
+        ),
+        (
+            "src/Panel.native.tsx",
+            "import { useItemSelection } from './hook'; export function Panel() { const [, apply] = useItemSelection(['native']); apply('native_call'); return null; }",
+        ),
+        (
+            "src/web/Only.tsx",
+            "import { useItemSelection } from '../hook'; export function Only() { const [, apply] = useItemSelection(['web_dir']); apply('web_dir_call'); return null; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Panel } from './Panel'; export function App() { return <Panel />; }",
+        ),
+    ];
+    let query = "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n";
+    let run = |platform: &str, excludes: &str| {
+        let fixture = TestProject::new(&files);
+        fixture.write(
+            "flow.toml",
+            &format!(
+                "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nplatform_extensions = [{platform}]\nsource_excludes = [{excludes}]\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n"
+            ),
+        );
+        fixture.write("query.toml", query);
+        let mut reached = fixture
+            .report()
+            .callsites
+            .iter()
+            .map(|callsite| {
+                (
+                    format!("{:?}", callsite.factory_arguments["items"]),
+                    callsite.reachability,
+                )
+            })
+            .collect::<Vec<_>>();
+        reached.sort_by(|left, right| left.0.cmp(&right.0));
+        reached
+    };
+    let items = |item: &str| format!("[Array {{ elements: [String {{ value: \"{item}\" }}] }}]");
+    // `./Panel` resolves to the native file, and the excluded web files are not callsites.
+    assert_eq!(
+        run("'.ios', '.native'", "'**/web/**', '**/*.web.tsx'"),
+        [(items("native"), Reachability::Reachable)]
+    );
+    assert_eq!(
+        run("'.web'", "'**/*.native.tsx'"),
+        [
+            (items("web"), Reachability::Reachable),
+            (items("web_dir"), Reachability::Unknown)
+        ]
+    );
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,

@@ -111,6 +111,15 @@ pub struct ProjectConfig {
     pub model_files: Vec<PathBuf>,
     #[serde(default)]
     pub resolution_conditions: Vec<String>,
+    /// Platform suffixes an import tries before the plain file, in order, as `[".ios", ".native"]`
+    /// resolves `./Panel` to `Panel.ios.tsx`, then `Panel.native.tsx`, then `Panel.tsx`.
+    #[serde(default)]
+    pub platform_extensions: Vec<String>,
+    /// Paths the source walk skips, where `**` matches any number of path segments and `*` any
+    /// characters within one, as `**/web/**` or `**/*.web.tsx`. Matched against the file's full
+    /// path. A skipped file is still parsed when an import resolves to it.
+    #[serde(default)]
+    pub source_excludes: Vec<String>,
     #[serde(default)]
     pub import_aliases: BTreeMap<String, String>,
     #[serde(default)]
@@ -252,6 +261,15 @@ pub struct Project {
 }
 
 impl Project {
+    /// Whether the source walk skips a file, by `source_excludes`.
+    pub(crate) fn excluded(&self, path: &Path) -> bool {
+        let path = path.to_string_lossy();
+        self.config
+            .source_excludes
+            .iter()
+            .any(|pattern| glob_matches(pattern, &path))
+    }
+
     pub fn load(config_path: impl AsRef<Path>) -> Result<Self> {
         let config_path = config_path.as_ref().canonicalize().with_context(|| {
             format!(
@@ -297,56 +315,7 @@ impl Project {
                 );
             }
         }
-        for selector in &config.callback_selector_imports {
-            if selector.module.trim().is_empty() || selector.export.trim().is_empty() {
-                bail!("callback selector imports need a module and export name");
-            }
-        }
-        for factory in &config.lazy_component_factories {
-            if factory.module.trim().is_empty()
-                || factory.export.trim().is_empty()
-                || factory.promise_property.trim().is_empty()
-            {
-                bail!("lazy component factories need a module, export, and promise_property");
-            }
-        }
-        for wrapper in &config.component_wrappers {
-            if wrapper.module.trim().is_empty() || wrapper.export.trim().is_empty() {
-                bail!("component wrappers need a module and export");
-            }
-        }
-        for opener in &config.component_openers {
-            if opener.module.trim().is_empty() || opener.export.trim().is_empty() {
-                bail!("component openers need a module and export");
-            }
-            if opener.component_argument.is_none() && opener.render_argument.is_none() {
-                bail!("component openers need a component_argument or a render_argument");
-            }
-            if opener.component_argument.is_none()
-                && (opener.props_argument.is_some() || !opener.props_path.is_empty())
-            {
-                bail!("component opener props need a component_argument");
-            }
-            if opener.props_path.iter().any(|step| step.trim().is_empty()) {
-                bail!("component opener props_path steps cannot be empty");
-            }
-        }
-        for consumer in &config.component_consumers {
-            if consumer.module.trim().is_empty()
-                || consumer.export.trim().is_empty()
-                || consumer
-                    .render_props
-                    .iter()
-                    .chain(&consumer.component_props)
-                    .any(|prop| prop.trim().is_empty())
-                || consumer
-                    .render_callback_names
-                    .iter()
-                    .any(|name| name.trim().is_empty())
-            {
-                bail!("component consumers need a module, export, and nonempty prop names");
-            }
-        }
+        validate_contracts(&config)?;
         let config_hash = hex::encode(Sha256::digest(source.as_bytes()));
         Ok(Self {
             config_path,
@@ -422,7 +391,10 @@ impl Project {
             for entry in WalkDir::new(&root).follow_links(false) {
                 let entry =
                     entry.with_context(|| format!("failed while walking {}", root.display()))?;
-                if entry.file_type().is_file() && is_source_file(entry.path()) {
+                if entry.file_type().is_file()
+                    && is_source_file(entry.path())
+                    && !self.excluded(entry.path())
+                {
                     files.push(SourceCandidate {
                         path: entry.path().to_path_buf(),
                         text_filtered: true,
@@ -462,6 +434,101 @@ pub(crate) struct SourceCandidate {
     pub text_filtered: bool,
 }
 
+/// Checks the contracts and resolution settings a project configuration declares.
+fn validate_contracts(config: &ProjectConfig) -> Result<()> {
+    for selector in &config.callback_selector_imports {
+        if selector.module.trim().is_empty() || selector.export.trim().is_empty() {
+            bail!("callback selector imports need a module and export name");
+        }
+    }
+    for factory in &config.lazy_component_factories {
+        if factory.module.trim().is_empty()
+            || factory.export.trim().is_empty()
+            || factory.promise_property.trim().is_empty()
+        {
+            bail!("lazy component factories need a module, export, and promise_property");
+        }
+    }
+    for wrapper in &config.component_wrappers {
+        if wrapper.module.trim().is_empty() || wrapper.export.trim().is_empty() {
+            bail!("component wrappers need a module and export");
+        }
+    }
+    for extension in &config.platform_extensions {
+        if !extension.starts_with('.') || extension.len() < 2 || extension.contains('/') {
+            bail!("platform extensions must look like \".native\": {extension:?}");
+        }
+    }
+    if config
+        .source_excludes
+        .iter()
+        .any(|pattern| pattern.trim().is_empty())
+    {
+        bail!("source excludes cannot be empty");
+    }
+    for opener in &config.component_openers {
+        if opener.module.trim().is_empty() || opener.export.trim().is_empty() {
+            bail!("component openers need a module and export");
+        }
+        if opener.component_argument.is_none() && opener.render_argument.is_none() {
+            bail!("component openers need a component_argument or a render_argument");
+        }
+        if opener.component_argument.is_none()
+            && (opener.props_argument.is_some() || !opener.props_path.is_empty())
+        {
+            bail!("component opener props need a component_argument");
+        }
+        if opener.props_path.iter().any(|step| step.trim().is_empty()) {
+            bail!("component opener props_path steps cannot be empty");
+        }
+    }
+    for consumer in &config.component_consumers {
+        if consumer.module.trim().is_empty()
+            || consumer.export.trim().is_empty()
+            || consumer
+                .render_props
+                .iter()
+                .chain(&consumer.component_props)
+                .any(|prop| prop.trim().is_empty())
+            || consumer
+                .render_callback_names
+                .iter()
+                .any(|name| name.trim().is_empty())
+        {
+            bail!("component consumers need a module, export, and nonempty prop names");
+        }
+    }
+    Ok(())
+}
+
+/// Whether a path matches a pattern in which `**` matches any number of path segments and `*`
+/// any characters within one segment.
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    fn segments(pattern: &[&str], path: &[&str]) -> bool {
+        match pattern.split_first() {
+            None => path.is_empty(),
+            Some((&"**", rest)) => (0..=path.len()).any(|skip| segments(rest, &path[skip..])),
+            Some((first, rest)) => path.split_first().is_some_and(|(segment, others)| {
+                segment_matches(first, segment) && segments(rest, others)
+            }),
+        }
+    }
+    fn segment_matches(pattern: &str, text: &str) -> bool {
+        match pattern.split_once('*') {
+            None => pattern == text,
+            Some((prefix, rest)) => text.strip_prefix(prefix).is_some_and(|tail| {
+                tail.char_indices()
+                    .map(|(index, _)| index)
+                    .chain(std::iter::once(tail.len()))
+                    .any(|index| segment_matches(rest, &tail[index..]))
+            }),
+        }
+    }
+    let pattern = pattern.split('/').collect::<Vec<_>>();
+    let path = path.split('/').collect::<Vec<_>>();
+    segments(&pattern, &path)
+}
+
 pub(crate) fn is_source_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
@@ -476,12 +543,35 @@ pub(crate) fn is_source_file(path: &Path) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::is_source_file;
+    use super::{glob_matches, is_source_file};
 
     #[test]
     fn source_filter_excludes_declaration_files() {
         assert!(is_source_file(Path::new("Host.tsx")));
         assert!(!is_source_file(Path::new("types.d.ts")));
         assert!(!is_source_file(Path::new("package.json")));
+    }
+
+    #[test]
+    fn glob_patterns_match_segments_and_any_depth() {
+        assert!(glob_matches(
+            "**/web/**",
+            "/repo/modules/panel/web/Panel.tsx"
+        ));
+        assert!(!glob_matches(
+            "**/web/**",
+            "/repo/modules/panel/native/Panel.tsx"
+        ));
+        assert!(glob_matches("**/*.web.tsx", "/repo/modules/Panel.web.tsx"));
+        assert!(!glob_matches(
+            "**/*.web.tsx",
+            "/repo/modules/Panel.native.tsx"
+        ));
+        assert!(glob_matches("/repo/*/Panel.tsx", "/repo/modules/Panel.tsx"));
+        assert!(!glob_matches(
+            "/repo/*/Panel.tsx",
+            "/repo/modules/panel/Panel.tsx"
+        ));
+        assert!(glob_matches("**", "/repo/Panel.tsx"));
     }
 }
