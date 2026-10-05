@@ -295,8 +295,12 @@ caller's path. The walk follows a render function's JSX in the source without a 
 JSX is written where the result is. A lazy factory contract recognizes a callback
 returning a literal `import()` and links its default export. These contracts describe possible
 paths, not guaranteed
-route matches, authorization, loading, or runtime rendering. Unconfigured imports and dynamic
-import expressions remain unknown. The backward walk still parses only candidate importer paths;
+route matches, authorization, loading, or runtime rendering. Exploration takes an awaited value
+as the value itself, so `import('./Panel')` gives the module's namespace when the module is parsed
+(and requests it otherwise): `const { default: Panel } = await import('./Panel')` and
+`import('./Panel').then((module) => module.Panel)` give the component, which a render-function
+opener contract then renders. Unconfigured imports remain unknown. The backward walk still parses
+only candidate importer paths;
 class `render()` methods and direct `this.method()` calls can supply use edges without indexing
 every file.
 Object-rest props, JSX fragments, and configured member tags can forward children through the

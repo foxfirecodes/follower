@@ -2549,6 +2549,17 @@ impl<'a> Solver<'a> {
                         file_id,
                     );
                 }
+                // `import('./Panel').then((module) => module.Panel)` calls the callback with the
+                // module, as `await` gives it.
+                if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
+                    && property == "then"
+                    && matches!(object.kind, FlowExpressionKind::DynamicImport { .. })
+                    && let Some(callback) = arguments.first()
+                {
+                    let module = self.eval(object, environment, file_id);
+                    let callback = self.eval(callback, environment, file_id);
+                    return self.invoke_value(callback, vec![module], expression.span.clone());
+                }
                 if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
                     && property == "values"
                     && matches!(&object.kind, FlowExpressionKind::Identifier { name, .. } if name == "Object")
@@ -2793,9 +2804,10 @@ impl<'a> Solver<'a> {
                 self.note_exact_site(&expression.span);
                 self.create_element(tag, props, expression, environment, file_id)
             }
-            FlowExpressionKind::DynamicImport { .. } => {
-                TrackedValue::unknown("unmodeled_dynamic_import")
-            }
+            // An awaited value is the value itself, so `import()` gives the module's namespace.
+            FlowExpressionKind::DynamicImport { module } => self
+                .module_namespace(file_id, module, &expression.span)
+                .unwrap_or_else(|| TrackedValue::unknown("unmodeled_dynamic_import")),
             FlowExpressionKind::Unsupported { syntax, references } => {
                 if syntax == "symbolic_for_of_iteration" {
                     self.record_coverage_gap(
@@ -5275,6 +5287,22 @@ impl<'a> Solver<'a> {
         export: &str,
         span: &SourceSpan,
     ) -> Option<TrackedValue> {
+        let AbstractValue::Namespace(module) = self.module_namespace(file_id, module, span)?.value
+        else {
+            return None;
+        };
+        let exported = self.symbol_linker.resolve_exported_value(module, export);
+        Some(self.linked_value(exported, span))
+    }
+
+    /// The namespace of a module, for a module specifier written in a file. A module that is not
+    /// parsed is requested, and gives `None` like one that does not resolve.
+    fn module_namespace(
+        &mut self,
+        file_id: FileId,
+        module: &str,
+        span: &SourceSpan,
+    ) -> Option<TrackedValue> {
         let target = self
             .symbol_linker
             .file(file_id)
@@ -5285,14 +5313,11 @@ impl<'a> Solver<'a> {
             })
             .and_then(|resolution| resolution.resolved_path.clone());
         let Some(target) = target else {
-            self.record_coverage_gap("component import did not resolve", span);
+            self.record_coverage_gap("module import did not resolve", span);
             return None;
         };
         if let Some(file) = self.symbol_linker.file_at(&target) {
-            let exported = self
-                .symbol_linker
-                .resolve_exported_value(file.file_id, export);
-            return Some(self.linked_value(exported, span));
+            return Some(TrackedValue::plain(AbstractValue::Namespace(file.file_id)));
         }
         if self.current_reachability != Reachability::Unknown {
             self.request_root_import(&target);
@@ -5397,6 +5422,10 @@ impl<'a> Solver<'a> {
             }
             _ => value.clone(),
         };
+        if let AbstractValue::Namespace(module) = loader.value {
+            let exported = self.symbol_linker.resolve_exported_value(module, "default");
+            return Some(self.linked_value(exported, span));
+        }
         let (module_file, (module, export)) = match &loader.value {
             AbstractValue::Function(key) => (
                 key.file_id,

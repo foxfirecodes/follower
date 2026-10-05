@@ -1266,6 +1266,67 @@ fn callsite_walk_follows_props_into_components_configured_openers_open() {
 }
 
 #[test]
+fn exploration_renders_what_render_function_openers_load() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/Modal.tsx",
+            "export default function Modal({ onClose }) { return <button onClick={() => onClose('modal')} />; }",
+        ),
+        (
+            "src/Menu.tsx",
+            "export default function Menu({ onDone }) { return <button onClick={() => onDone('menu')} />; }",
+        ),
+        (
+            "src/Sheet.tsx",
+            "export function Sheet({ onDone }) { return <button onClick={() => onDone('sheet')} />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { openDialogDeferred, openPopupDeferred, openSheet } from 'external-ui'; import { useItemSelection } from './hook'; function Shown() { const [, apply] = useItemSelection(['shown']); openDialogDeferred(async () => { const { default: Modal } = await import('./Modal'); return (props) => <Modal {...props} onClose={apply} />; }); openSheet(() => import('./Sheet').then((module) => module.Sheet), { onDone: apply }); return <button onClick={(event) => openPopupDeferred(event, async () => { const module = await import('./Menu'); return (props) => <module.default {...props} onDone={apply} />; })} />; } export function App() { return <Shown />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n[[component_openers]]\nmodule = 'external-ui'\nexport = 'openDialogDeferred'\nrender_argument = 0\n[[component_openers]]\nmodule = 'external-ui'\nexport = 'openPopupDeferred'\nrender_argument = 1\n[[component_openers]]\nmodule = 'external-ui'\nexport = 'openSheet'\ncomponent_argument = 0\nprops_argument = 1\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    let mut explored = callsite
+        .capability
+        .calls
+        .iter()
+        .filter(|call| call.explored)
+        .flat_map(|call| &call.arguments["action"])
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>();
+    explored.sort();
+    // An awaited `import()` is the module, so the render function's component is known; a
+    // loader's `.then` callback receives the module too.
+    assert_eq!(
+        explored,
+        [
+            "String { value: \"menu\" }",
+            "String { value: \"modal\" }",
+            "String { value: \"sheet\" }"
+        ],
+        "{:?}",
+        callsite.capability.calls
+    );
+    assert!(
+        callsite.capability.escapes.is_empty(),
+        "{:?}",
+        callsite.capability.escapes
+    );
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,
