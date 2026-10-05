@@ -953,6 +953,10 @@ fn callsite_walk_follows_function_children_refs_loaders_and_aliases() {
             "export default function Modal({ onClose }) { return <button onClick={() => onClose('modal')} />; }",
         ),
         (
+            "src/Panel.tsx",
+            "export default function Panel({ onClose }) { return <button onClick={() => onClose('panel')} />; }",
+        ),
+        (
             "src/platform.web.tsx",
             "import { useItemSelection } from './hook'; export function usePlatform() { return useItemSelection(['platform']); }",
         ),
@@ -966,7 +970,7 @@ fn callsite_walk_follows_function_children_refs_loaders_and_aliases() {
         ),
         (
             "src/App.tsx",
-            "import * as React from 'react'; import Selected from './Selected'; import { usePlatform } from './platform'; import useSharedBase from './shared'; import { openSheet, openModal } from 'external-open'; import { useItemSelection } from './hook'; function Child() { return <Selected>{({ apply }) => <button onClick={() => apply('child')} />}</Selected>; } function Platform() { const [, apply] = usePlatform(); apply('platform_call'); return null; } function Refs() { const [, apply] = useItemSelection(['refs']); const ref = React.useRef(apply); React.useEffect(() => { ref.current = apply; }); return <button onClick={() => ref.current('ref')} />; } function Lazy() { const [, apply] = useItemSelection(['lazy']); openModal(async () => { const mod = await import('./Modal'); return () => <mod.default onClose={apply} />; }); openSheet(import('./Sheet'), 'key', { onDone: apply }); return null; } function Shared() { const open = React.useCallback(({ onClose }) => onClose('shared_call'), []); useSharedBase({ open }); return null; } export function App() { return <div><Child /><Platform /><Refs /><Lazy /><Shared /></div>; }",
+            "import * as React from 'react'; import Selected from './Selected'; import { usePlatform } from './platform'; import useSharedBase from './shared'; import { openSheet, openModal } from 'external-open'; import { useItemSelection } from './hook'; function Child() { return <Selected>{({ apply }) => <button onClick={() => apply('child')} />}</Selected>; } function Platform() { const [, apply] = usePlatform(); apply('platform_call'); return null; } function Refs() { const [, apply] = useItemSelection(['refs']); const ref = React.useRef(apply); React.useEffect(() => { ref.current = apply; }); return <button onClick={() => ref.current('ref')} />; } function Lazy() { const [, apply] = useItemSelection(['lazy']); openModal(async () => { const mod = await import('./Modal'); return () => <mod.default onClose={apply} />; }); openSheet(import('./Sheet'), 'key', { onDone: apply }); return null; } function Destructured() { const [, apply] = useItemSelection(['destructured']); openModal(async () => { const { default: Panel } = await import('./Panel'); return (props) => <Panel {...props} onClose={apply} />; }); return null; } function Shared() { const open = React.useCallback(({ onClose }) => onClose('shared_call'), []); useSharedBase({ open }); return null; } export function App() { return <div><Child /><Platform /><Refs /><Lazy /><Destructured /><Shared /></div>; }",
         ),
     ]);
     fixture.write(
@@ -1011,6 +1015,8 @@ fn callsite_walk_follows_function_children_refs_loaders_and_aliases() {
     assert_eq!(actions("refs"), ["ref"]);
     // `await import()` names a module, and props passed next to an import are its component's.
     assert_eq!(actions("lazy"), ["modal", "sheet"]);
+    // A name destructured from `await import()` is that module's export.
+    assert_eq!(actions("destructured"), ["panel"]);
     // A default import under another name still matches its callers, and an injected function
     // bound through `useCallback` is followed.
     assert_eq!(actions("shared"), ["shared_call"]);

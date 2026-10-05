@@ -414,7 +414,8 @@ result. The walk follows it through the source from the factory call: through de
 aliases, `useCallback`, `useMemo`, and `useRef` (whose `current` holds its argument), property
 writes such as `ref.current = value`, record and array fields, JSX props into function and class
 components (including components loaded by `lazy(() => import(...))`, a loader whose record argument
-returns `import(...)`, or a local bound to `await import(...)`, as in `<module.default />`),
+returns `import(...)`, or a local bound to `await import(...)` or destructured from it, as in
+`<module.default />` or `const { default: Panel } = await import('./Panel')`),
 arguments to project functions, and `return` to each caller of a hook. A call of a parameter, such
 as `children({ apply })` or an injected `open({ onClose })`, is followed into the function each
 caller passes for it, written at the call or bound to a name, including through `useCallback`. Props

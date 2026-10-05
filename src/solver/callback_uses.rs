@@ -888,9 +888,14 @@ impl Solver<'_> {
         name: &str,
         member: Option<&str>,
     ) -> Vec<UseNode> {
-        if let (Some(module), Some(member)) = (imports.get(name), member) {
+        if let Some((module, export)) = imports.get(name) {
+            let export = match (export, member) {
+                (None, Some(member)) => member,
+                (Some(export), None) => export,
+                _ => return Vec::new(),
+            };
             return self
-                .module_export_scopes(file_id, module, member)
+                .module_export_scopes(file_id, module, export)
                 .unwrap_or_default();
         }
         match (self.symbol_linker.resolve_binding(file_id, name), member) {
@@ -2812,34 +2817,60 @@ fn collect_array_elements(value: &QueryValue, elements: &mut Vec<QueryValue>) {
     }
 }
 
-/// Local names bound to a module namespace, as in `const module = await import('./Panel')`.
-type Imports = HashMap<String, String>;
+/// Local names bound to a module loaded with `import()`: the module, and the export the name
+/// holds, or `None` for the namespace, as in `const module = await import('./Panel')`.
+type Imports = HashMap<String, (String, Option<String>)>;
 
 fn local_imports(body: &ScopeBody<'_>) -> Imports {
     let mut imports = Imports::new();
     let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
         let frame = frames.last().expect("visited frame");
-        if let (Role::Bind(pattern), FlowExpressionKind::DynamicImport { module }) =
+        let (Role::Bind(pattern), FlowExpressionKind::DynamicImport { module }) =
             (&frame.role, &frame.expression.kind)
-            && let FlowPatternKind::Identifier { name } = &pattern.kind
-        {
-            imports.insert(name.clone(), module.clone());
+        else {
+            return;
+        };
+        match &pattern.kind {
+            FlowPatternKind::Identifier { name } => {
+                imports.insert(name.clone(), (module.clone(), None));
+            }
+            // `const { default: Panel } = await import('./Panel')` binds the export itself.
+            FlowPatternKind::Object { fields, .. } => {
+                for field in fields {
+                    let target = match &field.target.kind {
+                        FlowPatternKind::Default { target, .. } => target,
+                        _ => &field.target,
+                    };
+                    if let FlowPatternKind::Identifier { name } = &target.kind {
+                        imports.insert(
+                            name.clone(),
+                            (module.clone(), Some(field.source_property.clone())),
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
     };
     visit_body(body, &mut found);
     imports
 }
 
-/// The module and export an argument loads: `import('./Panel')`, a local bound to one, or a
-/// loader such as `() => import('./Panel')`.
+/// The module and export an argument loads: `import('./Panel')`, a local bound to one or to one
+/// of its exports, or a loader such as `() => import('./Panel')`.
 fn imported_module(argument: &FlowExpression, imports: &Imports) -> Option<(String, String)> {
     match &argument.kind {
         FlowExpressionKind::DynamicImport { module } => {
             Some((module.clone(), "default".to_owned()))
         }
-        FlowExpressionKind::Identifier { name, .. } => imports
-            .get(name)
-            .map(|module| (module.clone(), "default".to_owned())),
+        FlowExpressionKind::Identifier { name, .. } => {
+            imports.get(name).map(|(module, export)| {
+                (
+                    module.clone(),
+                    export.clone().unwrap_or_else(|| "default".to_owned()),
+                )
+            })
+        }
         FlowExpressionKind::Arrow { .. } => loaded_module(argument),
         _ => None,
     }
