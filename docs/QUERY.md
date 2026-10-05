@@ -163,7 +163,9 @@ import exported wrappers returning the tracked callback or exported functions/co
 factory arguments are still unknown. It follows re-export barrels and evaluates direct imported
 calls and JSX uses in large importer files. The analysis expansion is bounded at 256 additional
 files and eight rounds, skips `node_modules`, and reuses parsed files within the run; the backward
-use walk below has its own 256-file budget. Importer
+use walk below has its own 256-file budget, and the root phase that follows what paths from the
+entries read has 512. A `[limits]` table sets `discovery_files`, `backward_walk_files`, and
+`root_phase_files` for a project whose runs need more or fewer. Importer
 functions below 20,000 bytes are evaluated with a 5,000-expression budget; larger files use direct
 callsites with unknown surrounding locals and a 64-callsite budget per function. These limits and
 the text filter leave coverage incomplete.

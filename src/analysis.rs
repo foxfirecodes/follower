@@ -416,10 +416,8 @@ impl SourceCatalog {
     }
 }
 
-/// Budget for files that configured roots request after discovery stops.
-const ROOT_PHASE_FILES: usize = 512;
-/// Budget for files the backward use walk parses, separate from import expansion.
-const BACKWARD_WALK_FILES: usize = 256;
+/// Rounds of follow-up for files that configured roots request after discovery stops. The file
+/// budgets for discovery, that follow-up, and the backward use walk are the project's `limits`.
 const ROOT_PHASE_ROUNDS: usize = 8;
 
 struct RootPhase {
@@ -949,6 +947,7 @@ impl Analyzer {
             let (snapshot, catalog) = self.index_with_catalog(&linker, query)?;
             (snapshot, Some(catalog))
         };
+        let limits = self.project.config.limits;
         let mut followed = 0;
         let mut walked = 0;
         let mut skipped = BTreeSet::new();
@@ -1042,7 +1041,7 @@ impl Analyzer {
                         skipped.insert(path.clone());
                     }
                 }
-                let remaining = ROOT_PHASE_FILES - phase.files;
+                let remaining = limits.root_phase_files.saturating_sub(phase.files);
                 if additions.is_empty() || phase.rounds == ROOT_PHASE_ROUNDS || remaining == 0 {
                     report.coverage.gaps.extend(phase.discovery_stop.take());
                     if !additions.is_empty() {
@@ -1092,8 +1091,9 @@ impl Analyzer {
             }
             // Walk back from factory callsites once discovery stops, whether it settled or ran out
             // of budget; the walk has its own file budget.
-            let discovery_done =
-                additions.is_empty() || round >= 8 || followed + additions.len() > 256;
+            let discovery_done = additions.is_empty()
+                || round >= 8
+                || followed + additions.len() > limits.discovery_files;
             if discovery_done && !self.project.config.entries.is_empty() {
                 let callsites = report
                     .creations
@@ -1147,7 +1147,7 @@ impl Analyzer {
                         catalog,
                         &entry_corridor,
                         &callsites,
-                        BACKWARD_WALK_FILES.saturating_sub(walked),
+                        limits.backward_walk_files.saturating_sub(walked),
                     );
                     backward_limit_hit |= walk.limit_hit;
                     backward_skipped_files += walk.skipped_files;

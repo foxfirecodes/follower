@@ -1100,6 +1100,18 @@ fn callsite_walk_parses_the_files_the_text_filter_skipped() {
         callsite.capability.escapes
     );
     assert!(callsite.capability.escapes.is_empty());
+
+    // Without root-phase files, the hook's last caller is never parsed.
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[limits]\nroot_phase_files = 0\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    assert!(callsite.capability.calls.is_empty());
+    assert!(!callsite.capability.escapes.is_empty());
 }
 
 #[test]

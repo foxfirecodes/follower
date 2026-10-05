@@ -142,6 +142,31 @@ pub struct ProjectConfig {
     pub component_openers: Vec<ComponentOpener>,
     #[serde(default)]
     pub inputs: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub limits: Limits,
+}
+
+/// File budgets for a filtered query. Larger budgets parse more of a large project, at the cost
+/// of time and of exploration spread over more files.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Limits {
+    /// Files discovery may add before exploring from the entries.
+    pub discovery_files: usize,
+    /// Files the root phase may add for what paths from the entries read.
+    pub root_phase_files: usize,
+    /// Files the backward use walk may add.
+    pub backward_walk_files: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            discovery_files: 256,
+            root_phase_files: 512,
+            backward_walk_files: 256,
+        }
+    }
 }
 
 impl ProjectConfig {
