@@ -137,6 +137,7 @@ impl AbstractValue {
         Self::Record(Rc::new(RecordFields {
             fields,
             open: Some(reason.to_owned()),
+            unkeyed: Vec::new(),
         }))
     }
 
@@ -273,6 +274,9 @@ struct RecordFields {
     fields: BTreeMap<String, TrackedValue>,
     /// Why the record may have properties beyond `fields`.
     open: Option<String>,
+    /// Values under keys that were not known, such as `[key]: value` with an unknown `key`.
+    /// Any property may hold one of them.
+    unkeyed: Vec<TrackedValue>,
 }
 
 impl std::ops::Deref for RecordFields {
@@ -737,6 +741,7 @@ pub fn execute_query(
     };
     let phase_start = Instant::now();
     solver.callsite_values = solver.callsite_values(query);
+    solver.request_unparsed_argument_modules();
     let importer_requests = std::mem::take(&mut solver.importer_requests);
     let walk_file_requests = std::mem::take(&mut solver.walk_file_requests);
     if std::env::var_os("FOLLOWER_PROFILE_QUERY").is_some() {
@@ -830,6 +835,8 @@ struct Solver<'a> {
     importer_requests: BTreeSet<std::path::PathBuf>,
     /// Files the callsite walk needs.
     walk_file_requests: BTreeSet<std::path::PathBuf>,
+    /// The files behind each `unparsed_module:` value, by its reason.
+    unparsed_modules: BTreeMap<String, BTreeSet<std::path::PathBuf>>,
     /// Calls of each function in progress.
     active_functions: std::collections::HashMap<FunctionKey, usize>,
     /// Closures carrying a factory result, in creation order, until the render that created
@@ -1000,6 +1007,7 @@ impl<'a> Solver<'a> {
             callsite_values: Vec::new(),
             importer_requests: BTreeSet::new(),
             walk_file_requests: BTreeSet::new(),
+            unparsed_modules: BTreeMap::new(),
             active_functions: std::collections::HashMap::new(),
             pending_callbacks: Vec::new(),
             uncalled_runs: std::collections::HashSet::new(),
@@ -1459,6 +1467,121 @@ impl<'a> Solver<'a> {
         self.module_env_cache.clear();
         self.evaluating_globals.remove(&index);
         self.initialized_globals.insert(index);
+    }
+
+    /// What a module-level name in `file_id` refers to.
+    fn module_reference(
+        &mut self,
+        file_id: FileId,
+        name: &str,
+        resolution: ValueResolution,
+        span: &SourceSpan,
+    ) -> TrackedValue {
+        if resolution == ValueResolution::Unresolved
+            && let Some(value) = self.unparsed_module_value(file_id, name, span)
+        {
+            return value;
+        }
+        self.linked_value(resolution, span)
+    }
+
+    /// An import from a module that is not parsed, tied to the module so that a callsite argument
+    /// holding it can request the module.
+    fn unparsed_module_value(
+        &mut self,
+        file_id: FileId,
+        local: &str,
+        span: &SourceSpan,
+    ) -> Option<TrackedValue> {
+        let paths = self.symbol_linker.unparsed_link_targets(file_id, local);
+        if paths.is_empty() {
+            return None;
+        }
+        let specifier = self
+            .symbol_linker
+            .file(file_id)?
+            .flow
+            .imports
+            .iter()
+            .find(|import| import.local == local)?
+            .module
+            .clone();
+        let reason = format!("{UNPARSED_MODULE}{specifier}");
+        self.unparsed_modules
+            .entry(reason.clone())
+            .or_default()
+            .extend(paths);
+        self.record_coverage_gap("unresolved value linkage", span);
+        Some(TrackedValue::unknown(reason))
+    }
+
+    /// Requests the modules behind unknown values that reached a callsite's arguments, so the next
+    /// round knows them.
+    fn request_unparsed_argument_modules(&mut self) {
+        fn collect<'v>(value: &'v QueryValue, reasons: &mut BTreeSet<&'v str>) {
+            match value {
+                QueryValue::Unknown { reason } if reason.starts_with(UNPARSED_MODULE) => {
+                    reasons.insert(reason);
+                }
+                QueryValue::Array { elements: values } | QueryValue::Alternatives { values } => {
+                    for value in values {
+                        collect(value, reasons);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut reasons = BTreeSet::new();
+        for callsite in &self.callsite_values {
+            for value in callsite
+                .factory_arguments
+                .values()
+                .chain(callsite.possible_elements.values())
+                .flatten()
+            {
+                collect(value, &mut reasons);
+            }
+        }
+        for reason in reasons {
+            if let Some(paths) = self.unparsed_modules.get(reason) {
+                self.walk_file_requests.extend(paths.iter().cloned());
+            }
+        }
+    }
+
+    /// What a read with an unknown key gives on a known object: any of its values, or none.
+    fn read_any_property(&mut self, object: &TrackedValue) -> Option<TrackedValue> {
+        let object = self.materialize(object);
+        if is_unparsed_module_value(&object) {
+            return Some(object);
+        }
+        let values = match &object.value {
+            AbstractValue::Record(fields)
+                if fields.len() + fields.unkeyed.len() <= MAX_ANY_PROPERTY_VALUES =>
+            {
+                let mut values = fields
+                    .values()
+                    .chain(&fields.unkeyed)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                values.push(match fields.open.as_deref() {
+                    None | Some(COMPUTED_KEY) => TrackedValue::plain(AbstractValue::Undefined),
+                    Some(_) => TrackedValue::unknown("unknown_computed_property"),
+                });
+                values
+            }
+            AbstractValue::Array(elements) if elements.len() <= MAX_ANY_PROPERTY_VALUES => {
+                let mut values = elements.to_vec();
+                values.push(TrackedValue::plain(AbstractValue::Undefined));
+                values
+            }
+            AbstractValue::Union(alternatives) => alternatives
+                .iter()
+                .map(|alternative| self.read_any_property(alternative))
+                .collect::<Option<Vec<_>>>()?,
+            _ => return None,
+        };
+        Some(TrackedValue::plain(AbstractValue::union(values)))
     }
 
     fn linked_value(&mut self, resolution: ValueResolution, span: &SourceSpan) -> TrackedValue {
@@ -2515,17 +2638,29 @@ impl<'a> Solver<'a> {
                 {
                     self.record_coverage_gap("missing imported value", &expression.span);
                 }
-                self.linked_value(resolution, &expression.span)
+                self.module_reference(file_id, name, resolution, &expression.span)
             }
             FlowExpressionKind::Record { fields } => {
                 let mut record = RecordFields::default();
                 for field in fields {
+                    let key = field.computed.as_ref().map(|key| {
+                        let key = self.eval(key, environment, file_id);
+                        property_key(&self.materialize(&key).value)
+                    });
                     let value = self.eval(&field.value, environment, file_id);
                     if field.spread {
                         let value = self.materialize(&value);
                         spread_into_record(&mut record, &value);
                     } else {
-                        record.insert(field.property.clone(), value);
+                        match key {
+                            Some(Some(key)) => {
+                                record.insert(key, value);
+                            }
+                            Some(None) => add_unkeyed_value(&mut record, value),
+                            None => {
+                                record.insert(field.property.clone(), value);
+                            }
+                        }
                     }
                 }
                 TrackedValue::plain(AbstractValue::Record(Rc::new(record)))
@@ -2546,24 +2681,35 @@ impl<'a> Solver<'a> {
             FlowExpressionKind::ComputedMember { object, property } => {
                 let object = self.eval(object, environment, file_id);
                 let property = self.eval(property, environment, file_id);
-                let property_name = match &property.value {
-                    AbstractValue::String(value) => value.clone(),
-                    AbstractValue::Number(value) => value.to_string(),
-                    _ => {
-                        self.mark_value_unresolved(
-                            &object,
-                            "computed property is not a finite string",
-                            expression.span.clone(),
-                        );
-                        return TrackedValue::unknown("unknown_computed_property");
-                    }
-                };
-                self.read_property(
-                    object,
-                    &property_name,
+                let property = self.materialize(&property);
+                if let Some(keys) = property_keys(&property.value) {
+                    let mut values = keys
+                        .iter()
+                        .map(|key| {
+                            self.read_property(
+                                object.clone(),
+                                key,
+                                expression.span.clone(),
+                                RelationKind::KeySelection,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    return if values.len() == 1 {
+                        values.pop().expect("one value")
+                    } else {
+                        TrackedValue::plain(AbstractValue::union(values))
+                    };
+                }
+                // An unknown key reads any of a known object's values.
+                if let Some(value) = self.read_any_property(&object) {
+                    return value;
+                }
+                self.mark_value_unresolved(
+                    &object,
+                    "computed property is not a finite string",
                     expression.span.clone(),
-                    RelationKind::KeySelection,
-                )
+                );
+                TrackedValue::unknown("unknown_computed_property")
             }
             FlowExpressionKind::StrictEquality {
                 left,
@@ -2985,7 +3131,12 @@ impl<'a> Solver<'a> {
                     if let std::collections::btree_map::Entry::Vacant(entry) = captured.entry(name)
                     {
                         let resolution = self.symbol_linker.resolve_binding(file_id, entry.key());
-                        let value = self.linked_value(resolution, &expression.span);
+                        let value = self.module_reference(
+                            file_id,
+                            entry.key(),
+                            resolution,
+                            &expression.span,
+                        );
                         entry.insert(value);
                     }
                 }
@@ -3314,6 +3465,7 @@ impl<'a> Solver<'a> {
                     _ => RecordFields {
                         fields: BTreeMap::new(),
                         open: Some("create_element_props_unknown".to_owned()),
+                        unkeyed: Vec::new(),
                     },
                 };
                 if api == "createElement" {
@@ -3636,6 +3788,9 @@ impl<'a> Solver<'a> {
                         callee: None,
                         argument,
                     }),
+                    // What a function from a module that is not parsed returns stays tied to
+                    // the module.
+                    None if reason.starts_with(UNPARSED_MODULE) => TrackedValue::unknown(reason),
                     None => TrackedValue::unknown("unknown_call_result"),
                 }
             }
@@ -4605,6 +4760,7 @@ impl<'a> Solver<'a> {
                             props: RecordFields {
                                 fields: BTreeMap::new(),
                                 open: Some("props_from_configured_component".to_owned()),
+                                unkeyed: Vec::new(),
                             },
                             span: element.span.clone(),
                             trace: self.trace.clone(),
@@ -5602,6 +5758,7 @@ impl<'a> Solver<'a> {
                 _ => RecordFields {
                     fields: BTreeMap::new(),
                     open: Some("props_from_component_opener".to_owned()),
+                    unkeyed: Vec::new(),
                 },
             };
             self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
@@ -5712,6 +5869,7 @@ impl<'a> Solver<'a> {
                         props: RecordFields {
                             fields: BTreeMap::new(),
                             open: Some("props_from_unmodeled_component".to_owned()),
+                            unkeyed: Vec::new(),
                         },
                         span: span.clone(),
                         trace: self.trace.clone(),
@@ -6269,6 +6427,10 @@ impl<'a> Solver<'a> {
         relation: RelationKind,
     ) -> TrackedValue {
         let object = self.materialize(&object);
+        // What a module that is not parsed holds stays tied to the module.
+        if is_unparsed_module_value(&object) {
+            return object;
+        }
         if let AbstractValue::Namespace(file_id) = object.value {
             let resolution = self.symbol_linker.resolve_exported_value(file_id, property);
             if resolution == ValueResolution::Missing {
@@ -6289,11 +6451,20 @@ impl<'a> Solver<'a> {
             return value;
         }
         if let AbstractValue::Union(values) = object.value.clone() {
+            // `value?.property` on a missing alternative is `undefined`; a plain read throws
+            // instead, so what it gives is never used. Optional chains read like plain ones. A
+            // missing value on its own stays unknown, since it often stands for one set later.
             return TrackedValue::plain(AbstractValue::union(
                 values
                     .iter()
                     .cloned()
-                    .map(|value| self.read_property(value, property, span.clone(), relation))
+                    .map(|value| {
+                        if matches!(value.value, AbstractValue::Null | AbstractValue::Undefined) {
+                            TrackedValue::plain(AbstractValue::Undefined)
+                        } else {
+                            self.read_property(value, property, span.clone(), relation)
+                        }
+                    })
                     .collect(),
             ));
         }
@@ -6326,14 +6497,27 @@ impl<'a> Solver<'a> {
             );
             return TrackedValue::unknown("property_read_from_non_record");
         };
-        let Some(value) = fields.get(property).cloned() else {
+        let Some(mut value) = fields.get(property).cloned() else {
             // Prototype members are not modeled, so they stay unknown even on a closed record.
             if fields.open.is_none() && !is_object_prototype_member(property) {
                 return TrackedValue::plain(AbstractValue::Undefined);
             }
+            // A literal whose only unknown keys are computed holds one of their values or none.
+            if fields.open.as_deref() == Some(COMPUTED_KEY) && !is_object_prototype_member(property)
+            {
+                let mut values = fields.unkeyed.clone();
+                values.push(TrackedValue::plain(AbstractValue::Undefined));
+                return TrackedValue::plain(AbstractValue::union(values));
+            }
             self.mark_value_unresolved(&object, &format!("unknown property {property}"), span);
             return TrackedValue::unknown(format!("unknown_property:{property}"));
         };
+        if !fields.unkeyed.is_empty() {
+            // A computed key may have replaced the value.
+            let mut values = vec![value];
+            values.extend(fields.unkeyed.iter().cloned());
+            value = TrackedValue::plain(AbstractValue::union(values));
+        }
         let choice = object.choice.clone().or(value.choice.clone()).or_else(|| {
             (relation == RelationKind::KeySelection)
                 .then(|| self.current_choice.clone())
@@ -7773,21 +7957,35 @@ fn append_array_values(receiver: &AbstractValue, added: &[TrackedValue]) -> Opti
     }
 }
 
+/// The distinct arrays a value may be. Joined branches often repeat the same array, so repeats
+/// count once toward the budget.
 fn finite_array_parts(value: &AbstractValue) -> Option<Vec<Vec<TrackedValue>>> {
-    match value {
-        AbstractValue::Array(elements) => Some(vec![elements.to_vec()]),
-        AbstractValue::Union(values) => {
-            let mut parts = Vec::new();
-            for value in values.iter() {
-                parts.extend(finite_array_parts(&value.value)?);
-                if parts.len() > 64 {
-                    return None;
+    fn collect(
+        value: &AbstractValue,
+        parts: &mut Vec<Vec<TrackedValue>>,
+        seen: &mut BTreeSet<u64>,
+    ) -> bool {
+        match value {
+            AbstractValue::Array(elements) => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&elements.len(), &mut hasher);
+                let complete = elements.iter().all(|element| {
+                    hash_value_fingerprint(&BTreeMap::new(), element, &mut hasher, 0)
+                });
+                if complete && !seen.insert(std::hash::Hasher::finish(&hasher)) {
+                    return true;
                 }
+                parts.push(elements.to_vec());
+                parts.len() <= 64
             }
-            Some(parts)
+            AbstractValue::Union(values) => values
+                .iter()
+                .all(|value| collect(&value.value, parts, seen)),
+            _ => false,
         }
-        _ => None,
     }
+    let mut parts = Vec::new();
+    collect(value, &mut parts, &mut BTreeSet::new()).then_some(parts)
 }
 
 fn object_values(value: &AbstractValue) -> Option<AbstractValue> {
@@ -7875,6 +8073,9 @@ fn collect_expression_references(expression: &FlowExpression, references: &mut C
         }
         FlowExpressionKind::Record { fields } => {
             for field in fields {
+                if let Some(key) = &field.computed {
+                    collect_expression_references(key, references);
+                }
                 collect_expression_references(&field.value, references);
             }
         }
@@ -8068,6 +8269,20 @@ fn extend_binding_dependencies(statements: &[FlowStatement], names: &mut BTreeSe
                 collect_expression_references(value, &mut references);
                 names.extend(references.names);
             }
+            // `items.push(value)` adds to `items`.
+            FlowStatement::Expression { value, .. } => {
+                if let FlowExpressionKind::Call { callee, arguments } = &value.kind
+                    && let FlowExpressionKind::StaticMember { object, property } = &callee.kind
+                    && ARRAY_MUTATORS.contains(&property.as_str())
+                    && local_path(object).is_some_and(|(name, _)| names.contains(&name))
+                {
+                    for argument in arguments {
+                        let mut references = ClosureReferences::default();
+                        collect_expression_references(argument, &mut references);
+                        names.extend(references.names);
+                    }
+                }
+            }
             FlowStatement::If {
                 consequent,
                 alternate,
@@ -8179,7 +8394,9 @@ fn spread_into_record(record: &mut RecordFields, value: &TrackedValue) {
     match &value.value {
         AbstractValue::Null | AbstractValue::Undefined => {}
         AbstractValue::Record(fields) => {
-            if let Some(reason) = &fields.open {
+            if let Some(reason) = &fields.open
+                && reason != COMPUTED_KEY
+            {
                 widen_record_for_unknown_spread(record, reason);
             }
             record.extend(
@@ -8187,6 +8404,9 @@ fn spread_into_record(record: &mut RecordFields, value: &TrackedValue) {
                     .iter()
                     .map(|(name, value)| (name.clone(), value.clone())),
             );
+            for value in &fields.unkeyed {
+                add_unkeyed_value(record, value.clone());
+            }
         }
         AbstractValue::Union(alternatives) => {
             // Each alternative spreads into its own copy; the record keeps every outcome.
@@ -8220,10 +8440,72 @@ fn spread_into_record(record: &mut RecordFields, value: &TrackedValue) {
                 };
                 record.insert(name, value);
             }
-            record.open = outcomes.into_iter().find_map(|outcome| outcome.open);
+            record.unkeyed = outcomes
+                .iter()
+                .flat_map(|outcome| outcome.unkeyed.iter().cloned())
+                .collect();
+            // A reason other than an unknown computed key wins, since it leaves more unknown.
+            record.open = outcomes
+                .iter()
+                .filter_map(|outcome| outcome.open.clone())
+                .max_by_key(|reason| reason != COMPUTED_KEY);
         }
         _ => widen_record_for_unknown_spread(record, "object_spread_of_unknown_value"),
     }
+}
+
+/// Starts the reason of a value imported from a module that is not parsed; the module specifier
+/// follows.
+const UNPARSED_MODULE: &str = "unparsed_module:";
+
+fn is_unparsed_module_value(value: &TrackedValue) -> bool {
+    matches!(&value.value, AbstractValue::Unknown(reason) if reason.starts_with(UNPARSED_MODULE))
+}
+
+/// Why a record literal is open when a computed key was not known.
+const COMPUTED_KEY: &str = "computed_object_key";
+
+/// The most values a read with an unknown key gathers from one object.
+const MAX_ANY_PROPERTY_VALUES: usize = 64;
+
+/// Adds `[key]: value` for a key that is not known: any property may now hold `value`.
+fn add_unkeyed_value(record: &mut RecordFields, value: TrackedValue) {
+    record.unkeyed.push(value);
+    if record.open.is_none() {
+        record.open = Some(COMPUTED_KEY.to_owned());
+    }
+}
+
+/// The property name a key value selects.
+fn property_key(value: &AbstractValue) -> Option<String> {
+    match value {
+        AbstractValue::String(value) => Some(value.clone()),
+        AbstractValue::Number(value) | AbstractValue::EnumMember { value, .. } => {
+            Some(value.to_string())
+        }
+        AbstractValue::Boolean(value) => Some(value.to_string()),
+        AbstractValue::Null => Some("null".to_owned()),
+        AbstractValue::Undefined => Some("undefined".to_owned()),
+        _ => None,
+    }
+}
+
+/// The property names a key may select, when each alternative is known.
+fn property_keys(value: &AbstractValue) -> Option<Vec<String>> {
+    fn collect(value: &AbstractValue, keys: &mut Vec<String>) -> bool {
+        if let AbstractValue::Union(values) = value {
+            return values.iter().all(|value| collect(&value.value, keys));
+        }
+        let Some(key) = property_key(value) else {
+            return false;
+        };
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+        keys.len() <= MAX_ANY_PROPERTY_VALUES
+    }
+    let mut keys = Vec::new();
+    (collect(value, &mut keys) && !keys.is_empty()).then_some(keys)
 }
 
 fn widen_record_for_unknown_spread(record: &mut RecordFields, reason: &str) {
@@ -8676,22 +8958,26 @@ fn query_value(value: &TrackedValue) -> QueryValue {
             }
         }
         AbstractValue::Boolean(value) => QueryValue::Boolean { value: *value },
-        AbstractValue::Union(values)
-            if array_alternatives(value)
-                || enum_alternatives(value)
-                || literal_alternatives(value) =>
-        {
+        // Each alternative projects on its own, so known ones stay visible beside unknown ones.
+        AbstractValue::Union(values) => {
             let mut distinct = Vec::new();
             for value in values.iter().map(query_value) {
-                if !distinct.contains(&value) {
-                    distinct.push(value);
+                let nested = match value {
+                    QueryValue::Alternatives { values } => values,
+                    value => vec![value],
+                };
+                for value in nested {
+                    if !distinct.contains(&value) {
+                        distinct.push(value);
+                    }
                 }
             }
-            QueryValue::Alternatives { values: distinct }
+            if distinct.len() == 1 {
+                distinct.pop().expect("one alternative")
+            } else {
+                QueryValue::Alternatives { values: distinct }
+            }
         }
-        AbstractValue::Union(_) => QueryValue::Unknown {
-            reason: "joined_alternatives".to_owned(),
-        },
         AbstractValue::Record(_) => QueryValue::Unknown {
             reason: "record_value".to_owned(),
         },
@@ -8813,27 +9099,51 @@ fn refine_environment_for_condition(
             let FlowExpressionKind::Identifier { name, .. } = &value.kind else {
                 return;
             };
-            let Some(binding) = environment.get_mut(name) else {
-                return;
-            };
-            let AbstractValue::Union(alternatives) = &binding.value else {
-                return;
-            };
             let wants_nullish = expected != *negated;
-            let mut narrowed = alternatives
-                .iter()
-                .filter(|alternative| {
-                    nullish(&alternative.value).is_none_or(|is_nullish| is_nullish == wants_nullish)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            if narrowed.len() == 1 {
-                binding.value = narrowed.remove(0).value;
-            } else if !narrowed.is_empty() {
-                binding.value = AbstractValue::union(narrowed);
-            }
+            narrow_binding(environment, name, |value| {
+                nullish(value).is_none_or(|is_nullish| is_nullish == wants_nullish)
+            });
+        }
+        FlowExpressionKind::Identifier { name, .. } => {
+            narrow_binding(environment, name, |value| {
+                truthy(value).is_none_or(|truthy| truthy == expected)
+            });
         }
         _ => {}
+    }
+}
+
+/// Keeps the alternatives of a local that a condition allows, looking through nested choices.
+fn narrow_binding(
+    environment: &mut Environment,
+    name: &str,
+    keep: impl Fn(&AbstractValue) -> bool,
+) {
+    fn leaves(value: &TrackedValue, out: &mut Vec<TrackedValue>) {
+        if let AbstractValue::Union(values) = &value.value {
+            for value in values.iter() {
+                leaves(value, out);
+            }
+        } else {
+            out.push(value.clone());
+        }
+    }
+    let Some(binding) = environment.get_mut(name) else {
+        return;
+    };
+    if !matches!(binding.value, AbstractValue::Union(_)) {
+        return;
+    }
+    let mut alternatives = Vec::new();
+    leaves(binding, &mut alternatives);
+    let mut narrowed = alternatives
+        .into_iter()
+        .filter(|alternative| keep(&alternative.value))
+        .collect::<Vec<_>>();
+    if narrowed.len() == 1 {
+        binding.value = narrowed.remove(0).value;
+    } else if !narrowed.is_empty() {
+        binding.value = AbstractValue::union(narrowed);
     }
 }
 
@@ -8884,22 +9194,6 @@ fn finite_array_alternatives(value: &TrackedValue) -> bool {
             elements.iter().all(|element| !value_is_uncertain(element))
         }
         AbstractValue::Union(values) => values.iter().all(finite_array_alternatives),
-        _ => false,
-    }
-}
-
-fn array_alternatives(value: &TrackedValue) -> bool {
-    match &value.value {
-        AbstractValue::Array(_) => true,
-        AbstractValue::Union(values) => values.iter().all(array_alternatives),
-        _ => false,
-    }
-}
-
-fn enum_alternatives(value: &TrackedValue) -> bool {
-    match &value.value {
-        AbstractValue::EnumMember { .. } | AbstractValue::Undefined => true,
-        AbstractValue::Union(values) => values.iter().all(enum_alternatives),
         _ => false,
     }
 }
@@ -9080,6 +9374,9 @@ fn collect_import_uses(
         }
         FlowExpressionKind::Record { fields } => {
             for field in fields {
+                if let Some(key) = &field.computed {
+                    collect_import_uses(key, imported_names, uses);
+                }
                 collect_import_uses(&field.value, imported_names, uses);
             }
         }
@@ -9239,4 +9536,23 @@ fn choice_label(props: &BTreeMap<String, String>) -> String {
         .map(|(name, value)| format!("{name}={value}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_arrays_count_once_toward_the_spread_budget() {
+        let listed = TrackedValue::plain(AbstractValue::array(vec![TrackedValue::plain(
+            AbstractValue::String("listed".to_owned()),
+        )]));
+        let empty = TrackedValue::plain(AbstractValue::array(Vec::new()));
+        // Joined branches that never changed the array repeat it past the budget of 64.
+        let alternatives = (0..40)
+            .flat_map(|_| [listed.clone(), empty.clone()])
+            .collect::<Vec<_>>();
+        let parts = finite_array_parts(&AbstractValue::union(alternatives)).expect("finite parts");
+        assert_eq!(parts.len(), 2);
+    }
 }

@@ -265,6 +265,7 @@ impl Lowerer<'_> {
                         .iter()
                         .map(|member| FlowRecordField {
                             spread: false,
+                            computed: None,
                             property: member.id.static_name().to_string(),
                             value: member.initializer.as_ref().map_or_else(
                                 || self.unsupported_expression("implicit_enum_value", member.span),
@@ -887,19 +888,30 @@ impl Lowerer<'_> {
                                 value: self.lower_expression(&spread.argument),
                                 span: self.span(spread.span),
                                 spread: true,
+                                computed: None,
                             });
                             continue;
                         }
                     };
-                    let Some(name) = property.key.static_name() else {
-                        return self
-                            .unsupported_expression("computed_object_key", expression.span());
+                    // `[key]: value` names its property when the key is evaluated.
+                    let (name, computed) = match property.key.static_name() {
+                        Some(name) => (name.into_owned(), None),
+                        None => match property.key.as_expression() {
+                            Some(key) => (String::new(), Some(self.lower_expression(key))),
+                            None => {
+                                return self.unsupported_expression(
+                                    "computed_object_key",
+                                    expression.span(),
+                                );
+                            }
+                        },
                     };
                     fields.push(FlowRecordField {
-                        property: name.into_owned(),
+                        property: name,
                         value: self.lower_expression(&property.value),
                         span: self.span(property.span),
                         spread: false,
+                        computed,
                     });
                 }
                 FlowExpressionKind::Record { fields }

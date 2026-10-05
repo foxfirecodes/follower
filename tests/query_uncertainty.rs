@@ -118,17 +118,25 @@ fn partial_returns_preserve_callback_invocations_on_the_continuing_path() {
 }
 
 #[test]
-fn joined_unknown_data_becomes_an_explicit_unknown_projection_and_coverage_gap() {
+fn joined_unknown_data_keeps_its_known_alternatives_beside_an_unknown_and_a_coverage_gap() {
     let fixture = TestProject::new(&[(
         "src/Host.tsx",
         "import { makeCallback } from './factory'; export function Host({ flag }) { let value = 'alpha'; if (flag) { value = flag.label; } makeCallback(value).callback('clicked'); }",
     )]);
     let report = fixture.report();
     assert_eq!(report.creations.len(), 1);
-    assert!(matches!(
-        report.creations[0].factory_arguments["created"],
-        QueryValue::Unknown { .. }
-    ));
+    let QueryValue::Alternatives { values } = &report.creations[0].factory_arguments["created"]
+    else {
+        panic!("{:?}", report.creations[0].factory_arguments["created"]);
+    };
+    assert!(values.contains(&QueryValue::String {
+        value: "alpha".into()
+    }));
+    assert!(
+        values
+            .iter()
+            .any(|value| matches!(value, QueryValue::Unknown { .. }))
+    );
     assert!(!report.coverage.complete);
     assert!(!report.creations[0].unresolved.is_empty());
     let gap = report

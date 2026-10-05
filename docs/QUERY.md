@@ -378,7 +378,10 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   arrays, finite array alternatives, alternatives of known literals (such as a string chosen by a
   condition), `null`, `undefined`, and explicit unknowns. A branch-built array remains a set of
   possible arrays instead of collapsing to one merged list. String enum members currently
-  project to their string values. Alternatives that include an unknown value project as unknown.
+  project to their string values. Alternatives that include an unknown value keep their known
+  alternatives beside the unknown one, which still leaves the value unresolved. An array element
+  chosen among values, such as a table entry read with an unknown key, contributes each of them as
+  an item, except `null` and `undefined`.
 - `reachable` reports creations explored from configured entry points and finite input domains.
 - When no path from an entry reaches some code, the project can declare that it is rendered. A
   `[[render_roots]]` entry names a component, function, or module binding such as a registry
@@ -563,10 +566,14 @@ decide, `possible_elements` lists the elements they hold; the text output and th
 that list and the number of arrays instead of every array when there are more than four. Where a
 factory argument stays unresolved, `possible_elements` also lists what a local array built from
 literal elements and `push` calls may contain, such as the types pushed under conditions too many to
-keep as separate arrays, and `values_from_callers` gives the argument's value with what each caller
+keep as separate arrays, or a choice between such arrays, as in `hidden ? [] : items`, and `values_from_callers` gives the argument's value with what each caller
 passes, when it reads only the enclosing function's parameters and a caller passes values that do
 not depend on its own locals; up to 32 callers are evaluated, one level up. Each call also says
-which elements of an array factory argument it can apply to, in `elements`. The walk keeps the
+which elements of an array factory argument it can apply to, in `elements`. For a call through an
+instance that no explored path renders, they are what the instance's caller writes for the
+argument, such as `kinds={kinds}` with `const kinds = disabled ? [] : [Kind.A]` in the caller; an
+element that reads the caller's own parameters, as `kinds={[kind]}`, is what the caller's callers
+pass for them. The walk keeps the
 conditions each step of the path runs under: `if` branches, the code after an early return, `?:`
 branches, and the right side of `&&` and `||`. A condition that compares with members of the
 elements' enum, such as `case Kind.A:` or `visible === Kind.A`, narrows them; `guards` lists the
@@ -598,11 +605,14 @@ keeps its truthiness even when its value is unknown; `unknown && false` is falsy
 filter drop an element its other conditions exclude.
 
 Optional chains read and call like their plain forms: `value?.name` is `value.name` and
-`callback?.(argument)` is `callback(argument)`, so on a missing value the result is unknown, as
-an unsupported expression was before.
+`callback?.(argument)` is `callback(argument)`. A property read on a `null` or `undefined`
+alternative of a value that may be something else gives `undefined`, which is what an optional
+chain gives; a plain read would throw instead, so its value is never used. A read on a value that
+is only `null` or `undefined` is unknown, since such a value often stands for one set later.
 
 The engine follows object and array destructuring, local calls and closures, records, finite computed record
-selection, arrays and finite spreads, exact string/boolean/numeric-enum strict-equality branches,
+selection, object literals with computed keys such as `{ [Kind.A]: value }`, arrays and finite
+spreads, exact string/boolean/numeric-enum strict-equality branches,
 null comparisons, logical expressions, conditional expressions, finite-array `.map` and `.filter`,
 `Object.values` on known records, local `.push`, object literal spreads, destructuring and
 parameter defaults, `defaultProps`, JSX component props/children/spreads,
@@ -632,8 +642,19 @@ continuing path. Modified bindings retain joined alternatives; callback-bearing 
 unresolved rather than disappearing after the branch. Strict equality involving an unknown value
 remains unknown, and projected factory captures containing unknown values, including joins with
 an unknown side, carry gaps; finite alternatives of literals or arrays do not.
-Nullish guards narrow finite local alternatives inside their guarded branch, including guards
-combined with `&&` or `||`.
+Nullish guards and plain truthiness tests narrow finite local alternatives inside their guarded
+branch, including nested alternatives and guards combined with `&&` or `||`.
+A computed read whose key is not known, as in `table[key]`, gives any of the object's values or
+`undefined`, for an object or array of up to 64 entries; on an open record it may also be an
+unknown. A computed key that is not known, as in `{ [key]: value }`, leaves the literal's other
+names unknown, so a read of any name may give that value. Repeated arrays count once toward the
+budget of 64 for a spread of several possible arrays.
+
+A value imported from a module that is not parsed is unknown with the reason
+`unparsed_module:<specifier>`, which property reads and calls keep. When such a value reaches a
+callsite's factory arguments, the next round parses that module, as it does for the imports a
+callsite's arguments depend on, including what local `.push` calls add to them. A reason that
+remains names the module that was not parsed.
 `for`, `for...in`, `for...of`, and `while` bodies are explored for zero or one iteration, a
 `do...while` body for one, and switch cases independently; these leave coverage gaps because
 repeated iterations and fallthrough are not modeled. Blocks keep their own scope, labels are

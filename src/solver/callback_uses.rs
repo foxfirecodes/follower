@@ -2662,6 +2662,37 @@ impl Solver<'_> {
     /// callsite scope's parameters, as `contentTypes={[selected.id]}`. A property of a local the
     /// walk cannot trace, as `selected.id` for an entry picked from a table, may be any value the
     /// caller's file writes under that property.
+    /// What an instance's caller writes for a factory argument, from the arrays its source builds,
+    /// as `contentTypes={items}` with `const items = hidden ? [] : [Kind.A]`.
+    fn written_source_elements(
+        &mut self,
+        candidate: &FactoryCallCandidate,
+        graph: &HashMap<UseNode, Vec<UseEdge>>,
+        instance: &SourceSpan,
+        position: usize,
+    ) -> Option<Vec<QueryValue>> {
+        let scope = self.candidate_scope(candidate)?;
+        let FlowExpressionKind::Identifier { name, .. } = &candidate.arguments.get(position)?.kind
+        else {
+            return None;
+        };
+        let binding = self
+            .scope_code(&scope)?
+            .params
+            .iter()
+            .enumerate()
+            .find_map(|(index, param)| pattern_path(param, name).map(|steps| (index, steps)))?;
+        let edge = graph
+            .get(&scope)?
+            .iter()
+            .find(|edge| edge.site == *instance)?;
+        let user = edge.user.clone();
+        let (_, passed) =
+            self.passed_values(&edge.user, &edge.site, &scope, &[(name.clone(), binding)])?;
+        let (_, written) = passed.into_iter().next()?;
+        self.pushed_values(&user, &written, Some(graph))
+    }
+
     fn written_instance_elements(
         &mut self,
         candidate: &FactoryCallCandidate,
@@ -2748,21 +2779,105 @@ impl Solver<'_> {
     }
 
     /// For a local array built from literal elements and `push` calls, such as
-    /// `const items = []; if (ready) items.push(Kind.A);`, the values it may contain.
+    /// `const items = []; if (ready) items.push(Kind.A);`, the values it may contain. A choice
+    /// between arrays, such as `hidden ? [] : items`, may contain the values of either.
     fn pushed_elements(
         &mut self,
         scope: &UseNode,
         argument: &FlowExpression,
     ) -> Option<Vec<QueryValue>> {
-        let FlowExpressionKind::Identifier { name, .. } = &argument.kind else {
-            return None;
-        };
+        self.pushed_values(scope, argument, None)
+    }
+
+    /// The values of the elements `pushed_expressions` finds. With the use graph, an element that
+    /// reads the scope's parameters is what the scope's callers pass for them.
+    fn pushed_values(
+        &mut self,
+        scope: &UseNode,
+        argument: &FlowExpression,
+        graph: Option<&HashMap<UseNode, Vec<UseEdge>>>,
+    ) -> Option<Vec<QueryValue>> {
         let locals = self.scope_locals(scope)?;
-        let (file_id, elements) = {
-            let code = self.scope_code(scope)?;
-            let mut elements = Vec::new();
+        let file_id = self.scope_code(scope)?.file_id;
+        let mut elements = Vec::new();
+        if !self.pushed_expressions(scope, argument, &mut elements, 0) || elements.is_empty() {
+            return None;
+        }
+        let mut values = Vec::new();
+        for element in &elements {
+            let mut found = Vec::new();
+            if matches!(element.kind, FlowExpressionKind::Spread { .. }) {
+            } else if is_context_free(element, &locals) {
+                found.push(self.evaluate_context_free(file_id, element));
+            } else if let Some(graph) = graph {
+                found.extend(
+                    self.values_from_callers(scope, element, graph)
+                        .into_iter()
+                        .map(|caller| caller.value),
+                );
+            }
+            if found.is_empty() {
+                found.push(QueryValue::Unknown {
+                    reason: "element_depends_on_context".to_owned(),
+                });
+            }
+            for value in found {
+                if !values.contains(&value) {
+                    values.push(value);
+                }
+            }
+        }
+        Some(values)
+    }
+
+    /// Adds the element expressions an array argument may hold; false when one of its arrays is
+    /// not a literal or a local built by `push`.
+    fn pushed_expressions(
+        &self,
+        scope: &UseNode,
+        argument: &FlowExpression,
+        elements: &mut Vec<FlowExpression>,
+        depth: usize,
+    ) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        let depth = depth + 1;
+        let name = match &argument.kind {
+            FlowExpressionKind::Array { elements: literal } => {
+                elements.extend(literal.iter().cloned());
+                return true;
+            }
+            FlowExpressionKind::Conditional {
+                consequent,
+                alternate,
+                ..
+            } => {
+                return self.pushed_expressions(scope, consequent, elements, depth)
+                    && self.pushed_expressions(scope, alternate, elements, depth);
+            }
+            // `ready && items` is `items` or a falsy value that holds nothing.
+            FlowExpressionKind::Logical {
+                operator: FlowLogicalOperator::And,
+                right,
+                ..
+            } => return self.pushed_expressions(scope, right, elements, depth),
+            FlowExpressionKind::Logical { left, right, .. } => {
+                return self.pushed_expressions(scope, left, elements, depth)
+                    && self.pushed_expressions(scope, right, elements, depth);
+            }
+            FlowExpressionKind::Identifier { name, .. } => name,
+            _ => return false,
+        };
+        {
+            let Some(code) = self.scope_code(scope) else {
+                return false;
+            };
+            let start = elements.len();
             let mut bound = false;
             let mut reassigned = false;
+            // A local bound to a choice of arrays, as `const items = hidden ? [] : [Kind.A]`.
+            let mut chosen = None;
             let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
                 let frame = frames.last().expect("visited frame");
                 match (&frame.role, &frame.expression.kind) {
@@ -2771,10 +2886,15 @@ impl Solver<'_> {
                             kind: FlowPatternKind::Identifier { name: bound_name },
                             ..
                         }),
-                        FlowExpressionKind::Array { elements: initial },
+                        initial,
                     ) if bound_name == name => {
                         bound = true;
-                        elements.extend(initial.iter().cloned());
+                        match initial {
+                            FlowExpressionKind::Array { elements: initial } => {
+                                elements.extend(initial.iter().cloned());
+                            }
+                            _ => chosen = Some(frame.expression.clone()),
+                        }
                     }
                     (Role::Assign(FlowAssignmentTarget::Identifier { name: assigned }), _)
                         if assigned == name =>
@@ -2793,27 +2913,17 @@ impl Solver<'_> {
                 }
             };
             visit_body(&code.body, &mut found);
-            if !bound || reassigned || elements.is_empty() {
-                return None;
-            }
-            (code.file_id, elements)
-        };
-        let mut values = Vec::new();
-        for element in &elements {
-            let value = if is_context_free(element, &locals)
-                && !matches!(element.kind, FlowExpressionKind::Spread { .. })
+            if !bound
+                || reassigned
+                || chosen.is_some_and(|initial| {
+                    !self.pushed_expressions(scope, &initial, elements, depth)
+                })
             {
-                self.evaluate_context_free(file_id, element)
-            } else {
-                QueryValue::Unknown {
-                    reason: "element_depends_on_context".to_owned(),
-                }
-            };
-            if !values.contains(&value) {
-                values.push(value);
+                elements.truncate(start);
+                return false;
             }
         }
-        Some(values)
+        true
     }
 
     /// For an argument that reads only the enclosing function's parameters, its value with
@@ -3220,8 +3330,11 @@ impl Solver<'_> {
                 if written_elements.contains_key(&key) {
                     continue;
                 }
-                let elements =
-                    self.written_instance_elements(candidate, graph, &instance, position);
+                let elements = self
+                    .written_instance_elements(candidate, graph, &instance, position)
+                    .or_else(|| {
+                        self.written_source_elements(candidate, graph, &instance, position)
+                    });
                 written_elements.insert(key, elements);
             }
         }
@@ -3867,19 +3980,31 @@ fn array_count(value: &QueryValue) -> usize {
 /// The distinct elements of every array a value may be, in first-seen order. An unknown
 /// alternative is kept, since the arrays it stands for may hold anything.
 fn collect_array_elements(value: &QueryValue, elements: &mut Vec<QueryValue>) {
-    let mut add = |element: &QueryValue| {
-        if !elements.contains(element) {
+    // An element chosen among values, such as `table[key]`, may be any of them.
+    fn add(element: &QueryValue, elements: &mut Vec<QueryValue>) {
+        if let QueryValue::Alternatives { values } = element {
+            // A choice that may find nothing, such as a missing table entry, adds no item.
+            for value in values {
+                if !matches!(value, QueryValue::Null | QueryValue::Undefined) {
+                    add(value, elements);
+                }
+            }
+        } else if !elements.contains(element) {
             elements.push(element.clone());
         }
-    };
+    }
     match value {
-        QueryValue::Array { elements: items } => items.iter().for_each(&mut add),
+        QueryValue::Array { elements: items } => {
+            for item in items {
+                add(item, elements);
+            }
+        }
         QueryValue::Alternatives { values } => {
             for value in values {
                 collect_array_elements(value, elements);
             }
         }
-        QueryValue::Unknown { .. } => add(value),
+        QueryValue::Unknown { .. } => add(value, elements),
         _ => {}
     }
 }

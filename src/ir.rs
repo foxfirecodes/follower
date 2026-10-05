@@ -335,6 +335,9 @@ pub struct FlowRecordField {
     /// `...value` copies the value's properties at this point; `property` is unused.
     #[serde(default)]
     pub spread: bool,
+    /// The key of `[key]: value`, evaluated to name the property; `property` is unused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computed: Option<FlowExpression>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

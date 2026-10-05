@@ -357,11 +357,15 @@ fn object_spread_keeps_known_properties_of_each_alternative() {
         "src/App.tsx",
         "import { Leaf } from './Leaf'; import { extra } from 'external-values'; function Base({ children, hover }) { const base = { kind: 'base', ...(hover ? { kind: 'hovered' } : {}) }; return children({ ...base, size: 'md' }); } function Open() { const merged = { action: 'listed', ...extra }; return <Leaf action={merged.action} />; } export function App() { return <div><Base hover={false}>{(props) => <Leaf action={props.kind} />}</Base><Base hover>{(props) => <Leaf action={props.size} />}</Base><Open /></div>; }",
     )]);
-    // A spread of an unknown value may overwrite properties listed before it, so that read is a
-    // joined unknown; the other spreads keep exact values.
+    // A spread of an unknown value may overwrite properties listed before it, so that read is
+    // the listed value or an unknown; the other spreads keep exact values.
     assert_eq!(
         exact,
-        ["Unknown { reason: \"joined_alternatives\" }", "base", "md"],
+        [
+            "Alternatives { values: [String { value: \"listed\" }, Unknown { reason: \"object_spread_of_unknown_value\" }] }",
+            "base",
+            "md"
+        ],
         "{other:?}"
     );
 }
@@ -934,6 +938,169 @@ fn set_and_array_membership_decide_filters_with_unknown_conditions() {
         collect_enum_members(value, &mut names);
     }
     assert_eq!(names, ["B", "C"]);
+}
+
+const ITEMS_QUERY: &str = "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n";
+
+/// The enum members a callsite may request, from its explored values or what the source pushes,
+/// and whether any of them is unknown.
+fn requested_members(report: &code_flow::query::QueryReport) -> (Vec<String>, bool) {
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    let values = callsite
+        .possible_elements
+        .get("items")
+        .unwrap_or(&callsite.factory_arguments["items"]);
+    let mut names = Vec::new();
+    for value in values {
+        collect_enum_members(value, &mut names);
+    }
+    names.sort();
+    names.dedup();
+    (names, values.iter().any(contains_unknown))
+}
+
+#[test]
+fn a_choice_between_arrays_holds_what_each_pushes() {
+    // Independent pushes make more arrays than exploration keeps, so the source says what the
+    // list may hold, through the choice between it and an empty list.
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/kinds.ts",
+            "export enum Kind { A = 1, B = 2, C = 3, D = 4, E = 5, F = 6, G = 7 }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Kind } from './kinds'; import { flag } from 'external-flags'; import { useItemSelection } from './hook'; function Picker() { const kinds: Kind[] = []; if (flag('a')) { kinds.push(Kind.A); } if (flag('b')) { if (flag('c')) { kinds.push(Kind.B); } else if (flag('d')) { kinds.push(Kind.C); } } if (flag('e')) { kinds.push(Kind.D); } if (flag('f')) { kinds.push(Kind.E); } if (flag('g')) { kinds.push(Kind.F); } if (flag('h')) { kinds.push(Kind.G); } const [, apply] = useItemSelection(flag('hidden') ? [] : kinds); apply('pick'); return null; } export function App() { return <Picker />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", ITEMS_QUERY);
+    let (names, unknown) = requested_members(&fixture.report());
+    assert_eq!(names, ["A", "B", "C", "D", "E", "F", "G"]);
+    assert!(!unknown);
+}
+
+#[test]
+fn tables_with_computed_keys_give_any_entry_for_an_unknown_key() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/kinds.ts",
+            "export enum Kind { A = 1, B = 2, C = 3, D = 4, E = 5 }",
+        ),
+        (
+            "src/names.ts",
+            "export const Names = { ONE: 'one', TWO: 'two', THREE: 'three' } as const;",
+        ),
+        (
+            "src/App.tsx",
+            "import { Kind } from './kinds'; import { Names } from './names'; import { pick } from 'external-pick'; import { useItemSelection } from './hook'; const TABLE = { [Names.ONE]: Kind.A, [Names.TWO]: Kind.B, [Kind.C]: Kind.D }; function Picker({ name }) { const kind = TABLE[name]; if (kind != null) { const [, apply] = useItemSelection([kind, TABLE[Names.THREE] ?? Kind.E]); apply('pick'); } return null; } export function App() { return <Picker name={pick()} />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", ITEMS_QUERY);
+    // The unknown key reads one of the table's entries; the known key reads a missing entry.
+    let (names, unknown) = requested_members(&fixture.report());
+    assert_eq!(names, ["A", "B", "D", "E"]);
+    assert!(!unknown);
+}
+
+#[test]
+fn callsite_arguments_parse_the_modules_their_values_come_from() {
+    // Neither the config, the hook that builds the other entry, nor the enum holds the filter
+    // term, so only the values that reach the callsite's argument ask for them.
+    let fixture = TestProject::new(&[
+        HOOK,
+        ("src/kinds.ts", "export enum Kind { A = 1, B = 2, C = 3 }"),
+        (
+            "src/config.ts",
+            "import { Kind } from './kinds'; const Current = { content: Kind.B, label: 'current' }; export default Current;",
+        ),
+        (
+            "src/useConfig.ts",
+            "import * as React from 'react'; import { Kind } from './kinds'; import { flag } from 'external-flags'; function build(source) { if (source == null) { return null; } return { content: Kind.C, title: source.title }; } export function useConfig() { const show = flag('show'); const source = flag('source'); const config = React.useMemo(() => (show ? build(source) : null), [show, source]); return { show, config }; }",
+        ),
+        (
+            "src/App.tsx",
+            "import Current from './config'; import { useConfig } from './useConfig'; import { flag } from 'external-flags'; import { useItemSelection } from './hook'; function Picker() { const { show, config } = useConfig(); const items = []; if (flag('current') && Current.content != null) { items.push(Current.content); } if (show && config != null) { items.push(config.content); } const [, apply] = useItemSelection(items); apply('pick'); return null; } export function App() { return <Picker />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\nsource_contains_any = ['useItemSelection']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", ITEMS_QUERY);
+    let (names, unknown) = requested_members(&fixture.report());
+    assert_eq!(names, ["B", "C"]);
+    assert!(!unknown);
+}
+
+#[test]
+fn an_unexplored_instance_requests_the_arrays_its_caller_builds() {
+    // The explored caller passes `B`, so the wrapper's items are known; the other callers are never
+    // rendered, and their calls apply to what they build or are given, not to the explored
+    // caller's items.
+    let fixture = TestProject::new(&[
+        HOOK,
+        ("src/kinds.ts", "export enum Kind { A = 1, B = 2, C = 3 }"),
+        (
+            "src/Tagged.tsx",
+            "import { Kind } from './kinds'; import Sel from './Sel'; function Tagged({ kind }) { return <Sel kinds={[kind]}>{({ apply }) => <button onClick={() => apply('c')} />}</Sel>; } export function Uses() { return <Tagged kind={Kind.C} />; }",
+        ),
+        (
+            "src/Sel.tsx",
+            "import { useItemSelection } from './hook'; export default function Sel({ kinds, children }) { const [visible, apply] = useItemSelection(kinds); return children({ visible, apply }); }",
+        ),
+        (
+            "src/Unrendered.tsx",
+            "import { Kind } from './kinds'; import Sel from './Sel'; export function Unrendered({ disabled }) { const kinds = disabled ? [] : [Kind.A]; return <Sel kinds={kinds}>{({ visible, apply }) => (visible === Kind.A ? <button onClick={() => apply('a')} /> : null)}</Sel>; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Kind } from './kinds'; import Sel from './Sel'; export function App() { return <Sel kinds={[Kind.B]}>{({ visible, apply }) => (visible === Kind.B ? <button onClick={() => apply('b')} /> : null)}</Sel>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", ITEMS_QUERY);
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    let mut applied = callsite
+        .capability
+        .calls
+        .iter()
+        .map(|call| {
+            let mut names = Vec::new();
+            for value in &call.elements["items"] {
+                collect_enum_members(value, &mut names);
+            }
+            (format!("{:?}", call.arguments["action"]), names)
+        })
+        .collect::<Vec<_>>();
+    applied.sort();
+    assert_eq!(
+        applied,
+        [
+            ("[String { value: \"a\" }]".to_owned(), vec!["A".to_owned()]),
+            ("[String { value: \"b\" }]".to_owned(), vec!["B".to_owned()]),
+            ("[String { value: \"c\" }]".to_owned(), vec!["C".to_owned()]),
+        ],
+        "{:?}",
+        callsite.capability.excluded_calls
+    );
 }
 
 #[test]

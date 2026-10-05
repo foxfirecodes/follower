@@ -368,8 +368,25 @@ fn callsite_items(callsite: &QueryCallsiteValues, label: &str) -> (Vec<QueryValu
 }
 
 fn collect_elements(value: &QueryValue, add: &mut impl FnMut(&QueryValue)) {
+    // An element chosen among values, such as `table[key]`, may be any of them.
+    fn add_element(element: &QueryValue, add: &mut impl FnMut(&QueryValue)) {
+        if let QueryValue::Alternatives { values } = element {
+            // A choice that may find nothing, such as a missing table entry, adds no item.
+            for value in values {
+                if !matches!(value, QueryValue::Null | QueryValue::Undefined) {
+                    add_element(value, add);
+                }
+            }
+        } else {
+            add(element);
+        }
+    }
     match value {
-        QueryValue::Array { elements } => elements.iter().for_each(add),
+        QueryValue::Array { elements } => {
+            for element in elements {
+                add_element(element, add);
+            }
+        }
         QueryValue::Alternatives { values } => {
             for value in values {
                 collect_elements(value, add);
