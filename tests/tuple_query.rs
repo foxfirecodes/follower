@@ -1149,10 +1149,7 @@ fn callsite_walk_follows_configured_component_wrappers() {
     actions.sort();
     assert_eq!(
         actions,
-        [
-            "String { value: \"card\" }",
-            "String { value: \"panel\" }"
-        ]
+        ["String { value: \"card\" }", "String { value: \"panel\" }"]
     );
     // The props of a wrapped component are followed into the component, through a curried
     // wrapper and through one wrapper around another.
@@ -1163,6 +1160,109 @@ fn callsite_walk_follows_configured_component_wrappers() {
     );
     // Exploration renders the configured wrappers' components too.
     assert!(callsite.capability.calls.iter().all(|call| call.explored));
+}
+
+#[test]
+fn callsite_walk_follows_props_into_components_configured_openers_open() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/Panel.tsx",
+            "export default function Panel({ onDone }) { return <button onClick={() => onDone('panel')} />; }",
+        ),
+        (
+            "src/Nested.tsx",
+            "export default function Nested({ onDone }) { return <button onClick={() => onDone('nested')} />; }",
+        ),
+        (
+            "src/SheetA.tsx",
+            "export default function SheetA({ onDone }) { return <button onClick={() => onDone('sheet_a')} />; }",
+        ),
+        (
+            "src/Rendered.tsx",
+            "export default function Rendered({ onDone }) { return <button onClick={() => onDone('rendered')} />; }",
+        ),
+        (
+            "src/SheetB.tsx",
+            "export default function SheetB({ onDone }) { return <button onClick={() => onDone('sheet_b')} />; }",
+        ),
+        // Opens whichever sheet its caller's importer loads, with a wrapper around `onDone`.
+        (
+            "src/Opener.tsx",
+            "import Sheets from 'external-ui'; export function Opener(props) { Sheets.openDeferred(props.importer(), 'key', { ...props, onDone: (kind) => props.onDone(kind) }); return null; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { openThing, openWithProps, openRender } from 'external-ui'; import Panel from './Panel'; import Rendered from './Rendered'; import Nested from './Nested'; import { Opener } from './Opener'; import { useItemSelection } from './hook'; function loadA() { return import('./SheetA'); } function Direct() { const [, apply] = useItemSelection(['direct']); openThing(Panel, { onDone: apply }); openWithProps(Nested, { props: { onDone: apply } }); return null; } function A() { const [, apply] = useItemSelection(['a']); return <Opener importer={loadA} onDone={apply} />; } function B() { const [, apply] = useItemSelection(['b']); return <Opener importer={() => import('./SheetB')} onDone={apply} />; } function Render() { const [, apply] = useItemSelection(['render']); openRender(() => <Rendered onDone={apply} />); return null; } export function App() { return <div><Direct /><A /><B /><Render /></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n[[component_openers]]\nmodule = 'external-ui'\nexport = 'openThing'\ncomponent_argument = 0\nprops_argument = 1\n[[component_openers]]\nmodule = 'external-ui'\nexport = 'openWithProps'\ncomponent_argument = 0\nprops_argument = 1\nprops_path = ['props']\n[[component_openers]]\nmodule = 'external-ui'\nexport = 'default.openDeferred'\ncomponent_argument = 0\nprops_argument = 2\n[[component_openers]]\nmodule = 'external-ui'\nexport = 'openRender'\nrender_argument = 0\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let callsite = |items: &str| {
+        report
+            .callsites
+            .iter()
+            .find(|callsite| {
+                callsite.factory_arguments["items"]
+                    == [QueryValue::Array {
+                        elements: vec![QueryValue::String {
+                            value: items.to_owned(),
+                        }],
+                    }]
+            })
+            .unwrap_or_else(|| panic!("callsite for {items}"))
+    };
+    let actions = |items: &str| {
+        let mut actions = callsite(items)
+            .capability
+            .calls
+            .iter()
+            .flat_map(|call| &call.arguments["action"])
+            .map(|value| match value {
+                QueryValue::String { value } => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        actions.sort();
+        actions
+    };
+    // A component and its props, with the props at the top of the argument or under a path.
+    assert_eq!(actions("direct"), ["nested", "panel"]);
+    // The opener's component comes from the importer each element passes, so each sheet's
+    // calls belong only to the callsite whose element opened it.
+    assert_eq!(actions("a"), ["sheet_a"]);
+    assert_eq!(actions("b"), ["sheet_b"]);
+    assert_eq!(actions("render"), ["rendered"]);
+    for items in ["direct", "a", "b", "render"] {
+        assert!(
+            callsite(items).capability.escapes.is_empty(),
+            "{items}: {:?}",
+            callsite(items).capability.escapes
+        );
+        // Exploration renders what the openers open, so it runs each call.
+        assert!(
+            callsite(items)
+                .capability
+                .calls
+                .iter()
+                .all(|call| call.explored),
+            "{items}: {:?}",
+            callsite(items).capability.calls
+        );
+    }
+    let via = &callsite("a").capability.calls[0].via;
+    assert!(
+        via.iter()
+            .any(|step| step == "props of the component Sheets.openDeferred opens"),
+        "{via:?}"
+    );
 }
 
 #[test]

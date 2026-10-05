@@ -101,6 +101,16 @@ enum Lead<'e> {
         parameter: usize,
         steps: Vec<Step>,
         hop: String,
+        /// The call or element that passes the value, in the scope being left.
+        site: SourceSpan,
+    },
+    /// Passed in the props a configured opener renders `component` with.
+    Open {
+        component: &'e FlowExpression,
+        steps: Vec<Step>,
+        span: SourceSpan,
+        text: String,
+        context: Vec<String>,
     },
     Callers(Vec<Step>),
     /// Passed to a call of `root` at `path`, which may be a parameter whose callers pass a
@@ -815,9 +825,111 @@ impl Solver<'_> {
             .unwrap_or_else(|| vec![UseNode::Global(index)])
     }
 
+    /// The scopes of the component a configured opener renders: the component, an import of its
+    /// module, or a loader, written at the call or, for a parameter, passed by the site the walk
+    /// entered the scope through. `loader()`, as in `open(props.importer(), props)`, opens what
+    /// the loader loads.
+    fn opened_scopes(
+        &self,
+        code: &ScopeCode<'_>,
+        imports: &Imports,
+        scope: &UseNode,
+        entered: Option<&(UseNode, SourceSpan)>,
+        component: &FlowExpression,
+        unparsed: &mut BTreeSet<PathBuf>,
+    ) -> Vec<UseNode> {
+        let (expression, called) = match &component.kind {
+            FlowExpressionKind::Call { callee, arguments } if arguments.is_empty() => {
+                (callee.as_ref(), true)
+            }
+            _ => (component, false),
+        };
+        if let Some((root, path)) = read_path(expression)
+            && !imports.contains_key(&root)
+            && let Some(binding) =
+                code.params.iter().enumerate().find_map(|(index, param)| {
+                    pattern_path(param, &root).map(|inner| (index, inner))
+                })
+        {
+            // Without the site, the value is any caller's, which would open every caller's
+            // component on this path.
+            let Some((user, site)) = entered else {
+                return Vec::new();
+            };
+            let (index, inner) = binding;
+            let steps = inner.into_iter().chain(path).collect();
+            return self
+                .passed_values(user, site, scope, &[(root, (index, steps))])
+                .and_then(|(caller_file, passed)| {
+                    let (_, value) = passed.into_iter().next()?;
+                    Some(self.component_scopes(
+                        caller_file,
+                        &Imports::new(),
+                        &value,
+                        called,
+                        unparsed,
+                    ))
+                })
+                .unwrap_or_default();
+        }
+        self.component_scopes(code.file_id, imports, expression, called, unparsed)
+    }
+
+    /// The scopes of a component written in a file, or of the component a module import or a
+    /// loader loads; with `called`, the expression is a loader the opener's argument calls. A
+    /// loaded module that is not parsed goes to `unparsed`.
+    fn component_scopes(
+        &self,
+        file_id: FileId,
+        imports: &Imports,
+        expression: &FlowExpression,
+        called: bool,
+        unparsed: &mut BTreeSet<PathBuf>,
+    ) -> Vec<UseNode> {
+        let mut export_scopes = |file_id: FileId, module: &str, export: &str| {
+            self.module_export_scopes(file_id, module, export)
+                .unwrap_or_else(|| {
+                    unparsed.extend(self.unparsed_module(file_id, module));
+                    Vec::new()
+                })
+        };
+        if let Some((module, export)) = imported_module(expression, imports) {
+            return export_scopes(file_id, &module, &export);
+        }
+        let scopes = match &expression.kind {
+            FlowExpressionKind::Identifier { name, .. } => {
+                self.resolve_scopes(file_id, imports, name, None)
+            }
+            FlowExpressionKind::StaticMember { object, property } => match &object.kind {
+                FlowExpressionKind::Identifier { name, .. } => {
+                    self.resolve_scopes(file_id, imports, name, Some(property))
+                }
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        // A declared loader, as `function loadPanel() { return import('./Panel'); }`.
+        let loader = scopes.iter().find_map(|scope| match scope {
+            UseNode::Function(key) => statements_module(&self.functions.get(key)?.body)
+                .map(|module| (key.file_id, module)),
+            UseNode::Global(index) => {
+                let (file_id, binding) = self.globals_ir.get(*index)?;
+                loaded_module(&binding.value).map(|module| (*file_id, module))
+            }
+        });
+        if let Some((file_id, (module, export))) = loader {
+            return export_scopes(file_id, &module, &export);
+        }
+        if called { Vec::new() } else { scopes }
+    }
+
     /// The component a value renders through configured wrappers, as `Panel` in
     /// `withTheme(connect(mapState)(Panel))`, or the value itself.
-    fn wrapped_component<'e>(&self, file_id: FileId, mut value: &'e FlowExpression) -> &'e FlowExpression {
+    fn wrapped_component<'e>(
+        &self,
+        file_id: FileId,
+        mut value: &'e FlowExpression,
+    ) -> &'e FlowExpression {
         let Some(file) = self.symbol_linker.file(file_id) else {
             return value;
         };
@@ -1000,6 +1112,27 @@ impl Solver<'_> {
                         std::iter::once("current".to_owned()).chain(steps).collect(),
                     );
                 }
+                // Props a configured opener renders its component with.
+                if let Some(opener) = self
+                    .symbol_linker
+                    .file(file_id)
+                    .and_then(|file| self.project.config.component_opener(&file.flow, callee))
+                    && opener.props_argument == Some(*position)
+                    && let Some(FlowExpressionKind::Call { arguments, .. }) =
+                        parent.map(|parent| &parent.kind)
+                    && let Some(component) = opener
+                        .component_argument
+                        .and_then(|index| arguments.get(index))
+                    && steps.starts_with(&opener.props_path)
+                {
+                    return Lead::Open {
+                        component,
+                        steps: steps[opener.props_path.len()..].to_vec(),
+                        span: span.clone(),
+                        text,
+                        context: context_of(frames, index),
+                    };
+                }
                 let scopes = match &callee.kind {
                     FlowExpressionKind::Identifier { name, .. } => {
                         self.resolve_scopes(file_id, imports, name, None)
@@ -1028,6 +1161,7 @@ impl Solver<'_> {
                         parameter: 0,
                         steps,
                         hop: format!("props passed with the component {text} loads from {module}"),
+                        site: span.clone(),
                     };
                 }
                 if scopes.is_empty() {
@@ -1056,6 +1190,7 @@ impl Solver<'_> {
                         parameter: *position,
                         steps,
                         hop: format!("argument {} of {text}", position + 1),
+                        site: span.clone(),
                     }
                 }
             }
@@ -1130,6 +1265,7 @@ impl Solver<'_> {
                         parameter: 0,
                         steps,
                         hop: shown,
+                        site: span.clone(),
                     }
                 }
             }
@@ -1265,14 +1401,26 @@ impl Solver<'_> {
             direct,
             Rc::new(Vec::<OwnedGuard>::new()),
             None::<SourceSpan>,
+            None::<Rc<(UseNode, SourceSpan)>>,
         )]);
         let mut seen = HashSet::new();
         let mut locals_cache = HashMap::<UseNode, Rc<BTreeSet<String>>>::new();
         let mut recorded = HashSet::new();
-        while let Some((scope, target, via, forward, carried, instance)) = queue.pop_front() {
+        // Each entry is a scope and what to follow in it, with the path so far, how calls map to
+        // the result's arguments, the conditions carried in, the caller site that supplied the
+        // callsite's arguments, and the scope and site the walk entered this scope through.
+        while let Some((scope, target, via, forward, carried, instance, entered)) =
+            queue.pop_front()
+        {
             let inner = forward.inner.as_ref().map(span_key);
             if seen.len() >= WALK_LIMIT
-                || !seen.insert((scope.clone(), target.clone(), inner, guard_key(&carried)))
+                || !seen.insert((
+                    scope.clone(),
+                    target.clone(),
+                    inner,
+                    guard_key(&carried),
+                    entered.as_ref().map(|entered| span_key(&entered.1)),
+                ))
             {
                 continue;
             }
@@ -1286,6 +1434,39 @@ impl Solver<'_> {
             let mut leads = Vec::new();
             let file_id = code.file_id;
             let imports = &local_imports(&code.body);
+            let open = |component: &FlowExpression,
+                        steps: Vec<Step>,
+                        span: SourceSpan,
+                        text: String,
+                        context: Vec<String>| {
+                let mut unparsed = BTreeSet::new();
+                let scopes = self.opened_scopes(
+                    &code,
+                    imports,
+                    &scope,
+                    entered.as_deref(),
+                    component,
+                    &mut unparsed,
+                );
+                if scopes.is_empty() {
+                    OwnedLead::Escape {
+                        span,
+                        detail: format!(
+                            "props of the component {text} opens, which the walk does not resolve"
+                        ),
+                        context,
+                        unparsed,
+                    }
+                } else {
+                    OwnedLead::Enter {
+                        scopes,
+                        parameter: 0,
+                        steps,
+                        hop: format!("props of the component {text} opens"),
+                        site: span,
+                    }
+                }
+            };
             let mut found = |frames: &[Frame<'_>], local: &[Guard<'_>]| {
                 let frame = frames.last().expect("visited frame");
                 let expression = frame.expression;
@@ -1391,7 +1572,7 @@ impl Solver<'_> {
                         if forwarded && let Some(arrow) = arrow {
                             let lead = self
                                 .follow(file_id, imports, frames, arrow, Vec::new())
-                                .into_owned();
+                                .into_owned(&open);
                             leads.push(Found::Lead(
                                 lead,
                                 Rc::new(Forward {
@@ -1435,7 +1616,7 @@ impl Solver<'_> {
                         }));
                     }
                     other => leads.push(Found::Lead(
-                        other.into_owned(),
+                        other.into_owned(&open),
                         forward.clone(),
                         None,
                         here(),
@@ -1477,6 +1658,7 @@ impl Solver<'_> {
                             forward,
                             carried.clone(),
                             instance.clone(),
+                            entered.clone(),
                         ));
                     }
                     OwnedLead::Enter {
@@ -1484,6 +1666,7 @@ impl Solver<'_> {
                         parameter,
                         steps,
                         hop,
+                        site,
                     } => {
                         walk.used = true;
                         if via.len() >= MAX_HOPS {
@@ -1514,6 +1697,7 @@ impl Solver<'_> {
                             };
                             let mut targets = Vec::new();
                             bind_targets(param, &steps, &mut targets);
+                            let entered = Rc::new((scope.clone(), site.clone()));
                             for target in targets {
                                 queue.push_back((
                                     next.clone(),
@@ -1522,6 +1706,7 @@ impl Solver<'_> {
                                     forward.clone(),
                                     here.clone(),
                                     instance.clone(),
+                                    Some(entered.clone()),
                                 ));
                             }
                         }
@@ -1565,6 +1750,7 @@ impl Solver<'_> {
                                 forward.clone(),
                                 here.clone(),
                                 from_caller(&edge.site),
+                                None,
                             ));
                         }
                     }
@@ -1641,6 +1827,7 @@ impl Solver<'_> {
                                             forward.clone(),
                                             here.clone(),
                                             from_caller(&edge.site),
+                                            None,
                                         ));
                                     }
                                 }
@@ -1664,6 +1851,7 @@ impl Solver<'_> {
                                                 forward.clone(),
                                                 here.clone(),
                                                 from_caller(&edge.site),
+                                                None,
                                             ));
                                         }
                                     }
@@ -1679,6 +1867,7 @@ impl Solver<'_> {
                                                 forward.clone(),
                                                 here.clone(),
                                                 from_caller(&edge.site),
+                                                None,
                                             ));
                                         }
                                     }
@@ -1776,21 +1965,26 @@ impl Solver<'_> {
 
     /// The files outside the snapshot that resolving a name from a file needs: the module a local
     /// bound to `import()` loads, or the modules that linking the name reached.
-    fn unparsed_targets(&self, file_id: FileId, imports: &Imports, name: &str) -> BTreeSet<PathBuf> {
+    fn unparsed_targets(
+        &self,
+        file_id: FileId,
+        imports: &Imports,
+        name: &str,
+    ) -> BTreeSet<PathBuf> {
         let Some((module, _)) = imports.get(name) else {
             return self.symbol_linker.unparsed_link_targets(file_id, name);
         };
+        self.unparsed_module(file_id, module).into_iter().collect()
+    }
+
+    /// The file a module specifier written in a file resolves to, when it is not parsed.
+    fn unparsed_module(&self, file_id: FileId, module: &str) -> Option<PathBuf> {
+        let file = self.symbol_linker.file(file_id)?;
         self.symbol_linker
-            .file(file_id)
-            .and_then(|file| {
-                self.symbol_linker
-                    .import_resolutions(&file.path)
-                    .filter(|resolution| &resolution.specifier == module)
-                    .find_map(|resolution| resolution.resolved_path.clone())
-            })
+            .import_resolutions(&file.path)
+            .filter(|resolution| resolution.specifier == module)
+            .find_map(|resolution| resolution.resolved_path.clone())
             .filter(|path| self.symbol_linker.file_at(path).is_none())
-            .into_iter()
-            .collect()
     }
 
     fn scope_span(&self, scope: &UseNode) -> SourceSpan {
@@ -2570,9 +2764,15 @@ impl Solver<'_> {
         calls.sort_by(|left, right| {
             location_key(left.location.as_ref()).cmp(&location_key(right.location.as_ref()))
         });
+        // A scope entered through several sites meets its escapes once for each; the first path
+        // stands for them.
+        let mut met = HashSet::new();
         let escapes = walk
             .escapes
             .into_iter()
+            .filter(|(span, detail, context, _)| {
+                met.insert((span_key(span), detail.clone(), context.clone()))
+            })
             .map(|(span, detail, context, via)| QueryCapabilityEscape {
                 location: self.query_location(&span),
                 detail,
@@ -2630,6 +2830,7 @@ enum OwnedLead {
         parameter: usize,
         steps: Vec<Step>,
         hop: String,
+        site: SourceSpan,
     },
     Callers(Vec<Step>),
     ParameterCall {
@@ -2651,8 +2852,13 @@ enum OwnedLead {
     Unrelated,
 }
 
-impl Lead<'_> {
-    fn into_owned(self) -> OwnedLead {
+impl<'e> Lead<'e> {
+    /// The lead without borrowed frames; `open` resolves the component a configured opener
+    /// renders, given the lead's component, steps, span, callee text, and context.
+    fn into_owned(
+        self,
+        open: &dyn Fn(&'e FlowExpression, Vec<Step>, SourceSpan, String, Vec<String>) -> OwnedLead,
+    ) -> OwnedLead {
         match self {
             Lead::Same(target) => OwnedLead::Same(target),
             Lead::Enter {
@@ -2660,12 +2866,21 @@ impl Lead<'_> {
                 parameter,
                 steps,
                 hop,
+                site,
             } => OwnedLead::Enter {
                 scopes,
                 parameter,
                 steps,
                 hop,
+                site,
             },
+            Lead::Open {
+                component,
+                steps,
+                span,
+                text,
+                context,
+            } => open(component, steps, span, text, context),
             Lead::Callers(steps) => OwnedLead::Callers(steps),
             Lead::ParameterCall {
                 root,
@@ -2707,17 +2922,27 @@ fn loaded_module(callback: &FlowExpression) -> Option<(String, String)> {
     let FlowExpressionKind::Arrow { body, .. } = &callback.kind else {
         return None;
     };
-    let returned = match body {
-        FlowArrowBody::Expression { expression } => expression.as_ref(),
-        FlowArrowBody::Statements { statements } => {
-            statements.iter().find_map(|statement| match statement {
-                FlowStatement::Return {
-                    value: Some(value), ..
-                } => Some(value),
-                _ => None,
-            })?
-        }
-    };
+    match body {
+        FlowArrowBody::Expression { expression } => returned_module(expression),
+        FlowArrowBody::Statements { statements } => statements_module(statements),
+    }
+}
+
+/// The module and export a function body's first `return` loads.
+pub(super) fn statements_module(statements: &[FlowStatement]) -> Option<(String, String)> {
+    statements
+        .iter()
+        .find_map(|statement| match statement {
+            FlowStatement::Return {
+                value: Some(value), ..
+            } => Some(value),
+            _ => None,
+        })
+        .and_then(returned_module)
+}
+
+/// The module and export a returned value loads, as for `loaded_module`.
+pub(super) fn returned_module(returned: &FlowExpression) -> Option<(String, String)> {
     match &returned.kind {
         FlowExpressionKind::DynamicImport { module } => {
             Some((module.clone(), "default".to_owned()))
@@ -2926,14 +3151,12 @@ fn imported_module(argument: &FlowExpression, imports: &Imports) -> Option<(Stri
         FlowExpressionKind::DynamicImport { module } => {
             Some((module.clone(), "default".to_owned()))
         }
-        FlowExpressionKind::Identifier { name, .. } => {
-            imports.get(name).map(|(module, export)| {
-                (
-                    module.clone(),
-                    export.clone().unwrap_or_else(|| "default".to_owned()),
-                )
-            })
-        }
+        FlowExpressionKind::Identifier { name, .. } => imports.get(name).map(|(module, export)| {
+            (
+                module.clone(),
+                export.clone().unwrap_or_else(|| "default".to_owned()),
+            )
+        }),
         FlowExpressionKind::Arrow { .. } => loaded_module(argument),
         _ => None,
     }

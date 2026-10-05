@@ -23,7 +23,7 @@ use crate::{
     },
     link::{LinkedSymbol, LinkedValue, SymbolLinker, ValueResolution, pattern_names},
     models::{CallbackFactoryModel, CaptureSource, ModelEvidence, ModelValue, ModeledOperation},
-    project::{ComponentConsumer, Project},
+    project::{ComponentConsumer, ComponentOpener, Project},
     queries::{AuditFinding, AuditReport, Conclusion, Coverage, FindingRef},
     query::{
         QueryBoundaryKind, QueryCallPathKind, QueryCallPathStep, QueryCallsiteInventory,
@@ -2531,33 +2531,23 @@ impl<'a> Solver<'a> {
                         .lazy_factory_property(&file.flow, callee)
                 }) && let Some(module) = lazy_component_import(expression, property)
                 {
-                    let target = self
-                        .symbol_linker
-                        .file(file_id)
-                        .and_then(|file| {
-                            self.symbol_linker
-                                .import_resolutions(&file.path)
-                                .find(|resolution| resolution.specifier == module)
-                        })
-                        .and_then(|resolution| resolution.resolved_path.clone());
-                    if let Some(target) = target {
-                        if let Some(file) = self.symbol_linker.file_at(&target) {
-                            let exported = self
-                                .symbol_linker
-                                .resolve_exported_value(file.file_id, "default");
-                            return self.linked_value(exported, &expression.span);
-                        }
-                        if self.current_reachability != Reachability::Unknown {
-                            self.request_root_import(&target);
-                        }
-                        self.requested_imports.insert(target);
-                    } else {
-                        self.record_coverage_gap(
-                            "lazy component import did not resolve",
-                            &expression.span,
-                        );
-                    }
-                    return TrackedValue::unknown("unresolved_lazy_component");
+                    return self
+                        .module_export_value(file_id, module, "default", &expression.span)
+                        .unwrap_or_else(|| TrackedValue::unknown("unresolved_lazy_component"));
+                }
+                if let Some(opener) = self
+                    .symbol_linker
+                    .file(file_id)
+                    .and_then(|file| self.project.config.component_opener(&file.flow, callee))
+                    .cloned()
+                {
+                    return self.open_component(
+                        &opener,
+                        expression,
+                        arguments,
+                        environment,
+                        file_id,
+                    );
                 }
                 if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
                     && property == "values"
@@ -5274,6 +5264,166 @@ impl<'a> Solver<'a> {
         self.assumed_renders.pop();
         self.assumed_boundaries.pop();
         self.current_reachability = previous;
+    }
+
+    /// The value of a module's export, for a module specifier written in a file. A module that is
+    /// not parsed is requested, and gives `None` like one that does not resolve.
+    fn module_export_value(
+        &mut self,
+        file_id: FileId,
+        module: &str,
+        export: &str,
+        span: &SourceSpan,
+    ) -> Option<TrackedValue> {
+        let target = self
+            .symbol_linker
+            .file(file_id)
+            .and_then(|file| {
+                self.symbol_linker
+                    .import_resolutions(&file.path)
+                    .find(|resolution| resolution.specifier == module)
+            })
+            .and_then(|resolution| resolution.resolved_path.clone());
+        let Some(target) = target else {
+            self.record_coverage_gap("component import did not resolve", span);
+            return None;
+        };
+        if let Some(file) = self.symbol_linker.file_at(&target) {
+            let exported = self
+                .symbol_linker
+                .resolve_exported_value(file.file_id, export);
+            return Some(self.linked_value(exported, span));
+        }
+        if self.current_reachability != Reachability::Unknown {
+            self.request_root_import(&target);
+        }
+        self.requested_imports.insert(target);
+        None
+    }
+
+    /// Explores what a configured opener renders, as a configured component's render props are:
+    /// the component with its props, or what the render function returns. The opener's other
+    /// arguments go to it as to an unknown call.
+    fn open_component(
+        &mut self,
+        opener: &ComponentOpener,
+        call: &FlowExpression,
+        arguments: &[FlowExpression],
+        environment: &Environment,
+        file_id: FileId,
+    ) -> TrackedValue {
+        let values = arguments
+            .iter()
+            .map(|argument| self.eval(argument, environment, file_id))
+            .collect::<Vec<_>>();
+        if let Some(index) = opener.component_argument
+            && let Some(argument) = arguments.get(index)
+            && let Some(component) =
+                self.opened_component(argument, &values[index], environment, file_id, &call.span)
+        {
+            let props = opener
+                .props_argument
+                .and_then(|index| values.get(index))
+                .map(|props| {
+                    opener.props_path.iter().fold(props.clone(), |value, step| {
+                        self.read_property(
+                            value,
+                            step,
+                            call.span.clone(),
+                            RelationKind::ValueTransfer,
+                        )
+                    })
+                });
+            let props = match props.map(|props| self.materialize(&props).value) {
+                Some(AbstractValue::Record(fields)) => Rc::unwrap_or_clone(fields),
+                _ => RecordFields {
+                    fields: BTreeMap::new(),
+                    open: Some("props_from_component_opener".to_owned()),
+                },
+            };
+            self.render(TrackedValue::plain(AbstractValue::element(ElementValue {
+                component: Box::new(component),
+                props,
+                span: call.span.clone(),
+                trace: self.trace.clone(),
+                tag: None,
+            })));
+        }
+        if let Some(render) = opener.render_argument.and_then(|index| values.get(index)) {
+            let returned = self.invoke_value(
+                render.clone(),
+                vec![TrackedValue::unknown("component_opener_render_argument")],
+                call.span.clone(),
+            );
+            // The function may return the element, or a component the opener renders.
+            self.render_assumed_prop(&returned, &call.span);
+        }
+        let consumed = [
+            opener.component_argument,
+            opener.props_argument,
+            opener.render_argument,
+        ];
+        let others = values
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !consumed.contains(&Some(*index)))
+            .map(|(_, value)| value)
+            .collect();
+        self.invoke_value(
+            TrackedValue::unknown("configured_component_opener"),
+            others,
+            call.span.clone(),
+        );
+        TrackedValue::unknown("component_opener_result")
+    }
+
+    /// The component an opener's component argument holds: the component, or what an `import()`
+    /// or a loader written at the call, or a loader called there, loads.
+    fn opened_component(
+        &mut self,
+        argument: &FlowExpression,
+        value: &TrackedValue,
+        environment: &Environment,
+        file_id: FileId,
+        span: &SourceSpan,
+    ) -> Option<TrackedValue> {
+        if self.is_component_like(value) {
+            return Some(value.clone());
+        }
+        // A loader that is called, as in `open(props.importer(), props)`, or passed itself.
+        let loader = match &argument.kind {
+            FlowExpressionKind::Call { callee, arguments } if arguments.is_empty() => {
+                self.eval(callee, environment, file_id)
+            }
+            _ => value.clone(),
+        };
+        let (module_file, (module, export)) = match &loader.value {
+            AbstractValue::Function(key) => (
+                key.file_id,
+                callback_uses::statements_module(&self.functions.get(key)?.body)?,
+            ),
+            AbstractValue::Closure(closure) => (
+                closure.file_id,
+                match &closure.body {
+                    FlowArrowBody::Expression { expression } => {
+                        callback_uses::returned_module(expression)?
+                    }
+                    FlowArrowBody::Statements { statements } => {
+                        callback_uses::statements_module(statements)?
+                    }
+                },
+            ),
+            _ => (
+                file_id,
+                match &argument.kind {
+                    FlowExpressionKind::DynamicImport { module } => {
+                        (module.clone(), "default".to_owned())
+                    }
+                    _ => return None,
+                },
+            ),
+        };
+        self.module_export_value(module_file, &module, &export, span)
     }
 
     /// Renders a prop handed to an unmodeled component, including function children.

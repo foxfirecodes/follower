@@ -252,6 +252,27 @@ curried = true
 module = "@sample/lazy"
 export = "loadComponent"
 promise_property = "load"
+
+# open(Panel, { onClose }), open(import('./Panel'), { onClose }), or open(loadPanel, { onClose })
+[[component_openers]]
+module = "@sample/overlay"
+export = "open"
+component_argument = 0
+props_argument = 1
+
+# openSheet(Panel, { props: { onClose } })
+[[component_openers]]
+module = "@sample/overlay"
+export = "openSheet"
+component_argument = 0
+props_argument = 1
+props_path = ["props"]
+
+# openModal(async () => (props) => <Panel {...props} />)
+[[component_openers]]
+module = "@sample/overlay"
+export = "openModal"
+render_argument = 0
 ```
 
 A consumer contract explores the named render callback, component prop, children, or a
@@ -261,7 +282,17 @@ a contract on a package export also covers barrels that re-export it under the s
 render the component at the given argument index; with `curried = true`, the export returns the
 wrapper, as in `connect(mapState)(Panel)`, and the index is in the call of its result. The callsite
 walk follows props of a wrapped component, such as `export default connect(mapState)(Panel)`,
-into `Panel`. A lazy factory contract recognizes a callback
+into `Panel`. An opener contract describes a function that renders a component outside the
+caller's render, such as a modal or sheet opener. `component_argument` holds the component, an
+`import()` of its module, or a loader that returns either, called at the argument or passed itself;
+`props_argument` holds its props, under `props_path` when they are nested. `render_argument` holds
+a function that returns the element, or a component the opener renders. Exploration renders what the
+opener opens as a configured component's render props are rendered, and the callsite walk follows
+props into the opened component, which it finds where the opener is called. When the component
+comes from a parameter, as in `open(props.importer(), props)`, the walk takes what the element or
+call it entered the function through passes for it, so each caller's component gets only its
+caller's path. The walk follows a render function's JSX in the source without a contract, since the
+JSX is written where the result is. A lazy factory contract recognizes a callback
 returning a literal `import()` and links its default export. These contracts describe possible
 paths, not guaranteed
 route matches, authorization, loading, or runtime rendering. Unconfigured imports and dynamic
@@ -445,7 +476,8 @@ same call, or are unknown with the reason, such as a parameter of the enclosing 
 says whether an explored path executed the call. Passing the result as an intrinsic element's event
 handler is a call with an unknown event argument. `escapes` lists where the result went that the
 walk does not follow, such as an unknown function, a store, a property write, a component it cannot
-resolve, or a hook whose callers are not in the parsed files. `status` is `called`,
+resolve, or a hook whose callers are not in the parsed files; an escape that several paths reach
+is listed once, with the first path's `via`. `status` is `called`,
 `called_with_unknown_arguments`, `escapes`, `not_called` (used, for example passed to code that
 ignores it, but never called), or `unused` (not bound, or bound and never used). For an array
 argument with several possible arrays, such as a list filtered by conditions the model cannot

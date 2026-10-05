@@ -67,6 +67,30 @@ pub struct ComponentConsumer {
     pub component_props: Vec<String>,
 }
 
+/// An imported function that opens a component outside the caller's render, such as a modal or
+/// sheet opener: given a component and its props, or a function that renders it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentOpener {
+    pub module: String,
+    pub export: String,
+    /// The argument holding the component: the component, an `import()` of its module, or a
+    /// loader that returns either.
+    #[serde(default)]
+    pub component_argument: Option<usize>,
+    /// The argument holding the component's props.
+    #[serde(default)]
+    pub props_argument: Option<usize>,
+    /// The properties from the props argument to the props, as `["props"]` for
+    /// `open(Panel, { props: { onClose } })`.
+    #[serde(default)]
+    pub props_path: Vec<String>,
+    /// The argument holding a function that returns the element or component to render, directly
+    /// or through a promise.
+    #[serde(default)]
+    pub render_argument: Option<usize>,
+}
+
 fn default_schema_version() -> u32 {
     1
 }
@@ -97,6 +121,8 @@ pub struct ProjectConfig {
     pub component_wrappers: Vec<ComponentWrapper>,
     #[serde(default)]
     pub component_consumers: Vec<ComponentConsumer>,
+    #[serde(default)]
+    pub component_openers: Vec<ComponentOpener>,
     #[serde(default)]
     pub inputs: BTreeMap<String, Vec<String>>,
 }
@@ -204,6 +230,17 @@ impl ProjectConfig {
             .iter()
             .find(|model| model.module == module && model.export == export)
     }
+
+    pub fn component_opener<'a>(
+        &'a self,
+        file: &FlowFileIr,
+        callee: &FlowExpression,
+    ) -> Option<&'a ComponentOpener> {
+        let (module, export) = self.imported_export(file, callee)?;
+        self.component_openers
+            .iter()
+            .find(|model| model.module == module && model.export == export)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -276,6 +313,22 @@ impl Project {
         for wrapper in &config.component_wrappers {
             if wrapper.module.trim().is_empty() || wrapper.export.trim().is_empty() {
                 bail!("component wrappers need a module and export");
+            }
+        }
+        for opener in &config.component_openers {
+            if opener.module.trim().is_empty() || opener.export.trim().is_empty() {
+                bail!("component openers need a module and export");
+            }
+            if opener.component_argument.is_none() && opener.render_argument.is_none() {
+                bail!("component openers need a component_argument or a render_argument");
+            }
+            if opener.component_argument.is_none()
+                && (opener.props_argument.is_some() || !opener.props_path.is_empty())
+            {
+                bail!("component opener props need a component_argument");
+            }
+            if opener.props_path.iter().any(|step| step.trim().is_empty()) {
+                bail!("component opener props_path steps cannot be empty");
             }
         }
         for consumer in &config.component_consumers {
