@@ -1123,36 +1123,59 @@ impl<'a> Solver<'a> {
                 self.trace.clear();
             }
         }
-        self.run_declared_renders();
+        self.run_declared_renders()?;
         self.current_choice = None;
         Ok(())
     }
 
     /// Explores the render roots and render calls the project declares, as possible renders whose
     /// creations are declared rather than reached from an entry.
-    fn run_declared_renders(&mut self) {
+    fn run_declared_renders(&mut self) -> Result<()> {
         let config = &self.project.config;
         if config.render_roots.is_empty() && config.render_calls.is_empty() {
-            return;
+            return Ok(());
         }
         let mut starts = Vec::new();
         for root in &config.render_roots.clone() {
             let path = self.project.resolve_path(&root.module);
-            let Some(file) = path
+            let file = path
                 .canonicalize()
                 .ok()
                 .and_then(|path| self.symbol_linker.file_at(&path))
-            else {
-                continue;
-            };
-            let span = SourceSpan {
-                file_id: file.file_id,
-                start: 0,
-                end: 0,
-            };
+                .with_context(|| {
+                    format!("render root module was not indexed: {}", path.display())
+                })?;
             let resolution = self
                 .symbol_linker
                 .resolve_exported_value(file.file_id, &root.export);
+            if !matches!(resolution, ValueResolution::Resolved(_)) {
+                bail!(
+                    "render root export {} does not resolve in {}",
+                    root.export,
+                    root.module.display()
+                );
+            }
+            // The path starts at the declared function or binding.
+            let span = match &resolution {
+                ValueResolution::Resolved(LinkedValue::Declaration(symbol)) => self
+                    .functions
+                    .get(&FunctionKey {
+                        file_id: symbol.file_id,
+                        name: symbol.name.clone(),
+                    })
+                    .map(|function| function.span.clone())
+                    .or_else(|| {
+                        self.global_bindings
+                            .get(symbol)
+                            .map(|&index| self.globals_ir[index].1.span.clone())
+                    }),
+                _ => None,
+            }
+            .unwrap_or(SourceSpan {
+                file_id: file.file_id,
+                start: 0,
+                end: 0,
+            });
             starts.push((resolution, span));
         }
         let calls = self.declared_render_calls();
@@ -1191,6 +1214,7 @@ impl<'a> Solver<'a> {
         self.trace.clear();
         self.declared_render = false;
         self.current_reachability = Reachability::Reachable;
+        Ok(())
     }
 
     /// The arguments that calls of configured render calls render, in every parsed function and

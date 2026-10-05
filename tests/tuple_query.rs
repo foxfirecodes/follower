@@ -1734,6 +1734,30 @@ fn declared_render_roots_reach_callsites_off_the_entry_chain() {
 }
 
 #[test]
+fn a_render_root_that_does_not_resolve_is_an_error() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        ("src/App.tsx", "export function App() { return null; }"),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n[[render_roots]]\nmodule = 'src/App.tsx'\nexport = 'Missing'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n",
+    );
+    let error = fixture
+        .analyzer()
+        .query(&fixture.query(), "test-query")
+        .expect_err("an unresolved render root fails the query");
+    assert!(
+        format!("{error:#}").contains("render root export Missing does not resolve"),
+        "{error:#}"
+    );
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,

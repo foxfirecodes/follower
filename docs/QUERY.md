@@ -375,8 +375,9 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   project to their string values. Alternatives that include an unknown value project as unknown.
 - `reachable` reports creations explored from configured entry points and finite input domains.
 - When no path from an entry reaches some code, the project can declare that it is rendered. A
-  `[[render_roots]]` entry names a component or function, by file and export like an entry, that
-  exploration starts from with unknown props or arguments. A `[[render_calls]]` entry names an
+  `[[render_roots]]` entry names a component, function, or module binding such as a registry
+  record, by file and export like an entry, that exploration starts from with unknown props or
+  arguments; like an entry, it must resolve, or the query fails. A `[[render_calls]]` entry names an
   imported function whose calls render what they are given: at every call of it in the parsed
   files, wherever the call is, the listed arguments are rendered, with components rendered, functions
   called with unknown arguments and what they return rendered, and records and arrays searched;
