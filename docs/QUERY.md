@@ -309,7 +309,7 @@ holds (`load: importPanel`), and links its default export. These contracts descr
 paths, not guaranteed
 route matches, authorization, loading, or runtime rendering. Exploration takes an awaited value
 as the value itself, so `import('./Panel')` gives the module's namespace when the module is parsed
-(and requests it otherwise): `const { default: Panel } = await import('./Panel')` and
+(and requests it otherwise), as `require('./Panel')` does: `const { default: Panel } = await import('./Panel')` and
 `import('./Panel').then((module) => module.Panel)` give the component, which a render-function
 opener contract then renders; `Promise.resolve(value)` gives the value. Unconfigured imports remain unknown. The backward walk still parses
 only candidate importer paths;

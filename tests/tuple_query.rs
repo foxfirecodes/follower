@@ -1480,6 +1480,55 @@ fn platform_extensions_resolve_imports_to_one_platform() {
 }
 
 #[test]
+fn require_gives_the_module_like_an_awaited_import() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        (
+            "src/Panel.tsx",
+            "export default function Panel({ onDone }) { return <button onClick={() => onDone('panel')} />; }",
+        ),
+        (
+            "src/Card.tsx",
+            "export function Card({ onDone }) { return <button onClick={() => onDone('card')} />; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { useItemSelection } from './hook'; const Panel = require('./Panel').default; function Shown() { const [, apply] = useItemSelection(['shown']); const { Card } = require('./Card'); return <div><Panel onDone={apply} /><Card onDone={apply} /></div>; } export function App() { return <Shown />; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    let mut actions = callsite
+        .capability
+        .calls
+        .iter()
+        .map(|call| (format!("{:?}", call.arguments["action"]), call.explored))
+        .collect::<Vec<_>>();
+    actions.sort();
+    // Exploration and the walk both take `require('./Panel')` as the module.
+    assert_eq!(
+        actions,
+        [
+            ("[String { value: \"card\" }]".to_owned(), true),
+            ("[String { value: \"panel\" }]".to_owned(), true)
+        ],
+        "{:?}",
+        callsite.capability.escapes
+    );
+    assert!(callsite.capability.escapes.is_empty());
+}
+
+#[test]
 fn pushes_through_record_properties_reach_the_factory_argument() {
     let fixture = TestProject::new(&[
         HOOK,

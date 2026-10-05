@@ -1161,6 +1161,18 @@ impl Lowerer<'_> {
     }
 
     fn lower_call(&self, call: &CallExpression<'_>) -> FlowExpression {
+        // `require('./Panel')` gives the module, as an awaited `import()` does.
+        if let Some(module) = crate::frontend::required_module(call)
+            && let Expression::Identifier(callee) = &call.callee
+            && self.is_global_reference(callee)
+        {
+            return FlowExpression {
+                kind: FlowExpressionKind::DynamicImport {
+                    module: module.to_owned(),
+                },
+                span: self.span(call.span),
+            };
+        }
         let mut arguments: Vec<_> = call
             .arguments
             .iter()

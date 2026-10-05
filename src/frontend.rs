@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use oxc::{
     allocator::Allocator,
     ast::ast::{
-        ArrowFunctionExpression, ExportAllDeclaration, ExportFromDeclaration, Expression, Function,
-        ImportDeclaration, ImportOrExportKind, TSEnumDeclaration,
+        Argument, ArrowFunctionExpression, CallExpression, ExportAllDeclaration,
+        ExportFromDeclaration, Expression, Function, ImportDeclaration, ImportOrExportKind,
+        TSEnumDeclaration,
     },
     ast_visit::{Visit, walk},
     parser::{Parser, ParserReturn},
@@ -168,6 +169,17 @@ impl SyntaxCollector {
     }
 }
 
+/// The module a `require('literal')` call names.
+pub(crate) fn required_module<'c>(call: &'c CallExpression<'_>) -> Option<&'c str> {
+    let Expression::Identifier(callee) = &call.callee else {
+        return None;
+    };
+    let [Argument::StringLiteral(source)] = call.arguments.as_slice() else {
+        return None;
+    };
+    (callee.name == "require").then(|| source.value.as_str())
+}
+
 impl<'a> Visit<'a> for SyntaxCollector {
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         self.push_function(
@@ -203,6 +215,18 @@ impl<'a> Visit<'a> for SyntaxCollector {
             });
         }
         walk::walk_import_expression(self, expression);
+    }
+
+    // `require('./Panel')` loads a module like `import()`, so its specifier is resolved too.
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if let Some(specifier) = required_module(call) {
+            self.imports.push(ImportIr {
+                specifier: specifier.to_owned(),
+                span: owned_span(self.file_id, call.span),
+                type_only: false,
+            });
+        }
+        walk::walk_call_expression(self, call);
     }
 
     fn visit_export_from_declaration(&mut self, declaration: &ExportFromDeclaration<'a>) {

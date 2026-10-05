@@ -809,6 +809,14 @@ impl Solver<'_> {
         let Some(&index) = self.global_bindings.get(symbol) else {
             return Vec::new();
         };
+        // `const Panel = require('./Panel').default` binds a module's export.
+        if let Some((file_id, binding)) = self.globals_ir.get(index)
+            && let FlowExpressionKind::StaticMember { object, property } = &binding.value.kind
+            && let FlowExpressionKind::DynamicImport { module } = &object.kind
+            && let Some(scopes) = self.module_export_scopes(*file_id, module, property)
+        {
+            return scopes;
+        }
         // `export default Panel` binds the default export to another name, and
         // `export default connect(mapState)(Panel)` to a component a configured wrapper renders.
         if let Some((file_id, binding)) = self.globals_ir.get(index)
@@ -3159,6 +3167,19 @@ fn local_imports(body: &ScopeBody<'_>) -> Imports {
     let mut imports = Imports::new();
     let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
         let frame = frames.last().expect("visited frame");
+        // `const Panel = require('./Panel').default` binds the export.
+        if let (
+            Role::Bind(FlowPattern {
+                kind: FlowPatternKind::Identifier { name },
+                ..
+            }),
+            FlowExpressionKind::StaticMember { object, property },
+        ) = (&frame.role, &frame.expression.kind)
+            && let FlowExpressionKind::DynamicImport { module } = &object.kind
+        {
+            imports.insert(name.clone(), (module.clone(), Some(property.clone())));
+            return;
+        }
         let (Role::Bind(pattern), FlowExpressionKind::DynamicImport { module }) =
             (&frame.role, &frame.expression.kind)
         else {
