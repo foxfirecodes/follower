@@ -287,6 +287,17 @@ module = "@sample/overlay"
 export = "openModal"
 render_argument = 0
 
+# Rendered somewhere no entry's path is found, such as a modal a store opens.
+[[render_roots]]
+module = "src/settings/SettingsModal.tsx"
+export = "default"
+
+# createSetting(id, { useNotice, render }): every call renders what its second argument holds.
+[[render_calls]]
+module = "@sample/settings"
+export = "createSetting"
+arguments = [1]
+
 # const Stack = createStack(); <Stack.Screen component={Panel} /> or getComponent={() => Panel}
 [[component_consumers]]
 module = "@sample/navigation"
@@ -362,6 +373,15 @@ backward-use expansion has settled, avoiding repeated full entry walks during ea
   possible arrays instead of collapsing to one merged list. String enum members currently
   project to their string values. Alternatives that include an unknown value project as unknown.
 - `reachable` reports creations explored from configured entry points and finite input domains.
+- When no path from an entry reaches some code, the project can declare that it is rendered. A
+  `[[render_roots]]` entry names a component or function, by file and export like an entry, that
+  exploration starts from with unknown props or arguments. A `[[render_calls]]` entry names an
+  imported function whose calls render what they are given: at every call of it in the parsed
+  files, wherever the call is, the listed arguments are rendered, with components rendered, functions
+  called with unknown arguments and what they return rendered, and records and arrays searched;
+  locals around the call are unknown. Both run after the entries as possible renders, and what they
+  reach has `reachability = "declared"` and a `declared_render` first path step, so an answer that
+  rests on a declaration says so. A declared render is an assumption about the project: check it.
 - A path from an entry can pass through a component whose behavior is not modeled, such as one
   imported from a file the text prefilter skipped or from an external package. The explorer then
   assumes the component renders its children, JSX-valued props, component props, and render
@@ -541,6 +561,9 @@ too, and each call of it reports the value it passes, or the parameter's default
 none, in place of the call inside the wrapper. Such a call counts as `explored` when the call inside
 the wrapper saw its values on an explored path. The walk visits at most 400 scope and target pairs
 and 8 scope changes per callsite.
+
+Schema version 11 adds `declared` reachability and `declared_render` path steps, for creations
+reached only from a render root or render call the project declares, described below.
 
 Snapshot reuse is not implemented yet.
 

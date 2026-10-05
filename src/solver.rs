@@ -856,6 +856,9 @@ struct Solver<'a> {
     caller_producer_files: BTreeSet<FileId>,
     current_choice: Option<String>,
     current_reachability: Reachability,
+    /// Whether exploration runs from a render root or render call the project declares, so what
+    /// it reaches is declared rather than reached from an entry.
+    declared_render: bool,
     assumed_renders: Vec<(SourceSpan, Assumption)>,
     /// Boundary keys for `assumed_renders`, one per entry.
     assumed_boundaries: Vec<Rc<str>>,
@@ -1011,6 +1014,7 @@ impl<'a> Solver<'a> {
             caller_producer_files: BTreeSet::new(),
             current_choice: None,
             current_reachability: Reachability::Reachable,
+            declared_render: false,
             assumed_renders: Vec::new(),
             assumed_boundaries: Vec::new(),
             boundaries: BTreeMap::new(),
@@ -1116,8 +1120,151 @@ impl<'a> Solver<'a> {
                 self.trace.clear();
             }
         }
+        self.run_declared_renders();
         self.current_choice = None;
         Ok(())
+    }
+
+    /// Explores the render roots and render calls the project declares, as possible renders whose
+    /// creations are declared rather than reached from an entry.
+    fn run_declared_renders(&mut self) {
+        let config = &self.project.config;
+        if config.render_roots.is_empty() && config.render_calls.is_empty() {
+            return;
+        }
+        let mut starts = Vec::new();
+        for root in &config.render_roots.clone() {
+            let path = self.project.resolve_path(&root.module);
+            let Some(file) = path
+                .canonicalize()
+                .ok()
+                .and_then(|path| self.symbol_linker.file_at(&path))
+            else {
+                continue;
+            };
+            let span = SourceSpan {
+                file_id: file.file_id,
+                start: 0,
+                end: 0,
+            };
+            let resolution = self
+                .symbol_linker
+                .resolve_exported_value(file.file_id, &root.export);
+            starts.push((resolution, span));
+        }
+        let calls = self.declared_render_calls();
+        self.prepare_globals(None);
+        self.current_choice = Some("<declared>".to_owned());
+        self.current_reachability = Reachability::Possible;
+        self.declared_render = true;
+        for (resolution, span) in starts {
+            self.assumed_evaluations = 0;
+            self.assumed_budget_reported = false;
+            self.trace = vec![TraceStep {
+                kind: QueryCallPathKind::DeclaredRender,
+                span: span.clone(),
+            }];
+            let value = self.linked_value(resolution, &span);
+            let pending = self.pending_callbacks.len();
+            self.render_declared(&value, &span, 0);
+            self.run_uncalled_callbacks(pending);
+        }
+        for (file_id, argument, span) in calls {
+            self.assumed_evaluations = 0;
+            self.assumed_budget_reported = false;
+            self.trace = vec![TraceStep {
+                kind: QueryCallPathKind::DeclaredRender,
+                span: span.clone(),
+            }];
+            // Locals around the call are unknown; module bindings and imports resolve.
+            let value = self.eval(&argument, &Environment::new(), file_id);
+            let pending = self.pending_callbacks.len();
+            self.render_declared(&value, &span, 0);
+            self.run_uncalled_callbacks(pending);
+        }
+        self.trace.clear();
+        self.declared_render = false;
+        self.current_reachability = Reachability::Reachable;
+    }
+
+    /// The arguments that calls of configured render calls render, in every parsed function and
+    /// module binding.
+    fn declared_render_calls(&self) -> Vec<(FileId, FlowExpression, SourceSpan)> {
+        if self.project.config.render_calls.is_empty() {
+            return Vec::new();
+        }
+        let bodies = self
+            .functions
+            .iter()
+            .map(|(key, function)| (key.file_id, callback_uses::calls_in(&function.body, None)))
+            .chain(self.globals_ir.iter().map(|(file_id, binding)| {
+                (*file_id, callback_uses::calls_in(&[], Some(&binding.value)))
+            }));
+        let mut found = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (file_id, calls) in bodies {
+            let Some(file) = self.symbol_linker.file(file_id) else {
+                continue;
+            };
+            for call in calls {
+                let FlowExpressionKind::Call { callee, arguments } = &call.kind else {
+                    continue;
+                };
+                let Some(model) = self.project.config.render_call(&file.flow, callee) else {
+                    continue;
+                };
+                // A call inside a function is also inside the module binding or outer function
+                // visited first; look at each call once.
+                if !seen.insert((file_id, call.span.start, call.span.end)) {
+                    continue;
+                }
+                for &index in &model.arguments {
+                    if let Some(argument) = arguments.get(index) {
+                        found.push((file_id, argument.clone(), call.span.clone()));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Renders what a declared render holds: a component renders with unknown props, a function
+    /// runs with unknown arguments and what it returns renders, and records and arrays are
+    /// searched.
+    fn render_declared(&mut self, value: &TrackedValue, span: &SourceSpan, depth: usize) {
+        if depth > 3 {
+            return;
+        }
+        match &value.value {
+            AbstractValue::Array(values) | AbstractValue::Union(values) => {
+                for value in values.iter() {
+                    self.render_declared(value, span, depth + 1);
+                }
+            }
+            AbstractValue::Record(fields) => {
+                for value in fields.fields.values() {
+                    self.render_declared(value, span, depth + 1);
+                }
+            }
+            AbstractValue::Function(_) | AbstractValue::Closure(_)
+                if !self.is_component_like(value) =>
+            {
+                let parameters = match &value.value {
+                    AbstractValue::Function(key) => self
+                        .functions
+                        .get(key)
+                        .map_or(0, |function| function.params.len()),
+                    AbstractValue::Closure(closure) => closure.params.len(),
+                    _ => 0,
+                };
+                let arguments = (0..parameters.max(1))
+                    .map(|_| TrackedValue::unknown("declared_render_argument"))
+                    .collect();
+                let returned = self.invoke_value(value.clone(), arguments, span.clone());
+                self.render_assumed_prop(&returned, span);
+            }
+            _ => self.render_assumed_prop(value, span),
+        }
     }
 
     fn entry_input_combinations(&self, export: &str) -> Result<Vec<BTreeMap<String, String>>> {
@@ -5974,8 +6121,14 @@ impl<'a> Solver<'a> {
             callsite: span.clone(),
             origin,
             origin_trace,
-            factory_arguments: arguments.to_vec(),
-            reachability: self.current_reachability,
+            factory_arguments: arguments.clone(),
+            reachability: if self.declared_render
+                && self.current_reachability != Reachability::Unknown
+            {
+                Reachability::Declared
+            } else {
+                self.current_reachability
+            },
             reverse_importer: self.current_reverse_importer.clone(),
             registrations: Vec::new(),
             invocations,
@@ -6948,8 +7101,10 @@ impl<'a> Solver<'a> {
         use sha2::{Digest, Sha256};
         let mut counts = BTreeMap::<&str, (usize, usize)>::new();
         for capability in &self.capabilities {
-            if capability.reachability != Reachability::Possible
-                || (!query.report.include_non_invoked && capability.invocations.is_empty())
+            if !matches!(
+                capability.reachability,
+                Reachability::Possible | Reachability::Declared
+            ) || (!query.report.include_non_invoked && capability.invocations.is_empty())
             {
                 continue;
             }
@@ -7181,7 +7336,7 @@ impl<'a> Solver<'a> {
             .collect();
         let component_boundaries = self.component_boundaries(query);
         QueryReport {
-            schema_version: 10,
+            schema_version: 11,
             snapshot_id: self.snapshot.snapshot_id.clone(),
             config_hash: self.snapshot.config_hash.clone(),
             query_hash: query_hash.to_owned(),

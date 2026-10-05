@@ -155,6 +155,8 @@ pub enum Reachability {
     Reachable,
     /// Reached from a configured root only if unmodeled components render the path.
     Possible,
+    /// Reached only from a render root or render call the project declares, not from an entry.
+    Declared,
     Unknown,
 }
 
@@ -225,6 +227,8 @@ pub enum QueryCallPathKind {
     /// A callback that carries the factory result and that nothing in the model called, such as
     /// an event handler, run because it may be.
     UncalledCallback,
+    /// A render root, or what a call the project declares as rendering is given.
+    DeclaredRender,
     Factory,
     Invocation,
 }

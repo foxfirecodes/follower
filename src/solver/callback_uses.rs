@@ -2950,6 +2950,25 @@ fn loaded_module(callback: &FlowExpression) -> Option<(String, String)> {
     }
 }
 
+/// The calls in a function body or expression, outermost first.
+pub(super) fn calls_in<'e>(
+    statements: &'e [FlowStatement],
+    expression: Option<&'e FlowExpression>,
+) -> Vec<&'e FlowExpression> {
+    let mut calls = Vec::new();
+    let mut found = |frames: &[Frame<'e>], _guards: &[Guard<'e>]| {
+        let expression = frames.last().expect("visited frame").expression;
+        if matches!(expression.kind, FlowExpressionKind::Call { .. }) {
+            calls.push(expression);
+        }
+    };
+    match expression {
+        Some(expression) => visit_body(&ScopeBody::Expression(expression), &mut found),
+        None => visit_body(&ScopeBody::Statements(statements), &mut found),
+    }
+    calls
+}
+
 /// The names a function body reads, calls, or renders as a JSX tag.
 pub(super) fn body_names(body: &FlowArrowBody) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
@@ -3355,7 +3374,8 @@ fn rank(reachability: Reachability) -> u8 {
     match reachability {
         Reachability::Reachable => 0,
         Reachability::Possible => 1,
-        Reachability::Unknown => 2,
+        Reachability::Declared => 2,
+        Reachability::Unknown => 3,
     }
 }
 

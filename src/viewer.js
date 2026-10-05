@@ -117,7 +117,7 @@
 
   let sort = { column: '', descending: false };
   let limit = 150;
-  const chipClass = value => ({ called: 'exact', explored: 'exact', reachable: 'exact', true: 'exact', source: 'conditional', possible: 'conditional', inferred: 'conditional', escapes: 'unknown', unused: 'muted', not_called: 'muted', called_with_unknown_arguments: 'unknown', false: 'unknown', excluded_call: 'muted', no_call: 'muted', escape: 'unknown', unknown: 'unknown' })[value] || '';
+  const chipClass = value => ({ called: 'exact', explored: 'exact', reachable: 'exact', true: 'exact', source: 'conditional', possible: 'conditional', declared: 'conditional', inferred: 'conditional', escapes: 'unknown', unused: 'muted', not_called: 'muted', called_with_unknown_arguments: 'unknown', false: 'unknown', excluded_call: 'muted', no_call: 'muted', escape: 'unknown', unknown: 'unknown' })[value] || '';
   const chipColumns = new Set(['row_kind', 'status', 'reachability', 'found', 'item_complete', 'arguments_resolved']);
 
   function table(list, hide) {

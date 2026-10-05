@@ -426,6 +426,7 @@ fn reachability_text(reachability: Reachability) -> &'static str {
     match reachability {
         Reachability::Reachable => "reachable",
         Reachability::Possible => "possible",
+        Reachability::Declared => "declared",
         Reachability::Unknown => "unknown",
     }
 }

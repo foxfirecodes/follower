@@ -99,6 +99,26 @@ pub struct ComponentOpener {
     pub render_argument: Option<usize>,
 }
 
+/// A component or function the project declares is rendered or run somewhere, so exploration
+/// starts there, as an entry does, when no path from an entry is found.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderRoot {
+    pub module: PathBuf,
+    pub export: String,
+}
+
+/// An imported function whose calls render what they are given: at every call of it, the
+/// components its listed arguments hold are rendered and the functions are called, as for a
+/// registry such as `createSetting(id, { useNotice, render })`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderCall {
+    pub module: String,
+    pub export: String,
+    pub arguments: Vec<usize>,
+}
+
 fn default_schema_version() -> u32 {
     1
 }
@@ -140,6 +160,10 @@ pub struct ProjectConfig {
     pub component_consumers: Vec<ComponentConsumer>,
     #[serde(default)]
     pub component_openers: Vec<ComponentOpener>,
+    #[serde(default)]
+    pub render_roots: Vec<RenderRoot>,
+    #[serde(default)]
+    pub render_calls: Vec<RenderCall>,
     #[serde(default)]
     pub inputs: BTreeMap<String, Vec<String>>,
     #[serde(default)]
@@ -296,6 +320,17 @@ impl ProjectConfig {
                     && model.export == export
             })
             .collect()
+    }
+
+    pub fn render_call<'a>(
+        &'a self,
+        file: &FlowFileIr,
+        callee: &FlowExpression,
+    ) -> Option<&'a RenderCall> {
+        let (module, export) = self.imported_export(file, callee)?;
+        self.render_calls
+            .iter()
+            .find(|model| model.module == module && model.export == export)
     }
 
     pub fn component_opener<'a>(
@@ -460,18 +495,29 @@ impl Project {
                 }
             }
         }
-        for entry in &self.config.entries {
-            let path = self.resolve_path(&entry.module);
+        let roots = self
+            .config
+            .entries
+            .iter()
+            .map(|entry| (&entry.module, "entry"))
+            .chain(
+                self.config
+                    .render_roots
+                    .iter()
+                    .map(|root| (&root.module, "render root")),
+            );
+        for (module, kind) in roots {
+            let path = self.resolve_path(module);
             if !is_source_file(&path) {
                 bail!(
-                    "entry module is not a supported source file: {}",
+                    "{kind} module is not a supported source file: {}",
                     path.display()
                 );
             }
             files.push(SourceCandidate {
-                path: path
-                    .canonicalize()
-                    .with_context(|| format!("failed to locate entry module {}", path.display()))?,
+                path: path.canonicalize().with_context(|| {
+                    format!("failed to locate {kind} module {}", path.display())
+                })?,
                 text_filtered: false,
             });
         }
@@ -523,6 +569,21 @@ fn validate_contracts(config: &ProjectConfig) -> Result<()> {
         .any(|pattern| pattern.trim().is_empty())
     {
         bail!("source excludes cannot be empty");
+    }
+    for call in &config.render_calls {
+        if call.module.trim().is_empty()
+            || call.export.trim().is_empty()
+            || call.arguments.is_empty()
+        {
+            bail!("render calls need a module, an export, and at least one argument");
+        }
+    }
+    if config
+        .render_roots
+        .iter()
+        .any(|root| root.export.trim().is_empty())
+    {
+        bail!("render roots need an export");
     }
     for opener in &config.component_openers {
         if opener.module.trim().is_empty() || opener.export.trim().is_empty() {

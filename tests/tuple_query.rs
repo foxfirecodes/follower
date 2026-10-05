@@ -619,7 +619,7 @@ fn component_boundaries_suggest_contracts_that_make_creations_reachable() {
     fixture.write("flow.toml", config);
     fixture.write("query.toml", TUPLE_QUERY);
     let report = fixture.report();
-    assert_eq!(report.schema_version, 10);
+    assert_eq!(report.schema_version, 11);
     assert!(
         report
             .creations
@@ -1596,6 +1596,76 @@ fn navigator_factory_members_render_their_screens() {
             (items("Tabs"), Reachability::Reachable)
         ]
     );
+}
+
+#[test]
+fn declared_render_roots_and_calls_reach_what_no_entry_renders() {
+    let fixture = TestProject::new(&[
+        HOOK,
+        // A modal nothing in the entry's tree opens.
+        (
+            "src/SettingsModal.tsx",
+            "import { useItemSelection } from './hook'; export default function SettingsModal() { const [, apply] = useItemSelection(['modal']); return <button onClick={() => apply('modal_close')} />; }",
+        ),
+        // A function that opens a sheet, called only from code the model does not reach.
+        (
+            "src/Sheet.tsx",
+            "import { useItemSelection } from './hook'; export default function Sheet() { const [, apply] = useItemSelection(['sheet']); return <button onClick={() => apply('sheet_close')} />; }",
+        ),
+        (
+            "src/showSheet.tsx",
+            "import { openSheet } from 'external-ui'; export function showSheet(props) { openSheet(import('./Sheet'), props); }",
+        ),
+        // A hook a settings registry stores for its renderer to call.
+        (
+            "src/useNotice.tsx",
+            "import { useItemSelection } from './hook'; export function useNotice() { const [visible, apply] = useItemSelection(['notice']); return visible == null ? null : { onClose: () => apply('notice_closed') }; }",
+        ),
+        (
+            "src/StatusCategory.tsx",
+            "import { createSection } from 'external-settings'; import { useNotice } from './useNotice'; export const StatusCategory = createSection('status', { useStatusLine: useNotice });",
+        ),
+        ("src/App.tsx", "export function App() { return null; }"),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n\
+         [[render_roots]]\nmodule = 'src/SettingsModal.tsx'\nexport = 'default'\n\
+         [[render_roots]]\nmodule = 'src/showSheet.tsx'\nexport = 'showSheet'\n\
+         [[render_calls]]\nmodule = 'external-settings'\nexport = 'createSection'\narguments = [1]\n\
+         [[component_openers]]\nmodule = 'external-ui'\nexport = 'openSheet'\ncomponent_argument = 0\nprops_argument = 1\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'tuple'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\nscan_callback_bodies = true\n[factory]\nproject = 'acceptance'\nmodule = 'src/hook.ts'\nexport = 'useItemSelection'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\n[capability]\nreturned_index = 1\n[[capability.invocation_arguments]]\nindex = 0\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let mut reached = report
+        .callsites
+        .iter()
+        .map(|callsite| {
+            (
+                format!("{:?}", callsite.factory_arguments["items"]),
+                callsite.reachability,
+                callsite.capability.calls.iter().all(|call| call.explored),
+            )
+        })
+        .collect::<Vec<_>>();
+    reached.sort_by(|left, right| left.0.cmp(&right.0));
+    let items = |item: &str| format!("[Array {{ elements: [String {{ value: \"{item}\" }}] }}]");
+    // Each is reached only through what the project declares, and says so; exploration runs
+    // their calls.
+    assert_eq!(
+        reached,
+        [
+            (items("modal"), Reachability::Declared, true),
+            (items("notice"), Reachability::Declared, true),
+            (items("sheet"), Reachability::Declared, true)
+        ],
+        "{:?}",
+        report.unreached_callsites
+    );
+    assert!(report.unreached_callsites.is_empty());
 }
 
 #[test]

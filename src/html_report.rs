@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn report_is_private_and_embedded_json_cannot_close_script() {
         let report = QueryReport {
-            schema_version: 10,
+            schema_version: 11,
             snapshot_id: "snapshot".into(),
             config_hash: "config".into(),
             query_hash: "query".into(),

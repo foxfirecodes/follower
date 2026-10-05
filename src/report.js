@@ -137,11 +137,13 @@
     return report.gaps.filter(gap => gap.links.some(link => link.creation_id === creation.creation_id));
   }
   function reachabilityBadge(creation) {
-    return creation.reachability === 'possible' ? badge('reachability possible', 'conditional') : badge('reachability unknown', 'unknown');
+    if (creation.reachability === 'possible') return badge('reachability possible', 'conditional');
+    if (creation.reachability === 'declared') return badge('reachability declared', 'conditional');
+    return badge('reachability unknown', 'unknown');
   }
   function callPath(invocation, reachability) {
     const section = node('div', 'call-path');
-    section.append(node('h4', '', reachability === 'reachable' ? 'Path to this invocation' : reachability === 'possible' ? 'Assumed path to this invocation' : 'Local path to this invocation'));
+    section.append(node('h4', '', reachability === 'reachable' ? 'Path to this invocation' : reachability === 'possible' ? 'Assumed path to this invocation' : reachability === 'declared' ? 'Declared path to this invocation' : 'Local path to this invocation'));
     if (invocation.other_paths) section.append(node('p', 'aside', `${invocation.other_paths} other explored path${invocation.other_paths === 1 ? '' : 's'} reach this invocation with the same values; this is the first.`));
     const full = invocation.call_path || [];
     if (!full.length) {
@@ -150,7 +152,7 @@
     }
     const prefix = sharedDirectory(full.map(step => step.location));
     if (prefix) section.append(node('p', 'call-root mono muted', `Relative to ${prefix}`));
-    const compact = full.filter((step, index) => index === 0 || index === full.length - 1 || step.location.path !== full[index + 1].location.path || step.kind === 'factory' || step.kind === 'invocation' || step.kind === 'assumed_render' || step.kind === 'uncalled_callback');
+    const compact = full.filter((step, index) => index === 0 || index === full.length - 1 || step.location.path !== full[index + 1].location.path || step.kind === 'factory' || step.kind === 'invocation' || step.kind === 'assumed_render' || step.kind === 'uncalled_callback' || step.kind === 'declared_render');
     const chain = node('ol', 'call-chain');
     let expanded = false;
     const toggle = button('', () => { expanded = !expanded; renderSteps(); });
@@ -167,7 +169,7 @@
     renderSteps();
     section.append(chain);
     if (compact.length < full.length) section.append(toggle);
-    const reach = reachability === 'reachable' ? 'A possible path from a configured entry.' : reachability === 'possible' ? 'A path from a configured entry that holds only if each assumed render step renders what it was given; those components are not analyzed and each is listed as a gap.' : 'Entry reachability is unknown; this path starts at a locally explored call.';
+    const reach = reachability === 'reachable' ? 'A possible path from a configured entry.' : reachability === 'possible' ? 'A path from a configured entry that holds only if each assumed render step renders what it was given; those components are not analyzed and each is listed as a gap.' : reachability === 'declared' ? 'A path from a render root or render call the project declares, not from a configured entry.' : 'Entry reachability is unknown; this path starts at a locally explored call.';
     section.append(node('p', 'aside', `${reach} The compact view shows cross-file handoffs plus creation and invocation; the full view includes same-file calls and renders. Factory creation and callback invocation may occur at different times.`));
     return section;
   }
