@@ -1282,8 +1282,12 @@ fn exploration_renders_what_render_function_openers_load() {
             "export function Sheet({ onDone }) { return <button onClick={() => onDone('sheet')} />; }",
         ),
         (
+            "src/Resolved.tsx",
+            "export default function Resolved({ onDone }) { return <button onClick={() => onDone('resolved')} />; }",
+        ),
+        (
             "src/App.tsx",
-            "import { openDialogDeferred, openPopupDeferred, openSheet } from 'external-ui'; import { useItemSelection } from './hook'; function Shown() { const [, apply] = useItemSelection(['shown']); openDialogDeferred(async () => { const { default: Modal } = await import('./Modal'); return (props) => <Modal {...props} onClose={apply} />; }); openSheet(() => import('./Sheet').then((module) => module.Sheet), { onDone: apply }); return <button onClick={(event) => openPopupDeferred(event, async () => { const module = await import('./Menu'); return (props) => <module.default {...props} onDone={apply} />; })} />; } export function App() { return <Shown />; }",
+            "import { openDialogDeferred, openPopupDeferred, openSheet } from 'external-ui'; import { useItemSelection } from './hook'; import Resolved from './Resolved'; function Shown() { const [, apply] = useItemSelection(['shown']); openDialogDeferred(async () => { const { default: Modal } = await import('./Modal'); return (props) => <Modal {...props} onClose={apply} />; }); openSheet(() => import('./Sheet').then((module) => module.Sheet), { onDone: apply }); openDialogDeferred(() => Promise.resolve((props) => <Resolved {...props} onDone={apply} />)); return <button onClick={(event) => openPopupDeferred(event, async () => { const module = await import('./Menu'); return (props) => <module.default {...props} onDone={apply} />; })} />; } export function App() { return <Shown />; }",
         ),
     ]);
     fixture.write(
@@ -1308,12 +1312,14 @@ fn exploration_renders_what_render_function_openers_load() {
         .collect::<Vec<_>>();
     explored.sort();
     // An awaited `import()` is the module, so the render function's component is known; a
-    // loader's `.then` callback receives the module too.
+    // loader's `.then` callback receives the module too, and `Promise.resolve(value)` is the
+    // value.
     assert_eq!(
         explored,
         [
             "String { value: \"menu\" }",
             "String { value: \"modal\" }",
+            "String { value: \"resolved\" }",
             "String { value: \"sheet\" }"
         ],
         "{:?}",

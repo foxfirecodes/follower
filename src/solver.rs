@@ -2550,6 +2550,17 @@ impl<'a> Solver<'a> {
                         file_id,
                     );
                 }
+                // `Promise.resolve(value)` is the value, as `await` gives it.
+                if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
+                    && property == "resolve"
+                    && matches!(&object.kind, FlowExpressionKind::Identifier { name, .. } if name == "Promise")
+                    && !environment.contains_key("Promise")
+                {
+                    return arguments.first().map_or_else(
+                        || TrackedValue::plain(AbstractValue::Undefined),
+                        |value| self.eval(value, environment, file_id),
+                    );
+                }
                 // `import('./Panel').then((module) => module.Panel)` calls the callback with the
                 // module, as `await` gives it.
                 if let FlowExpressionKind::StaticMember { object, property } = &callee.kind
