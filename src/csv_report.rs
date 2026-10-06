@@ -531,3 +531,37 @@ fn write_record<'a>(out: &mut String, fields: impl Iterator<Item = &'a str>) {
     }
     out.push_str("\r\n");
 }
+
+/// The records of a CSV, each without its line ending; a quoted field may hold line breaks.
+pub fn csv_records(text: &str) -> Vec<&str> {
+    let mut records = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    for (index, character) in text.char_indices() {
+        match character {
+            '"' => quoted = !quoted,
+            '\n' if !quoted => {
+                records.push(text[start..index].trim_end_matches('\r'));
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < text.len() {
+        records.push(&text[start..]);
+    }
+    records
+}
+
+#[cfg(test)]
+mod tests {
+    use super::csv_records;
+
+    #[test]
+    fn records_keep_line_breaks_inside_quoted_fields() {
+        assert_eq!(
+            csv_records("a,b\n1,\"two\nlines\"\n3,4\n"),
+            ["a,b", "1,\"two\nlines\"", "3,4"]
+        );
+    }
+}

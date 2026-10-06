@@ -146,7 +146,9 @@ For a function that acts when called, such as one that records an action directl
 factory is then itself the invocation: `invocation_arguments` select the call's own arguments,
 nothing is followed after the call, and each callsite reports one call at the callsite. Labelling
 its projections like another query's makes their CSVs share columns, and `follower view a.csv
-b.csv` shows CSVs with the same columns as one table.
+b.csv` shows CSVs with the same columns as one table. Written as `label=path`, as `follower view
+web=web.csv ios=ios.csv`, each CSV's rows get its label in a leading `source` column, which the
+page can filter and group by.
 
 A factory may invoke its result itself, as a hook that calls the callback it returns when the
 component unmounts. Each `[[capability.implicit_invocations]]` entry reports such an invocation as

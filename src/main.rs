@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use code_flow::{
     Analyzer, Project,
-    csv_report::query_report_csv,
+    csv_report::{csv_records, query_report_csv},
     csv_viewer::write_csv_viewer,
     html_report::write_query_report_html,
     query::{QueryReport, QueryValue, load_query},
@@ -60,9 +60,10 @@ enum Command {
     },
     /// Write a browsable page for a query CSV from `query --format csv`.
     View {
-        /// The CSVs to show, as one table; each must have the same columns.
+        /// The CSVs to show, as one table; each must have the same columns. Written as
+        /// `label=path`, a CSV's rows get the label in a leading `source` column.
         #[arg(required = true)]
-        csv: Vec<PathBuf>,
+        csv: Vec<String>,
         /// Where to write the page; defaults to the CSV path with an `.html` extension.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -126,33 +127,63 @@ fn main() -> Result<()> {
     }
 }
 
-fn view(csvs: &[PathBuf], output: Option<PathBuf>) -> Result<()> {
+fn view(arguments: &[String], output: Option<PathBuf>) -> Result<()> {
     // Several query CSVs with the same columns show as one table, as a hook query's calls and a
-    // query of direct calls that answer the same question.
+    // query of direct calls that answer the same question. A label says which CSV a row is from.
+    let csvs = arguments
+        .iter()
+        .map(|argument| match argument.split_once('=') {
+            Some((label, path)) if !label.is_empty() && !label.contains('/') => {
+                (Some(label.to_owned()), PathBuf::from(path))
+            }
+            _ => (None, PathBuf::from(argument)),
+        })
+        .collect::<Vec<_>>();
+    let labelled = csvs.iter().any(|(label, _)| label.is_some());
+    let csv_label = |label: &str| {
+        if label.contains([',', '"', '\n']) {
+            format!("\"{}\"", label.replace('"', "\"\""))
+        } else {
+            label.to_owned()
+        }
+    };
     let mut text = String::new();
-    let mut header = None;
-    for csv in csvs {
+    let mut header: Option<String> = None;
+    for (label, csv) in &csvs {
         let source = std::fs::read_to_string(csv)
             .with_context(|| format!("failed to read {}", csv.display()))?;
-        let (first, rows) = source.split_once('\n').unwrap_or((source.as_str(), ""));
+        let records = csv_records(&source);
+        let Some((first, rows)) = records.split_first() else {
+            bail!("{} is empty", csv.display());
+        };
         match &header {
             None => {
+                if labelled {
+                    text.push_str("source,");
+                }
                 text.push_str(first);
                 text.push('\n');
-                header = Some(first.to_owned());
+                header = Some((*first).to_owned());
             }
             Some(header) if header != first => bail!(
                 "{} has different columns from {}",
                 csv.display(),
-                csvs[0].display()
+                csvs[0].1.display()
             ),
             Some(_) => {}
         }
-        text.push_str(rows);
-        if !rows.is_empty() && !rows.ends_with('\n') {
+        let label = label
+            .as_deref()
+            .map_or_else(String::new, |label| format!("{},", csv_label(label)));
+        for row in rows {
+            if labelled {
+                text.push_str(&label);
+            }
+            text.push_str(row);
             text.push('\n');
         }
     }
+    let csvs = csvs.into_iter().map(|(_, csv)| csv).collect::<Vec<_>>();
     let first = &csvs[0];
     let output = output.unwrap_or_else(|| first.with_extension("html"));
     let title = csvs

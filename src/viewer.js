@@ -100,11 +100,11 @@
   });
   $('#columns-toggle').addEventListener('click', () => $('#columns').classList.toggle('hidden'));
 
-  const groupings = [['', 'Nothing'], ...(itemColumn ? [[itemColumn, itemColumn.slice(5)]] : []), ['callsite', 'Callsite'], ['call_path', 'Call file'], ...argColumns.map(column => [column, column.slice(4)]), ['status', 'Status'], ['enclosing', 'Enclosing function']];
+  const groupings = [['', 'Nothing'], ...(itemColumn ? [[itemColumn, itemColumn.slice(5)]] : []), ['callsite', 'Callsite'], ['call_path', 'Call file'], ...argColumns.map(column => [column, column.slice(4)]), ['status', 'Status'], ['enclosing', 'Enclosing function'], ...(has('source') ? [['source', 'Source']] : [])];
   groupings.forEach(([value, label]) => { const option = node('option', '', label); option.value = value; $('#group').append(option); });
   $('#group').value = itemColumn || 'callsite';
 
-  const filterColumns = ['row_kind', 'status', 'reachability', 'found', 'item_complete', 'arguments_resolved'].filter(has);
+  const filterColumns = ['source', 'row_kind', 'status', 'reachability', 'found', 'item_complete', 'arguments_resolved'].filter(has);
   const filters = {};
   filterColumns.forEach(column => {
     const select = node('select', 'filter');
