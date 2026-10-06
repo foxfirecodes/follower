@@ -553,6 +553,10 @@ pub struct QueryCapabilityCall {
     /// Whether every element the callsite or instance requests is known.
     #[serde(default)]
     pub elements_complete: bool,
+    /// Whether the factory makes the call itself, as a configured implicit invocation, rather
+    /// than code written at the call.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub implicit: bool,
 }
 
 /// Somewhere the factory result went that the walk could not follow.

@@ -166,7 +166,8 @@ where that is not known, the call is reported with a note in `via`. Items in the
 set of `except_items` are not ones the call applies to, so a callsite requesting only those gets an
 `excluded_call`. When the callsite's arguments come from its scope's parameters, as in a wrapper
 component, each instance of the scope decides from what it passes, and the call applies to that
-instance's items.
+instance's items. Such calls have `implicit: true` in the JSON report, and each instance's call is
+its own row.
 
 `exclude_callsites` at the top level lists path globs of factory callsites the query leaves out,
 as `["**/framework/**"]` for the factory's uses inside the code that implements it, whose calls

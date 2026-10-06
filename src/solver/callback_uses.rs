@@ -4074,6 +4074,7 @@ impl Solver<'_> {
                 guards_not,
                 elements,
                 elements_complete,
+                implicit: call.preset.is_some(),
             };
             if ruled_out {
                 excluded_calls.push(found);
@@ -4111,13 +4112,20 @@ impl Solver<'_> {
                     .map(|(label, (elements, _))| (label.clone(), elements.clone()))
                     .collect(),
                 elements_complete: callsite_elements.values().all(|(_, complete)| *complete),
+                implicit: false,
             });
         }
         let mut calls = merge_calls(calls);
         // A call another condition context allows is not excluded.
         let excluded_calls = merge_calls(excluded_calls)
             .into_iter()
-            .filter(|excluded| !calls.iter().any(|call| call.location == excluded.location))
+            .filter(|excluded| {
+                !calls.iter().any(|call| {
+                    call.location == excluded.location
+                        && call.implicit == excluded.implicit
+                        && (!call.implicit || call.instance == excluded.instance)
+                })
+            })
             .collect::<Vec<_>>();
         calls.sort_by(|left, right| {
             location_key(left.location.as_ref()).cmp(&location_key(right.location.as_ref()))
@@ -4925,10 +4933,13 @@ fn guard_applies(set: &[QueryValue], elements: &[QueryValue]) -> bool {
 fn merge_calls(calls: Vec<QueryCapabilityCall>) -> Vec<QueryCapabilityCall> {
     let mut merged: Vec<QueryCapabilityCall> = Vec::new();
     for call in calls {
-        let Some(existing) = merged
-            .iter_mut()
-            .find(|existing| existing.location == call.location)
-        else {
+        // The factory's own calls at one callsite stay apart by instance, since each applies to
+        // its instance's items.
+        let Some(existing) = merged.iter_mut().find(|existing| {
+            existing.location == call.location
+                && existing.implicit == call.implicit
+                && (!call.implicit || existing.instance == call.instance)
+        }) else {
             merged.push(call);
             continue;
         };

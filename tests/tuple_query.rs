@@ -1201,6 +1201,7 @@ fn implicit_invocations_are_calls_at_each_callsite_that_does_not_opt_out() {
     assert!(bypassed.capability.calls.is_empty());
     assert!(skipped.capability.calls.is_empty());
     assert_eq!(skipped.capability.excluded_calls.len(), 1);
+    assert!(shown.capability.calls[0].implicit);
     assert!(
         shown.capability.calls[0]
             .via
