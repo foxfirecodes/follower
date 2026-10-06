@@ -27,8 +27,11 @@ Use `--format json` for the stable machine-readable report, and `--format csv` f
 callsites, calls, and items that `follower view` turns into a browsable page. The query
 declaration and current semantics are documented in [`docs/QUERY.md`](docs/QUERY.md).
 
-Queries can also select tuple return elements with `returned_index`, and project numeric enum
-member names from TS source. Project configs accept `[import_aliases]` for paths such as `@sample/*`,
+Queries can also select tuple return elements with `returned_index`, treat each call of a
+function that acts when called as the invocation with `call_is_invocation`, report invocations a
+factory makes of its result itself with `implicit_invocations`, read properties of arguments with
+projection paths and defaults, and project numeric enum member names from TS source. `follower
+view` shows several CSVs with the same columns as one table. Project configs accept `[import_aliases]` for paths such as `@sample/*`,
 `platform_extensions` for code split by platform, contracts for libraries the analysis does not
 read (component consumers, wrappers, openers, lazy factories), and `[[render_roots]]` and
 `[[render_calls]]` to declare code rendered where no path from an entry is found; what those reach

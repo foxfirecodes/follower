@@ -669,7 +669,7 @@ fn validate_contracts(config: &ProjectConfig) -> Result<()> {
 
 /// Whether a path matches a pattern in which `**` matches any number of path segments and `*`
 /// any characters within one segment.
-fn glob_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, path: &str) -> bool {
     fn segments(pattern: &[&str], path: &[&str]) -> bool {
         match pattern.split_first() {
             None => path.is_empty(),

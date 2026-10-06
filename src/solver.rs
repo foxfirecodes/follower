@@ -41,6 +41,9 @@ const MAX_CALL_DEPTH: usize = 128;
 /// recursion over unknown data would otherwise run to the call depth budget, repeating the same
 /// exploration at every level.
 const MAX_RECURSION_DEPTH: usize = 8;
+/// Recursion over data that is not known, as a tree transform over unknown nodes, repeats the same
+/// body with values no better known, while each level may branch several ways.
+const MAX_UNCERTAIN_RECURSION_DEPTH: usize = 3;
 const MAX_REVERSE_IMPORTER_EVALUATIONS: usize = 5_000;
 const MAX_UNREACHED_RENDER_EVALUATIONS: usize = 5_000;
 const MAX_ASSUMED_RENDER_EVALUATIONS: usize = 1_000_000;
@@ -626,7 +629,7 @@ pub fn execute_query(
         returned_index: query.capability.returned_index,
         scan_callback_bodies: query.scan_callback_bodies,
         retains_returned_callback: Some(false),
-        invokes_returned_callback_during_call: Some(false),
+        invokes_returned_callback_during_call: Some(query.capability.call_is_invocation),
         captures,
         on_invoke: Vec::new(),
         evidence: ModelEvidence {
@@ -638,6 +641,10 @@ pub fn execute_query(
         },
     };
     let mut solver = Solver::new(project, snapshot, model)?;
+    solver.call_is_invocation = query.capability.call_is_invocation;
+    solver
+        .exclude_callsites
+        .clone_from(&query.exclude_callsites);
     if let Some(steps) = query.assumed_render_steps {
         solver.assumed_budget = steps;
     }
@@ -837,6 +844,10 @@ struct Solver<'a> {
     walk_file_requests: BTreeSet<std::path::PathBuf>,
     /// The files behind each `unparsed_module:` value, by its reason.
     unparsed_modules: BTreeMap<String, BTreeSet<std::path::PathBuf>>,
+    /// Each factory call is itself the invocation, with the call's arguments.
+    call_is_invocation: bool,
+    /// Path globs of factory callsites the query leaves out.
+    exclude_callsites: Vec<String>,
     /// Calls of each function in progress.
     active_functions: std::collections::HashMap<FunctionKey, usize>,
     /// Closures carrying a factory result, in creation order, until the render that created
@@ -1008,6 +1019,8 @@ impl<'a> Solver<'a> {
             importer_requests: BTreeSet::new(),
             walk_file_requests: BTreeSet::new(),
             unparsed_modules: BTreeMap::new(),
+            call_is_invocation: false,
+            exclude_callsites: Vec::new(),
             active_functions: std::collections::HashMap::new(),
             pending_callbacks: Vec::new(),
             uncalled_runs: std::collections::HashSet::new(),
@@ -1752,8 +1765,13 @@ impl<'a> Solver<'a> {
         };
         // A cut here depends only on the calls above it in the same function, so unlike the call
         // depth budget it does not stop enclosing renders from being remembered.
+        let limit = if arguments.iter().any(value_is_uncertain) {
+            MAX_UNCERTAIN_RECURSION_DEPTH
+        } else {
+            MAX_RECURSION_DEPTH
+        };
         let active = self.active_functions.entry(key.clone()).or_default();
-        if *active >= MAX_RECURSION_DEPTH {
+        if *active >= limit {
             self.record_coverage_gap("recursion depth budget exhausted", &function.span);
             self.mark_values_unresolved(
                 arguments.iter(),
@@ -6137,6 +6155,10 @@ impl<'a> Solver<'a> {
     }
 
     fn call_model(&mut self, arguments: &[TrackedValue], span: SourceSpan) -> TrackedValue {
+        // A callsite the query leaves out creates nothing.
+        if self.excluded_callsite_file(span.file_id) {
+            return TrackedValue::unknown("excluded_callsite");
+        }
         let arguments = arguments
             .iter()
             .map(|value| self.materialize(value))
@@ -6302,7 +6324,12 @@ impl<'a> Solver<'a> {
                     Some(self.model.id.clone()),
                     "factory model invokes the returned capability during creation",
                 ),
-                arguments: Vec::new(),
+                // A call that is itself the invocation passes its own arguments.
+                arguments: if self.call_is_invocation {
+                    arguments.clone()
+                } else {
+                    Vec::new()
+                },
                 call_path: self.trace_at(QueryCallPathKind::Invocation, &span),
                 other_paths: 0,
             }),
@@ -6580,8 +6607,20 @@ impl<'a> Solver<'a> {
     }
 
     fn expression_matches_model(&self, file_id: FileId, expression: &FlowExpression) -> bool {
-        self.linked_expression(file_id, expression)
-            == ValueResolution::Resolved(LinkedValue::Declaration(self.model_symbol.clone()))
+        !self.excluded_callsite_file(file_id)
+            && self.linked_expression(file_id, expression)
+                == ValueResolution::Resolved(LinkedValue::Declaration(self.model_symbol.clone()))
+    }
+
+    /// Whether the query leaves out the factory callsites in a file, by `exclude_callsites`.
+    fn excluded_callsite_file(&self, file_id: FileId) -> bool {
+        !self.exclude_callsites.is_empty()
+            && self.symbol_linker.file(file_id).is_some_and(|file| {
+                let path = file.path.to_string_lossy();
+                self.exclude_callsites
+                    .iter()
+                    .any(|pattern| crate::project::glob_matches(pattern, &path))
+            })
     }
 
     fn factory_candidates(&self) -> Vec<FactoryCallCandidate> {

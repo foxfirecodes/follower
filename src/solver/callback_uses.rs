@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::{
+    evidence::RelationKind,
     ids::FileId,
     ir::{
         FlowArrowBody, FlowAssignmentTarget, FlowExpression, FlowExpressionKind, FlowJsxProp,
@@ -17,16 +18,17 @@ use crate::{
     },
     link::{LinkedSymbol, LinkedValue, ValueResolution, pattern_names},
     query::{
-        QueryCallerValue, QueryCallsiteValues, QueryCapabilityCall, QueryCapabilityEscape,
-        QueryCapabilityStatus, QueryCapabilityUse, QuerySpec, QueryValue, Reachability,
+        ArgumentProjection, ConfiguredValue, ImplicitInvocation, QueryCallerValue,
+        QueryCallsiteValues, QueryCapabilityCall, QueryCapabilityEscape, QueryCapabilityStatus,
+        QueryCapabilityUse, QuerySpec, QueryValue, Reachability,
     },
 };
 
 use crate::query::QueryCallPathKind;
 
 use super::{
-    AbstractValue, Environment, FactoryCallCandidate, FunctionKey, Solver, TrackedValue, UseEdge,
-    UseNode, callee_text, query_value,
+    AbstractValue, Environment, FactoryCallCandidate, FunctionKey, Solver, TrackedValue,
+    UNPARSED_MODULE, UseEdge, UseNode, callee_text, query_value, truthy,
 };
 
 /// Scopes and targets one callsite's walk may visit.
@@ -58,6 +60,9 @@ enum Target {
     /// factory result. With a callee scope, only a call of that scope matches, since a use site
     /// can also be a call that receives the function as an argument.
     Site(u32, u32, Option<UseNode>, Vec<Step>),
+    /// A binding read only inside the function at this span, such as the parameter of a function
+    /// child, whose name another function child in the same scope may also use.
+    Within(u32, u32, String, Vec<Step>),
 }
 
 /// How an expression is used by the expression or statement that contains it.
@@ -180,6 +185,17 @@ struct FoundCall {
     /// The caller site that supplied the callsite's arguments, when the path left the callsite's
     /// scope through a caller, such as the element that renders a wrapper with a function child.
     instance: Option<SourceSpan>,
+    /// What a call the factory makes itself passes, instead of written arguments.
+    preset: Option<Rc<PresetCall>>,
+}
+
+/// A call no callsite writes, such as the factory invoking its own result.
+struct PresetCall {
+    arguments: BTreeMap<String, Vec<QueryValue>>,
+    /// Items the call never applies to.
+    excluded: Vec<QueryValue>,
+    /// Whether an explored path made the call.
+    explored: bool,
 }
 
 /// A condition on the walk's path, with where to evaluate the values it compares with.
@@ -734,7 +750,18 @@ impl Solver<'_> {
         let graph = self.use_graph();
         let mut results = Vec::new();
         for candidate in &candidates {
-            let mut walk = self.walk_capability(candidate, query, &graph);
+            // A call that is itself the invocation returns nothing to follow.
+            let mut walk = if query.capability.call_is_invocation {
+                Walk {
+                    calls: Vec::new(),
+                    escapes: Vec::new(),
+                    used: true,
+                    importer_requests: BTreeSet::new(),
+                    file_requests: BTreeSet::new(),
+                }
+            } else {
+                self.walk_capability(candidate, query, &graph)
+            };
             self.importer_requests.append(&mut walk.importer_requests);
             self.walk_file_requests.append(&mut walk.file_requests);
             results.push(self.summarize_callsite(candidate, query, walk, &graph));
@@ -1962,6 +1989,15 @@ impl Solver<'_> {
                         Target::Name(name, steps),
                         FlowExpressionKind::Identifier { name: seen, .. },
                     ) if seen == name => steps.clone(),
+                    (
+                        Target::Within(start, end, name, steps),
+                        FlowExpressionKind::Identifier { name: seen, .. },
+                    ) if seen == name
+                        && *start <= expression.span.start
+                        && expression.span.end <= *end =>
+                    {
+                        steps.clone()
+                    }
                     (Target::Site(start, end, callee, steps), kind)
                         if expression.span.start == *start
                             && expression.span.end == *end
@@ -2039,6 +2075,7 @@ impl Solver<'_> {
                             forwards: forwarded,
                             guards: here(),
                             instance: instance.clone(),
+                            preset: None,
                         }));
                         if forwarded && let Some(arrow) = arrow {
                             let lead = self
@@ -2086,6 +2123,7 @@ impl Solver<'_> {
                             forwards: false,
                             guards: here(),
                             instance: instance.clone(),
+                            preset: None,
                         }));
                     }
                     other => leads.push(Found::Lead(
@@ -2378,12 +2416,22 @@ impl Solver<'_> {
                             next_via.push(format!("{text} given by {caller}"));
                             let mut targets = Vec::new();
                             match &function.kind {
-                                // A function written at the call, such as a function child.
+                                // A function written at the call, such as a function child. Its
+                                // parameters are read only inside it.
                                 FlowExpressionKind::Arrow { params, .. } => {
                                     if let Some(param) = params.get(position) {
                                         bind_targets(param, &steps, &mut targets);
                                     }
                                     for target in targets {
+                                        let target = match target {
+                                            Target::Name(name, steps) => Target::Within(
+                                                function.span.start,
+                                                function.span.end,
+                                                name,
+                                                steps,
+                                            ),
+                                            target => target,
+                                        };
                                         queue.push_back((
                                             edge.user.clone(),
                                             target,
@@ -2662,6 +2710,396 @@ impl Solver<'_> {
     /// callsite scope's parameters, as `contentTypes={[selected.id]}`. A property of a local the
     /// walk cannot trace, as `selected.id` for an entry picked from a table, may be any value the
     /// caller's file writes under that property.
+    /// A value written in the query, evaluated where it names a module's export. A module that is
+    /// not parsed is requested, and the value is unknown until a later round parses it.
+    fn configured_value(&mut self, value: &ConfiguredValue) -> QueryValue {
+        match value {
+            ConfiguredValue::String(value) => QueryValue::String {
+                value: value.clone(),
+            },
+            ConfiguredValue::Integer(value) => QueryValue::Number { value: *value },
+            ConfiguredValue::Boolean(value) => QueryValue::Boolean { value: *value },
+            ConfiguredValue::Export {
+                module,
+                export,
+                path,
+            } => {
+                let resolved = self.project.resolve_path(module);
+                let resolved = resolved.canonicalize().unwrap_or(resolved);
+                let Some(file_id) = self
+                    .symbol_linker
+                    .file_at(&resolved)
+                    .map(|file| file.file_id)
+                else {
+                    self.walk_file_requests.insert(resolved);
+                    return QueryValue::Unknown {
+                        reason: format!("{UNPARSED_MODULE}{}", module.display()),
+                    };
+                };
+                let span = SourceSpan {
+                    file_id,
+                    start: 0,
+                    end: 0,
+                };
+                let resolution = self.symbol_linker.resolve_exported_value(file_id, export);
+                let mut value = self.linked_value(resolution, &span);
+                for property in path {
+                    value = self.read_property(
+                        value,
+                        property,
+                        span.clone(),
+                        RelationKind::ValueTransfer,
+                    );
+                }
+                query_value(&value)
+            }
+        }
+    }
+
+    /// A projected argument of an explored call, from all of the call's arguments.
+    fn explored_projection(
+        &mut self,
+        arguments: &[TrackedValue],
+        projection: &ArgumentProjection,
+        missing: QueryValue,
+        span: &SourceSpan,
+    ) -> QueryValue {
+        let value = match arguments.get(projection.index) {
+            None if projection.path.is_empty() => missing,
+            // A property of an omitted options argument is missing too.
+            None => QueryValue::Undefined,
+            Some(argument) => {
+                let mut value = argument.clone();
+                for property in &projection.path {
+                    value = self.read_property(
+                        value,
+                        property,
+                        span.clone(),
+                        RelationKind::ValueTransfer,
+                    );
+                }
+                query_value(&value)
+            }
+        };
+        let value = match (&value, &projection.default) {
+            (QueryValue::Unknown { reason }, Some(default)) if reason == "missing_argument" => {
+                self.configured_value(default)
+            }
+            _ => value,
+        };
+        self.finish_projection(value, projection)
+    }
+
+    /// A projected value with the projection's default for what is missing, as items when the
+    /// projection names them.
+    fn finish_projection(
+        &mut self,
+        value: QueryValue,
+        projection: &ArgumentProjection,
+    ) -> QueryValue {
+        let default = projection
+            .default
+            .as_ref()
+            .map(|default| self.configured_value(default));
+        let value = with_default(value, default.as_ref());
+        if projection.items {
+            as_items(value)
+        } else {
+            value
+        }
+    }
+
+    /// The call at a callsite that is itself the invocation, passing the call's own arguments.
+    fn call_as_invocation(
+        &self,
+        candidate: &FactoryCallCandidate,
+        query: &QuerySpec,
+        parameters: &BTreeSet<String>,
+    ) -> FoundCall {
+        let locals = Rc::new(
+            self.candidate_scope(candidate)
+                .and_then(|scope| self.scope_locals(&scope))
+                .unwrap_or_default(),
+        );
+        let arguments = query
+            .capability
+            .invocation_arguments
+            .iter()
+            .map(|projection| {
+                let expression = candidate.arguments.get(projection.index).cloned();
+                let parameter = matches!(
+                    &expression,
+                    Some(FlowExpression {
+                        kind: FlowExpressionKind::Identifier { name, .. },
+                        ..
+                    }) if parameters.contains(name)
+                );
+                Some(WrittenArgument {
+                    file_id: candidate.file_id,
+                    expression,
+                    locals: Rc::clone(&locals),
+                    parameter,
+                })
+            })
+            .collect();
+        FoundCall {
+            span: candidate.span.clone(),
+            arguments,
+            context: Vec::new(),
+            via: Vec::new(),
+            inner: None,
+            through: None,
+            forwards: false,
+            guards: Rc::new(Vec::new()),
+            instance: None,
+            preset: None,
+        }
+    }
+
+    /// The calls the factory makes of its result itself at a callsite, unless the configured
+    /// argument is truthy wherever the factory runs. Where the callsite's arguments come from its
+    /// scope's parameters, each instance of the scope decides on its own and requests its own
+    /// items; otherwise the callsite makes one call.
+    #[allow(clippy::too_many_arguments)]
+    fn implicit_calls(
+        &mut self,
+        candidate: &FactoryCallCandidate,
+        query: &QuerySpec,
+        implicit: &ImplicitInvocation,
+        graph: &HashMap<UseNode, Vec<UseEdge>>,
+        parameters: &BTreeSet<String>,
+        traces: &[Vec<(QueryCallPathKind, SourceSpan)>],
+        explored_arguments: &[Vec<TrackedValue>],
+    ) -> Vec<FoundCall> {
+        let arguments = query
+            .capability
+            .invocation_arguments
+            .iter()
+            .map(|projection| {
+                let value = implicit
+                    .arguments
+                    .get(&projection.label)
+                    .map_or(QueryValue::Undefined, |value| self.configured_value(value));
+                (projection.label.clone(), vec![value])
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut excluded = Vec::new();
+        if let Some(items) = &implicit.except_items {
+            let value = self.configured_value(items);
+            collect_array_elements(&value, &mut excluded);
+            excluded.retain(value_is_known);
+        }
+        let reads_parameters = |expression: &FlowExpression| {
+            let mut read = BTreeSet::new();
+            collect_read_names(expression, &mut read);
+            !read.is_disjoint(parameters)
+        };
+        let unless = implicit
+            .unless_argument
+            .map(|index| (index, candidate.arguments.get(index)));
+        let per_instance = unless
+            .is_some_and(|(_, argument)| argument.is_some_and(reads_parameters))
+            || query.factory_arguments.iter().any(|projection| {
+                candidate
+                    .arguments
+                    .get(projection.index)
+                    .is_some_and(reads_parameters)
+            });
+        let scope = self.candidate_scope(candidate);
+        let candidate_locals = scope
+            .as_ref()
+            .and_then(|scope| self.scope_locals(scope))
+            .unwrap_or_default();
+        // Whether the condition argument is truthy in each explored context in `contexts`.
+        let explored_truthiness = |solver: &Self, contexts: &[usize]| -> Vec<Option<bool>> {
+            let Some((index, _)) = unless else {
+                return Vec::new();
+            };
+            contexts
+                .iter()
+                .map(|&context| {
+                    explored_arguments[context]
+                        .get(index)
+                        .map_or(Some(false), |value| {
+                            truthy(&solver.materialize(value).value)
+                        })
+                })
+                .collect()
+        };
+        let mut sites = Vec::new();
+        let edges = match (&scope, per_instance) {
+            (Some(scope), true) => graph
+                .get(scope)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .take(MAX_CALLERS)
+                .map(|edge| (edge.user.clone(), edge.site.clone()))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        if edges.is_empty() {
+            let contexts = (0..explored_arguments.len()).collect::<Vec<_>>();
+            let truthiness = if unless.is_none() {
+                Vec::new()
+            } else if contexts.is_empty() {
+                vec![match unless.and_then(|(_, argument)| argument) {
+                    None => Some(false),
+                    Some(argument) if is_context_free(argument, &candidate_locals) => {
+                        query_truthy(&self.evaluate_context_free(candidate.file_id, argument))
+                    }
+                    Some(_) => None,
+                }]
+            } else {
+                explored_truthiness(self, &contexts)
+            };
+            sites.push((None, truthiness, !contexts.is_empty()));
+        } else {
+            for (user, site) in edges {
+                let contexts = matched_contexts(traces, &site);
+                let truthiness = if unless.is_none() {
+                    Vec::new()
+                } else if !contexts.is_empty() {
+                    explored_truthiness(self, &contexts)
+                } else {
+                    match unless.and_then(|(_, argument)| argument) {
+                        None => vec![Some(false)],
+                        Some(argument) if is_context_free(argument, &candidate_locals) => {
+                            vec![query_truthy(
+                                &self.evaluate_context_free(candidate.file_id, argument),
+                            )]
+                        }
+                        Some(argument) => match self.site_argument(
+                            &user,
+                            &site,
+                            scope.as_ref().expect("an instance's scope"),
+                            argument,
+                        ) {
+                            // Not a call or element of the scope: nothing here runs the factory.
+                            SiteArgument::NotASite => continue,
+                            SiteArgument::Unknown => vec![None],
+                            SiteArgument::Missing => vec![Some(false)],
+                            SiteArgument::Written(file_id, expression) => {
+                                let locals = self.scope_locals(&user).unwrap_or_default();
+                                vec![if is_context_free(&expression, &locals) {
+                                    query_truthy(&self.evaluate_context_free(file_id, &expression))
+                                } else {
+                                    None
+                                }]
+                            }
+                        },
+                    }
+                };
+                sites.push((Some(site), truthiness, !contexts.is_empty()));
+            }
+        }
+        let description = implicit
+            .description
+            .clone()
+            .unwrap_or_else(|| "called by the factory itself".to_owned());
+        sites
+            .into_iter()
+            .filter(|(_, truthiness, _)| {
+                truthiness.is_empty() || !truthiness.iter().all(|truthy| *truthy == Some(true))
+            })
+            .map(|(instance, truthiness, explored)| {
+                let mut via = vec![description.clone()];
+                if let Some((index, _)) = unless
+                    && truthiness.contains(&None)
+                {
+                    via.push(format!("unless factory argument {index} is truthy"));
+                }
+                FoundCall {
+                    span: candidate.span.clone(),
+                    arguments: Vec::new(),
+                    context: Vec::new(),
+                    via,
+                    inner: None,
+                    through: None,
+                    forwards: false,
+                    guards: Rc::new(Vec::new()),
+                    instance,
+                    preset: Some(Rc::new(PresetCall {
+                        arguments: arguments.clone(),
+                        excluded: excluded.clone(),
+                        explored,
+                    })),
+                }
+            })
+            .collect()
+    }
+
+    /// What a caller site passes for the parameter an argument of the callsite's scope reads.
+    fn site_argument(
+        &self,
+        user: &UseNode,
+        site: &SourceSpan,
+        scope: &UseNode,
+        argument: &FlowExpression,
+    ) -> SiteArgument {
+        let FlowExpressionKind::Identifier { name, .. } = &argument.kind else {
+            return SiteArgument::Unknown;
+        };
+        let Some(binding) = self.scope_code(scope).and_then(|code| {
+            code.params
+                .iter()
+                .enumerate()
+                .find_map(|(index, param)| pattern_path(param, name).map(|steps| (index, steps)))
+        }) else {
+            return SiteArgument::Unknown;
+        };
+        if let Some((file_id, passed)) =
+            self.passed_values(user, site, scope, &[(name.clone(), binding.clone())])
+            && let Some((_, expression)) = passed.into_iter().next()
+        {
+            return SiteArgument::Written(file_id, expression);
+        }
+        // Not passed: missing when the site writes every argument or prop it passes.
+        let Some(code) = self.scope_code(user) else {
+            return SiteArgument::NotASite;
+        };
+        let mut at_site = None;
+        let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
+            let expression = frames.last().expect("visited frame").expression;
+            if at_site.is_none() && expression.span == *site {
+                at_site = Some(expression.clone());
+            }
+        };
+        visit_body(&code.body, &mut found);
+        let (index, steps) = binding;
+        match at_site.map(|expression| expression.kind) {
+            Some(FlowExpressionKind::Call {
+                callee: target,
+                arguments,
+            }) if self.calls_scope(code.file_id, &target, scope) => {
+                if arguments.len() <= index
+                    && !arguments
+                        .iter()
+                        .any(|argument| matches!(argument.kind, FlowExpressionKind::Spread { .. }))
+                {
+                    SiteArgument::Missing
+                } else {
+                    SiteArgument::Unknown
+                }
+            }
+            Some(FlowExpressionKind::JsxElement { props, .. }) if index == 0 => {
+                let spread = props
+                    .iter()
+                    .any(|prop| !matches!(prop, FlowJsxProp::Property { .. }));
+                let named = steps.first().is_some_and(|step| {
+                    props.iter().any(
+                        |prop| matches!(prop, FlowJsxProp::Property { name, .. } if name == step),
+                    )
+                });
+                if spread || named {
+                    SiteArgument::Unknown
+                } else {
+                    SiteArgument::Missing
+                }
+            }
+            _ => SiteArgument::NotASite,
+        }
+    }
+
     /// What an instance's caller writes for a factory argument, from the arrays its source builds,
     /// as `contentTypes={items}` with `const items = hidden ? [] : [Kind.A]`.
     fn written_source_elements(
@@ -2669,10 +3107,11 @@ impl Solver<'_> {
         candidate: &FactoryCallCandidate,
         graph: &HashMap<UseNode, Vec<UseEdge>>,
         instance: &SourceSpan,
-        position: usize,
+        index: usize,
+        single: bool,
     ) -> Option<Vec<QueryValue>> {
         let scope = self.candidate_scope(candidate)?;
-        let FlowExpressionKind::Identifier { name, .. } = &candidate.arguments.get(position)?.kind
+        let FlowExpressionKind::Identifier { name, .. } = &candidate.arguments.get(index)?.kind
         else {
             return None;
         };
@@ -2690,7 +3129,7 @@ impl Solver<'_> {
         let (_, passed) =
             self.passed_values(&edge.user, &edge.site, &scope, &[(name.clone(), binding)])?;
         let (_, written) = passed.into_iter().next()?;
-        self.pushed_values(&user, &written, Some(graph))
+        self.pushed_values(&user, &written, Some(graph), single)
     }
 
     fn written_instance_elements(
@@ -2698,10 +3137,10 @@ impl Solver<'_> {
         candidate: &FactoryCallCandidate,
         graph: &HashMap<UseNode, Vec<UseEdge>>,
         instance: &SourceSpan,
-        position: usize,
+        index: usize,
     ) -> Option<Vec<QueryValue>> {
         let scope = self.candidate_scope(candidate)?;
-        let FlowExpressionKind::Identifier { name, .. } = &candidate.arguments.get(position)?.kind
+        let FlowExpressionKind::Identifier { name, .. } = &candidate.arguments.get(index)?.kind
         else {
             return None;
         };
@@ -2785,8 +3224,9 @@ impl Solver<'_> {
         &mut self,
         scope: &UseNode,
         argument: &FlowExpression,
+        single: bool,
     ) -> Option<Vec<QueryValue>> {
-        self.pushed_values(scope, argument, None)
+        self.pushed_values(scope, argument, None, single)
     }
 
     /// The values of the elements `pushed_expressions` finds. With the use graph, an element that
@@ -2796,11 +3236,14 @@ impl Solver<'_> {
         scope: &UseNode,
         argument: &FlowExpression,
         graph: Option<&HashMap<UseNode, Vec<UseEdge>>>,
+        single: bool,
     ) -> Option<Vec<QueryValue>> {
         let locals = self.scope_locals(scope)?;
         let file_id = self.scope_code(scope)?.file_id;
         let mut elements = Vec::new();
-        if !self.pushed_expressions(scope, argument, &mut elements, 0) || elements.is_empty() {
+        if !self.pushed_expressions(scope, argument, &mut elements, 0, single)
+            || elements.is_empty()
+        {
             return None;
         }
         let mut values = Vec::new();
@@ -2838,6 +3281,7 @@ impl Solver<'_> {
         argument: &FlowExpression,
         elements: &mut Vec<FlowExpression>,
         depth: usize,
+        single: bool,
     ) -> bool {
         if depth > 8 {
             return false;
@@ -2853,20 +3297,25 @@ impl Solver<'_> {
                 alternate,
                 ..
             } => {
-                return self.pushed_expressions(scope, consequent, elements, depth)
-                    && self.pushed_expressions(scope, alternate, elements, depth);
+                return self.pushed_expressions(scope, consequent, elements, depth, single)
+                    && self.pushed_expressions(scope, alternate, elements, depth, single);
             }
             // `ready && items` is `items` or a falsy value that holds nothing.
             FlowExpressionKind::Logical {
                 operator: FlowLogicalOperator::And,
                 right,
                 ..
-            } => return self.pushed_expressions(scope, right, elements, depth),
+            } => return self.pushed_expressions(scope, right, elements, depth, single),
             FlowExpressionKind::Logical { left, right, .. } => {
-                return self.pushed_expressions(scope, left, elements, depth)
-                    && self.pushed_expressions(scope, right, elements, depth);
+                return self.pushed_expressions(scope, left, elements, depth, single)
+                    && self.pushed_expressions(scope, right, elements, depth, single);
             }
             FlowExpressionKind::Identifier { name, .. } => name,
+            // An argument that is one item is the item, as `Kind.A`.
+            _ if single => {
+                elements.push(argument.clone());
+                return true;
+            }
             _ => return false,
         };
         {
@@ -2913,10 +3362,17 @@ impl Solver<'_> {
                 }
             };
             visit_body(&code.body, &mut found);
+            // A parameter or module value that is one item is the item, evaluated where it is
+            // read.
+            if !bound && !reassigned && single {
+                elements.truncate(start);
+                elements.push(argument.clone());
+                return true;
+            }
             if !bound
                 || reassigned
                 || chosen.is_some_and(|initial| {
-                    !self.pushed_expressions(scope, &initial, elements, depth)
+                    !self.pushed_expressions(scope, &initial, elements, depth, single)
                 })
             {
                 elements.truncate(start);
@@ -3065,52 +3521,70 @@ impl Solver<'_> {
         let mut explored_traces = Vec::new();
         let mut explored =
             BTreeMap::<(u32, u32), (SourceSpan, Vec<BTreeMap<String, QueryValue>>)>::new();
-        for capability in self
+        // Every argument of each explored creation, for conditions on arguments no projection
+        // selects.
+        let mut explored_arguments_raw = Vec::new();
+        let creations = self
             .capabilities
             .iter()
             .filter(|capability| capability.callsite == candidate.span)
-        {
-            contexts += 1;
-            explored_traces.push(
-                capability
-                    .origin_trace
-                    .iter()
-                    .map(|step| (step.kind, step.span.clone()))
-                    .collect::<Vec<_>>(),
-            );
-            if rank(capability.reachability) < rank(reachability) {
-                reachability = capability.reachability;
-            }
-            explored_factory_arguments.push(
-                query
-                    .factory_arguments
-                    .iter()
-                    .map(|projection| {
-                        capability
-                            .factory_arguments
-                            .get(projection.index)
-                            .map_or_else(
-                                || QueryValue::Unknown {
-                                    reason: "missing_argument".to_owned(),
-                                },
-                                query_value,
+            .map(|capability| {
+                (
+                    capability.reachability,
+                    capability
+                        .origin_trace
+                        .iter()
+                        .map(|step| (step.kind, step.span.clone()))
+                        .collect::<Vec<_>>(),
+                    capability.factory_arguments.clone(),
+                    capability
+                        .invocations
+                        .iter()
+                        .map(|invocation| {
+                            (
+                                self.evidence[invocation.evidence.0 as usize].span.clone(),
+                                invocation.arguments.clone(),
                             )
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            for invocation in &capability.invocations {
-                let span = &self.evidence[invocation.evidence.0 as usize].span;
-                let arguments = query
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (creation_reachability, trace, arguments, invocations) in creations {
+            contexts += 1;
+            explored_traces.push(trace);
+            if rank(creation_reachability) < rank(reachability) {
+                reachability = creation_reachability;
+            }
+            let projected = query
+                .factory_arguments
+                .iter()
+                .map(|projection| {
+                    self.explored_projection(
+                        &arguments,
+                        projection,
+                        QueryValue::Unknown {
+                            reason: "missing_argument".to_owned(),
+                        },
+                        &candidate.span,
+                    )
+                })
+                .collect::<Vec<_>>();
+            explored_factory_arguments.push(projected);
+            for (span, invocation_arguments) in invocations {
+                let projected = query
                     .capability
                     .invocation_arguments
                     .iter()
                     .map(|projection| {
                         (
                             projection.label.clone(),
-                            invocation
-                                .arguments
-                                .get(projection.index)
-                                .map_or(QueryValue::Undefined, query_value),
+                            self.explored_projection(
+                                &invocation_arguments,
+                                projection,
+                                QueryValue::Undefined,
+                                &span,
+                            ),
                         )
                     })
                     .collect();
@@ -3118,8 +3592,9 @@ impl Solver<'_> {
                     .entry((span.file_id.0, span.start))
                     .or_insert_with(|| (span.clone(), Vec::new()))
                     .1
-                    .push(arguments);
+                    .push(projected);
             }
+            explored_arguments_raw.push(arguments);
         }
         let mut factory_arguments = BTreeMap::<String, Vec<QueryValue>>::new();
         let candidate_locals = if contexts == 0 {
@@ -3133,15 +3608,18 @@ impl Solver<'_> {
             let mut values = Vec::new();
             if contexts == 0 {
                 // No context explored the callsite; what it writes may still be known.
-                values.push(match candidate.arguments.get(projection.index) {
-                    Some(argument) if is_context_free(argument, &candidate_locals) => {
-                        self.evaluate_context_free(candidate.file_id, argument)
-                    }
+                let value = match candidate.arguments.get(projection.index) {
+                    Some(argument) if is_context_free(argument, &candidate_locals) => self
+                        .evaluate_context_free(
+                            candidate.file_id,
+                            &projected_expression(argument, &projection.path),
+                        ),
                     Some(_) => QueryValue::Unknown {
                         reason: "callsite_not_explored".to_owned(),
                     },
                     None => QueryValue::Undefined,
-                });
+                };
+                values.push(self.finish_projection(value, projection));
             }
             for arguments in &explored_factory_arguments {
                 if !values.contains(&arguments[position]) {
@@ -3176,7 +3654,7 @@ impl Solver<'_> {
                 let Some(argument) = candidate.arguments.get(projection.index) else {
                     continue;
                 };
-                if let Some(pushed) = self.pushed_elements(&scope, argument) {
+                if let Some(pushed) = self.pushed_elements(&scope, argument, projection.items) {
                     let elements = possible_elements
                         .entry(projection.label.clone())
                         .or_insert_with(Vec::new);
@@ -3186,7 +3664,15 @@ impl Solver<'_> {
                         }
                     }
                 }
-                let callers = self.values_from_callers(&scope, argument, graph);
+                let mut callers = self.values_from_callers(
+                    &scope,
+                    &projected_expression(argument, &projection.path),
+                    graph,
+                );
+                for caller in &mut callers {
+                    let value = std::mem::replace(&mut caller.value, QueryValue::Undefined);
+                    caller.value = self.finish_projection(value, projection);
+                }
                 if !callers.is_empty() {
                     values_from_callers.insert(projection.label.clone(), callers);
                 }
@@ -3240,29 +3726,7 @@ impl Solver<'_> {
         // path renders the instance's element, or else passes through the function holding its
         // call.
         let instance_elements = |span: &SourceSpan, position: usize| {
-            let exact = explored_traces
-                .iter()
-                .enumerate()
-                .filter(|(_, trace)| trace.iter().any(|(_, step)| step == span))
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            let matched = if exact.is_empty() {
-                explored_traces
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, trace)| {
-                        trace.iter().any(|(kind, step)| {
-                            *kind == QueryCallPathKind::Call
-                                && step.file_id == span.file_id
-                                && step.start <= span.start
-                                && span.end <= step.end
-                        })
-                    })
-                    .map(|(index, _)| index)
-                    .collect()
-            } else {
-                exact
-            };
+            let matched = matched_contexts(&explored_traces, span);
             if matched.is_empty() {
                 return None;
             }
@@ -3321,6 +3785,36 @@ impl Solver<'_> {
             .map(span_key)
             .collect::<BTreeSet<_>>();
         covered.extend(wrapped.iter().copied());
+        let invocation_defaults = query
+            .capability
+            .invocation_arguments
+            .iter()
+            .map(|projection| {
+                projection
+                    .default
+                    .as_ref()
+                    .map(|default| self.configured_value(default))
+            })
+            .collect::<Vec<_>>();
+        // Calls no callsite writes: the call itself when it is the invocation, and the factory's
+        // own invocations of its result.
+        let mut walk = walk;
+        if query.capability.call_is_invocation {
+            walk.calls
+                .push(self.call_as_invocation(candidate, query, &parameters));
+        }
+        for implicit in &query.capability.implicit_invocations {
+            let found = self.implicit_calls(
+                candidate,
+                query,
+                implicit,
+                graph,
+                &parameters,
+                &explored_traces,
+                &explored_arguments_raw,
+            );
+            walk.calls.extend(found);
+        }
         // What each instance's caller writes for the factory arguments, for an instance whose
         // explored elements are not known.
         let mut written_elements = BTreeMap::new();
@@ -3330,10 +3824,17 @@ impl Solver<'_> {
                 if written_elements.contains_key(&key) {
                     continue;
                 }
+                let projection = &query.factory_arguments[position];
                 let elements = self
-                    .written_instance_elements(candidate, graph, &instance, position)
+                    .written_instance_elements(candidate, graph, &instance, projection.index)
                     .or_else(|| {
-                        self.written_source_elements(candidate, graph, &instance, position)
+                        self.written_source_elements(
+                            candidate,
+                            graph,
+                            &instance,
+                            projection.index,
+                            projection.items,
+                        )
                     });
                 written_elements.insert(key, elements);
             }
@@ -3350,12 +3851,25 @@ impl Solver<'_> {
                 covered.insert(key);
             }
             let mut arguments = BTreeMap::<String, Vec<QueryValue>>::new();
-            for (projection, argument) in query
+            if let Some(preset) = &call.preset {
+                arguments.clone_from(&preset.arguments);
+            }
+            for ((projection, argument), default) in query
                 .capability
                 .invocation_arguments
                 .iter()
                 .zip(&call.arguments)
+                .zip(&invocation_defaults)
             {
+                // The properties the projection reads, from the argument as written.
+                let projected = argument.as_ref().map(|argument| WrittenArgument {
+                    expression: argument
+                        .expression
+                        .as_ref()
+                        .map(|expression| projected_expression(expression, &projection.path)),
+                    ..argument.clone()
+                });
+                let argument = &projected;
                 let mut values = Vec::new();
                 match argument {
                     Some(WrittenArgument {
@@ -3419,7 +3933,14 @@ impl Solver<'_> {
                         .to_owned(),
                     });
                 }
-                arguments.insert(projection.label.clone(), values);
+                let mut defaulted = Vec::new();
+                for value in values {
+                    let value = with_default(value, default.as_ref());
+                    if !defaulted.contains(&value) {
+                        defaulted.push(value);
+                    }
+                }
+                arguments.insert(projection.label.clone(), defaulted);
             }
             let arguments_resolved = arguments.values().flatten().all(value_is_known);
             let instance = call
@@ -3427,7 +3948,11 @@ impl Solver<'_> {
                 .as_ref()
                 .and_then(|span| self.query_location(span));
             let mut guards = Vec::new();
-            let mut guards_not = Vec::new();
+            let mut guards_not = call
+                .preset
+                .as_ref()
+                .map(|preset| preset.excluded.clone())
+                .unwrap_or_default();
             for guard in call.guards.iter() {
                 let (sets, excluded) = self.guard_values(guard);
                 for set in sets {
@@ -3444,6 +3969,8 @@ impl Solver<'_> {
             let mut elements = BTreeMap::new();
             let mut elements_complete = true;
             let mut ruled_out = false;
+            // Every element any of the call's arguments could hold.
+            let mut domains = Vec::new();
             for (label, (callsite, callsite_complete)) in &callsite_elements {
                 // An instance requests its own elements; the callsite's are every instance's. An
                 // argument that does not read the callsite's parameters is the same everywhere.
@@ -3486,6 +4013,7 @@ impl Solver<'_> {
                 // Conditions on members of the elements' enum say which elements reach the call.
                 let mut domain = source.clone();
                 domain.extend(callsite.iter().cloned());
+                domains.extend(domain.iter().cloned());
                 let applicable = guards
                     .iter()
                     .filter(|set| guard_applies(set, &domain))
@@ -3513,6 +4041,9 @@ impl Solver<'_> {
             // A wrapper's call ran on an explored path if the call inside the wrapper saw its
             // values there.
             let explored = match (&call.inner, explored_arguments) {
+                _ if call.preset.is_some() => {
+                    call.preset.as_ref().is_some_and(|preset| preset.explored)
+                }
                 (None, explored) => explored.is_some(),
                 (Some(_), Some(explored)) => {
                     arguments_resolved
@@ -3526,6 +4057,11 @@ impl Solver<'_> {
                 }
                 (Some(_), None) => false,
             };
+            // The items a call the factory makes itself never applies to are listed only where the
+            // call could have applied to them.
+            if call.preset.is_some() {
+                guards_not.retain(|value| domains.contains(value));
+            }
             let found = QueryCapabilityCall {
                 location: self.query_location(&call.span),
                 context: call.context,
@@ -3913,6 +4449,119 @@ fn pattern_path(pattern: &FlowPattern, name: &str) -> Option<Vec<Step>> {
 }
 
 /// The value written for a property or index in a record or array literal.
+/// What a caller site passes for a parameter.
+enum SiteArgument {
+    /// The site is not a call or element of the scope.
+    NotASite,
+    /// The site passes something the expression cannot say, as through a spread.
+    Unknown,
+    /// The site omits it.
+    Missing,
+    Written(FileId, FlowExpression),
+}
+
+/// `expression` with the projection's properties read from it.
+fn projected_expression(expression: &FlowExpression, path: &[String]) -> FlowExpression {
+    path.iter()
+        .fold(expression.clone(), |object, property| FlowExpression {
+            span: object.span.clone(),
+            kind: FlowExpressionKind::StaticMember {
+                object: Box::new(object),
+                property: property.clone(),
+            },
+        })
+}
+
+/// A value as the items it names: an array's elements, or a single value as a list of one.
+fn as_items(value: QueryValue) -> QueryValue {
+    match value {
+        QueryValue::Array { .. } | QueryValue::Unknown { .. } => value,
+        QueryValue::Alternatives { values } => QueryValue::Alternatives {
+            values: values.into_iter().map(as_items).collect(),
+        },
+        QueryValue::Null | QueryValue::Undefined => QueryValue::Array {
+            elements: Vec::new(),
+        },
+        value => QueryValue::Array {
+            elements: vec![value],
+        },
+    }
+}
+
+/// `value` with `undefined`, alone or as one alternative, replaced by the default.
+fn with_default(value: QueryValue, default: Option<&QueryValue>) -> QueryValue {
+    let Some(default) = default else {
+        return value;
+    };
+    match value {
+        QueryValue::Undefined => default.clone(),
+        QueryValue::Alternatives { values } => {
+            let mut distinct = Vec::new();
+            for value in values {
+                let value = with_default(value, Some(default));
+                if !distinct.contains(&value) {
+                    distinct.push(value);
+                }
+            }
+            if distinct.len() == 1 {
+                distinct.pop().expect("one alternative")
+            } else {
+                QueryValue::Alternatives { values: distinct }
+            }
+        }
+        value => value,
+    }
+}
+
+/// Whether a projected value is truthy, when that is known.
+fn query_truthy(value: &QueryValue) -> Option<bool> {
+    match value {
+        QueryValue::Null | QueryValue::Undefined => Some(false),
+        QueryValue::Boolean { value } => Some(*value),
+        QueryValue::Number { value } | QueryValue::EnumMember { value, .. } => Some(*value != 0),
+        QueryValue::String { value } => Some(!value.is_empty()),
+        QueryValue::Array { .. } => Some(true),
+        QueryValue::Alternatives { values } => {
+            let mut truthiness = values.iter().map(query_truthy);
+            let first = truthiness.next()??;
+            truthiness
+                .all(|value| value == Some(first))
+                .then_some(first)
+        }
+        QueryValue::Unknown { .. } => None,
+    }
+}
+
+/// The explored contexts whose path went through a site: those whose path has the site as a
+/// step, or else a call step that holds it.
+fn matched_contexts(
+    traces: &[Vec<(QueryCallPathKind, SourceSpan)>],
+    span: &SourceSpan,
+) -> Vec<usize> {
+    let exact = traces
+        .iter()
+        .enumerate()
+        .filter(|(_, trace)| trace.iter().any(|(_, step)| step == span))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if !exact.is_empty() {
+        return exact;
+    }
+    traces
+        .iter()
+        .enumerate()
+        .filter(|(_, trace)| {
+            trace.iter().any(|(kind, step)| {
+                *kind == QueryCallPathKind::Call
+                    && step.file_id == span.file_id
+                    && step.start <= span.start
+                    && span.end <= step.end
+            })
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 fn record_field(value: &FlowExpression, step: &str) -> Option<FlowExpression> {
     match &value.kind {
         FlowExpressionKind::Record { fields } => fields

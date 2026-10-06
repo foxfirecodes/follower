@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use code_flow::{
     Analyzer, Project,
@@ -60,8 +60,9 @@ enum Command {
     },
     /// Write a browsable page for a query CSV from `query --format csv`.
     View {
-        /// The CSV to show.
-        csv: PathBuf,
+        /// The CSVs to show, as one table; each must have the same columns.
+        #[arg(required = true)]
+        csv: Vec<PathBuf>,
         /// Where to write the page; defaults to the CSV path with an `.html` extension.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -125,14 +126,45 @@ fn main() -> Result<()> {
     }
 }
 
-fn view(csv: &std::path::Path, output: Option<PathBuf>) -> Result<()> {
-    let text = std::fs::read_to_string(csv)
-        .with_context(|| format!("failed to read {}", csv.display()))?;
-    let output = output.unwrap_or_else(|| csv.with_extension("html"));
-    let title = csv.file_name().map_or_else(
-        || csv.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
+fn view(csvs: &[PathBuf], output: Option<PathBuf>) -> Result<()> {
+    // Several query CSVs with the same columns show as one table, as a hook query's calls and a
+    // query of direct calls that answer the same question.
+    let mut text = String::new();
+    let mut header = None;
+    for csv in csvs {
+        let source = std::fs::read_to_string(csv)
+            .with_context(|| format!("failed to read {}", csv.display()))?;
+        let (first, rows) = source.split_once('\n').unwrap_or((source.as_str(), ""));
+        match &header {
+            None => {
+                text.push_str(first);
+                text.push('\n');
+                header = Some(first.to_owned());
+            }
+            Some(header) if header != first => bail!(
+                "{} has different columns from {}",
+                csv.display(),
+                csvs[0].display()
+            ),
+            Some(_) => {}
+        }
+        text.push_str(rows);
+        if !rows.is_empty() && !rows.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    let first = &csvs[0];
+    let output = output.unwrap_or_else(|| first.with_extension("html"));
+    let title = csvs
+        .iter()
+        .map(|csv| {
+            csv.file_name().map_or_else(
+                || csv.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
     write_csv_viewer(&text, &title, &output)?;
     eprintln!("Viewer: {}", output.display());
     Ok(())

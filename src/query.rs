@@ -33,6 +33,32 @@ pub enum QueryScope {
 pub struct ArgumentProjection {
     pub index: usize,
     pub label: String,
+    /// Properties read from the argument, as `["action"]` for the `action` of an options
+    /// object.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
+    /// The value when the argument or the property is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<ConfiguredValue>,
+    /// The argument names the items calls apply to, so a single value is a list of one, as an
+    /// array argument's elements are.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub items: bool,
+}
+
+/// A value written in a query: a literal, or a module's exported value and properties under it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConfiguredValue {
+    String(String),
+    Integer(i64),
+    Boolean(bool),
+    Export {
+        module: std::path::PathBuf,
+        export: String,
+        #[serde(default)]
+        path: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -44,6 +70,32 @@ pub struct CapabilityQuery {
     pub returned_index: Option<usize>,
     #[serde(default)]
     pub invocation_arguments: Vec<ArgumentProjection>,
+    /// Each factory call is itself the invocation, as for a function that acts when called: the
+    /// invocation arguments are the call's own, and nothing is returned to follow.
+    #[serde(default)]
+    pub call_is_invocation: bool,
+    /// Invocations the factory makes of its result itself, which no callsite writes.
+    #[serde(default)]
+    pub implicit_invocations: Vec<ImplicitInvocation>,
+}
+
+/// An invocation the factory makes of its result itself, such as a hook that calls the callback
+/// it returns when the component unmounts. Each callsite reports it as a call at the callsite.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImplicitInvocation {
+    /// What the invocation passes, by invocation argument label.
+    #[serde(default)]
+    pub arguments: BTreeMap<String, ConfiguredValue>,
+    /// The factory argument at this index, when truthy, keeps the factory from invoking.
+    #[serde(default)]
+    pub unless_argument: Option<usize>,
+    /// Items the invocation never applies to, as an exported list or set.
+    #[serde(default)]
+    pub except_items: Option<ConfiguredValue>,
+    /// How the report describes the invocation.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -85,6 +137,10 @@ pub struct QuerySpec {
     #[serde(default)]
     pub scan_callback_bodies: bool,
     pub factory: SymbolMatcher,
+    /// Path globs of factory callsites the query leaves out, as `["**/framework/**"]` for the
+    /// factory's own uses inside the code that implements it.
+    #[serde(default)]
+    pub exclude_callsites: Vec<String>,
     #[serde(default)]
     pub factory_arguments: Vec<ArgumentProjection>,
     pub capability: CapabilityQuery,
@@ -107,9 +163,30 @@ impl QuerySpec {
         if self.id.trim().is_empty() {
             bail!("query id cannot be empty");
         }
-        if self.capability.returned_property.is_empty() == self.capability.returned_index.is_none()
-        {
-            bail!("capability must select exactly one of returned_property or returned_index");
+        let selected = usize::from(!self.capability.returned_property.is_empty())
+            + usize::from(self.capability.returned_index.is_some())
+            + usize::from(self.capability.call_is_invocation);
+        if selected != 1 {
+            bail!(
+                "capability must select exactly one of returned_property, returned_index, or call_is_invocation"
+            );
+        }
+        if self.capability.call_is_invocation && !self.capability.implicit_invocations.is_empty() {
+            bail!("capability.implicit_invocations needs a returned result to invoke");
+        }
+        for implicit in &self.capability.implicit_invocations {
+            for label in implicit.arguments.keys() {
+                if !self
+                    .capability
+                    .invocation_arguments
+                    .iter()
+                    .any(|projection| &projection.label == label)
+                {
+                    bail!(
+                        "capability.implicit_invocations names {label}, which is not an invocation argument label"
+                    );
+                }
+            }
         }
         validate_projections("factory_arguments", &self.factory_arguments)?;
         validate_projections(
@@ -129,7 +206,7 @@ fn validate_projections(name: &str, projections: &[ArgumentProjection]) -> Resul
         if !labels.insert(&projection.label) {
             bail!("{name} contains duplicate label {}", projection.label);
         }
-        if !indices.insert(projection.index) {
+        if !indices.insert((projection.index, &projection.path)) {
             bail!(
                 "{name} contains duplicate argument index {}",
                 projection.index

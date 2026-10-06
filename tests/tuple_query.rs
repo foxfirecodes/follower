@@ -1103,6 +1103,160 @@ fn an_unexplored_instance_requests_the_arrays_its_caller_builds() {
     );
 }
 
+/// Each call's action and the enum members its items name, sorted.
+fn applied_items(callsite: &code_flow::query::QueryCallsiteValues) -> Vec<(String, Vec<String>)> {
+    let mut applied = callsite
+        .capability
+        .calls
+        .iter()
+        .map(|call| {
+            let mut names = Vec::new();
+            for value in &call.elements["items"] {
+                collect_enum_members(value, &mut names);
+            }
+            let action = match call.arguments["action"].as_slice() {
+                [QueryValue::String { value }] => value.clone(),
+                values => format!("{values:?}"),
+            };
+            (action, names)
+        })
+        .collect::<Vec<_>>();
+    applied.sort();
+    applied
+}
+
+#[test]
+fn implicit_invocations_are_calls_at_each_callsite_that_does_not_opt_out() {
+    // The hook calls its result itself unless its third argument is truthy or the item is one it
+    // skips; a wrapper's instances decide for themselves, including through a bare attribute.
+    let fixture = TestProject::new(&[
+        (
+            "src/hook.ts",
+            "export function useItemSelection(_values, _group, _bypass = false) { return [null, (_action) => {}]; }",
+        ),
+        (
+            "src/kinds.ts",
+            "export enum Kind { A = 1, B = 2, C = 3, D = 4, E = 5 }",
+        ),
+        (
+            "src/skip.ts",
+            "import { Kind } from './kinds'; export const SKIP = new Set([Kind.C]);",
+        ),
+        (
+            "src/Sel.tsx",
+            "import { useItemSelection } from './hook'; export default function Sel({ kinds, bypass, children }) { const [visible, apply] = useItemSelection(kinds, undefined, bypass); return children({ visible, apply }); }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Kind } from './kinds'; import Sel from './Sel'; import { useItemSelection } from './hook'; function Shown() { const [visible] = useItemSelection([Kind.A]); return visible; } function Bypassed() { const [visible] = useItemSelection([Kind.B], undefined, true); return visible; } function Skipped() { const [visible] = useItemSelection([Kind.C]); return visible; } export function App() { return <div><Shown /><Bypassed /><Skipped /><Sel kinds={[Kind.D]}>{({ apply }) => <button onClick={() => apply('d')} />}</Sel><Sel kinds={[Kind.E]} bypass>{({ apply }) => <button onClick={() => apply('e')} />}</Sel></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        &format!(
+            "{ITEMS_QUERY}[[capability.implicit_invocations]]\narguments = {{ action = 'auto' }}\nunless_argument = 2\nexcept_items = {{ module = 'src/skip.ts', export = 'SKIP' }}\ndescription = 'called when the component unmounts'\n"
+        ),
+    );
+    let report = fixture.report();
+    let sel = report
+        .callsites
+        .iter()
+        .find(|callsite| {
+            callsite
+                .location
+                .as_ref()
+                .is_some_and(|location| location.path == "src/Sel.tsx")
+        })
+        .expect("wrapper callsite");
+    // Only the instance that does not pass `bypass` gets the hook's own call.
+    assert_eq!(
+        applied_items(sel),
+        [
+            ("auto".to_owned(), vec!["D".to_owned()]),
+            ("d".to_owned(), vec!["D".to_owned()]),
+            ("e".to_owned(), vec!["E".to_owned()]),
+        ]
+    );
+    let app = report
+        .callsites
+        .iter()
+        .filter(|callsite| {
+            callsite
+                .location
+                .as_ref()
+                .is_some_and(|location| location.path == "src/App.tsx")
+        })
+        .collect::<Vec<_>>();
+    let [shown, bypassed, skipped] = app.as_slice() else {
+        panic!("{app:?}");
+    };
+    assert_eq!(
+        applied_items(shown),
+        [("auto".to_owned(), vec!["A".to_owned()])]
+    );
+    assert!(bypassed.capability.calls.is_empty());
+    assert!(skipped.capability.calls.is_empty());
+    assert_eq!(skipped.capability.excluded_calls.len(), 1);
+    assert!(
+        shown.capability.calls[0]
+            .via
+            .contains(&"called when the component unmounts".to_owned())
+    );
+}
+
+#[test]
+fn calls_that_are_the_invocation_report_their_own_arguments() {
+    // A function that acts when called: each call is the invocation, an options property gives
+    // the action, a missing one takes the default, and a helper's callers say its items.
+    let fixture = TestProject::new(&[
+        (
+            "src/kinds.ts",
+            "export enum Kind { A = 1, B = 2, C = 3, D = 4 }",
+        ),
+        (
+            "src/record.ts",
+            "export async function record(_kind, _config = {}) {}",
+        ),
+        (
+            "src/internal/forward.ts",
+            "import { record } from '../record'; export function forward(kind) { return record(kind, { action: 'forwarded' }); }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Kind } from './kinds'; import { record } from './record'; import { forward } from './internal/forward'; function recordFor(kind) { void record(kind); } export function App() { return <div><button onClick={() => record(Kind.A)} /><button onClick={() => record(Kind.B, { action: 'take' })} /><button onClick={() => recordFor(Kind.C)} /><button onClick={() => forward(Kind.D)} /></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'direct'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\nexclude_callsites = ['**/internal/**']\n[factory]\nproject = 'acceptance'\nmodule = 'src/record.ts'\nexport = 'record'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\nitems = true\n[capability]\ncall_is_invocation = true\n[[capability.invocation_arguments]]\nindex = 1\npath = ['action']\ndefault = 'unknown'\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    // The excluded helper's call is not a callsite.
+    assert_eq!(report.callsites.len(), 3, "{:?}", report.callsites);
+    let mut applied = report
+        .callsites
+        .iter()
+        .flat_map(applied_items)
+        .collect::<Vec<_>>();
+    applied.sort();
+    assert_eq!(
+        applied,
+        [
+            ("take".to_owned(), vec!["B".to_owned()]),
+            ("unknown".to_owned(), vec!["A".to_owned()]),
+            ("unknown".to_owned(), vec!["C".to_owned()]),
+        ]
+    );
+}
+
 #[test]
 fn callsite_walk_follows_function_children_refs_loaders_and_aliases() {
     let fixture = TestProject::new(&[

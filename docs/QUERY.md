@@ -123,6 +123,55 @@ index = 0
 label = "action_kind"
 ```
 
+An argument projection can read inside the argument and stand in for what is missing:
+
+```toml
+[[capability.invocation_arguments]]
+index = 1
+path = ["action"]      # the `action` of an options object passed second
+default = "unknown"    # when the argument or the property is missing
+label = "action_kind"
+```
+
+`path` reads properties of the argument, in explored and source values alike. `default` replaces
+a missing value, alone or as one alternative; it is a string, integer, or boolean, or a module's
+exported value, as `{ module = "src/kinds.ts", export = "ActionKind", path = ["UNKNOWN"] }`. A
+module that is not parsed is requested, so the value is known from the next round. On a factory
+argument, `items = true` says the argument names the items calls apply to: a single value counts
+as a list of one, so it fills the `item.<label>` column as an array argument's elements do, and a
+choice of values, as `ready ? Kind.A : Kind.B`, holds each.
+
+For a function that acts when called, such as one that records an action directly, set
+`call_is_invocation = true` under `[capability]` instead of a returned selector. Each call of the
+factory is then itself the invocation: `invocation_arguments` select the call's own arguments,
+nothing is followed after the call, and each callsite reports one call at the callsite. Labelling
+its projections like another query's makes their CSVs share columns, and `follower view a.csv
+b.csv` shows CSVs with the same columns as one table.
+
+A factory may invoke its result itself, as a hook that calls the callback it returns when the
+component unmounts. Each `[[capability.implicit_invocations]]` entry reports such an invocation as
+a call at every callsite that does not opt out:
+
+```toml
+[[capability.implicit_invocations]]
+arguments = { action_kind = "auto" }    # what it passes, by invocation argument label
+unless_argument = 2                    # a truthy third factory argument opts out
+except_items = { module = "src/config.ts", export = "KEEP_SHOWN" }
+description = "called by the hook when the component unmounts"
+```
+
+Argument values are written as for `default`. Where the factory argument at `unless_argument` is
+truthy on every explored path, or written as a truthy literal, the callsite makes no such call;
+where that is not known, the call is reported with a note in `via`. Items in the exported list or
+set of `except_items` are not ones the call applies to, so a callsite requesting only those gets an
+`excluded_call`. When the callsite's arguments come from its scope's parameters, as in a wrapper
+component, each instance of the scope decides from what it passes, and the call applies to that
+instance's items.
+
+`exclude_callsites` at the top level lists path globs of factory callsites the query leaves out,
+as `["**/framework/**"]` for the factory's uses inside the code that implements it, whose calls
+another query already reports.
+
 Project configs can resolve repository aliases without a TypeScript compiler run:
 
 ```toml
@@ -611,8 +660,8 @@ chain gives; a plain read would throw instead, so its value is never used. A rea
 is only `null` or `undefined` is unknown, since such a value often stands for one set later.
 
 The engine follows object and array destructuring, local calls and closures, records, finite computed record
-selection, object literals with computed keys such as `{ [Kind.A]: value }`, arrays and finite
-spreads, exact string/boolean/numeric-enum strict-equality branches,
+selection, object literals with computed keys such as `{ [Kind.A]: value }`, `void` expressions,
+JSX attributes written without a value, which pass `true`, arrays and finite spreads, exact string/boolean/numeric-enum strict-equality branches,
 null comparisons, logical expressions, conditional expressions, finite-array `.map` and `.filter`,
 `Object.values` on known records, local `.push`, object literal spreads, destructuring and
 parameter defaults, `defaultProps`, JSX component props/children/spreads,
@@ -668,9 +717,9 @@ known records, but record key insertion order is not stored; records with multip
 coverage gap when array order might matter. Arrays and records bound to locals share heap identity
 across aliases and helper calls; local `.push` and static record-property writes update that
 identity. Unknown branches retain up to 32 possible heap values; exceeding that budget produces a
-coverage gap. A function calls itself at most 8 levels deep on one path, so recursion over
-unknown data stops early, with a coverage gap, instead of repeating the same exploration at
-every level. A push through a property path, as in `record.items.push(value)`, appends to the
+coverage gap. A function calls itself at most 8 levels deep on one path, or 3 when its arguments
+are not all known, so recursion over unknown data stops early, with a coverage gap, instead of
+repeating the same exploration at every level, which grows with each branch that recurses. A push through a property path, as in `record.items.push(value)`, appends to the
 array there, including after a branch joins several records; other methods that change an array
 in place (`unshift`, `splice`, `pop`, `shift`, `sort`, `reverse`, `fill`, `copyWithin`) leave it
 unknown with a coverage gap. Reassignment of captured

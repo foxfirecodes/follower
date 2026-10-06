@@ -1041,6 +1041,24 @@ impl Lowerer<'_> {
                     value: Box::new(self.lower_expression(&unary.argument)),
                 }
             }
+            // `void value` evaluates the value and gives `undefined`, as a choice between two
+            // `undefined`s tested on the value does.
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Void => {
+                let undefined = || {
+                    Box::new(FlowExpression {
+                        kind: FlowExpressionKind::Identifier {
+                            name: "undefined".to_owned(),
+                            module_binding: false,
+                        },
+                        span: span.clone(),
+                    })
+                };
+                FlowExpressionKind::Conditional {
+                    test: Box::new(self.lower_expression(&unary.argument)),
+                    consequent: undefined(),
+                    alternate: undefined(),
+                }
+            }
             Expression::ConditionalExpression(conditional) => FlowExpressionKind::Conditional {
                 test: Box::new(self.lower_expression(&conditional.test)),
                 consequent: Box::new(self.lower_expression(&conditional.consequent)),
@@ -1309,6 +1327,11 @@ impl Lowerer<'_> {
                         Some(JSXAttributeValue::Element(element)) => {
                             self.lower_jsx_element(element)
                         }
+                        // `<Panel open />` passes `true`.
+                        None => FlowExpression {
+                            kind: FlowExpressionKind::Boolean { value: true },
+                            span: self.span(attribute.span),
+                        },
                         _ => self.unsupported_expression(
                             "unsupported_jsx_attribute_value",
                             attribute.span,

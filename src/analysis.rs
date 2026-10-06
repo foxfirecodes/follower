@@ -1380,6 +1380,15 @@ impl Analyzer {
         let symbol_linker = SymbolLinker::new(&self.project, &inventory_snapshot);
         let model_symbol = symbol_linker.resolve_matcher(&query.factory);
         for path in &candidate_paths {
+            // Callsites the query leaves out are not part of its inventory.
+            let text = path.to_string_lossy();
+            if query
+                .exclude_callsites
+                .iter()
+                .any(|pattern| crate::project::glob_matches(pattern, &text))
+            {
+                continue;
+            }
             let Some(file) = inventory_snapshot
                 .files
                 .iter()
