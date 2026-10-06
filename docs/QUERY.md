@@ -625,7 +625,11 @@ which elements of an array factory argument it can apply to, in `elements`. For 
 instance that no explored path renders, they are what the instance's caller writes for the
 argument, such as `kinds={kinds}` with `const kinds = disabled ? [] : [Kind.A]` in the caller; an
 element that reads the caller's own parameters, as `kinds={[kind]}`, is what the caller's callers
-pass for them. The walk keeps the
+pass for them. A call argument read from a parameter, as `apply(action)` inside
+`useCallback((action) => ...)` or a helper `close(action)`, is what the calls of that function
+pass, an omitted one taking the parameter's default; callers in files that are not parsed are
+requested, including modules that load the function's module with `import()`, and a local bound
+to a call, as `const kinds = useKinds(id)`, holds what the call returns. The walk keeps the
 conditions each step of the path runs under: `if` branches, the code after an early return, `?:`
 branches, and the right side of `&&` and `||`. A condition that compares with members of the
 elements' enum, such as `case Kind.A:` or `visible === Kind.A`, narrows them; `guards` lists the

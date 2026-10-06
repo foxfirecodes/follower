@@ -1259,6 +1259,50 @@ fn calls_that_are_the_invocation_report_their_own_arguments() {
 }
 
 #[test]
+fn arguments_read_from_parameters_take_what_the_callers_pass() {
+    // The action comes from a parameter: of a callback the component calls, of a helper whose
+    // callers pass it, or of a method of an exported instance.
+    let fixture = TestProject::new(&[
+        ("src/kinds.ts", "export enum Kind { A = 1, B = 2, C = 3 }"),
+        (
+            "src/record.ts",
+            "export async function record(_kind, _config = {}) {}",
+        ),
+        (
+            "src/manager.ts",
+            "import { Kind } from './kinds'; import { record } from './record'; class Manager { close(action) { record(Kind.C, { action }); } } export default new Manager();",
+        ),
+        (
+            "src/App.tsx",
+            "import * as React from 'react'; import { Kind } from './kinds'; import { record } from './record'; import manager from './manager'; function recordWith(action) { record(Kind.B, { action }); } export function App() { const finish = React.useCallback((action) => { record(Kind.A, { action }); }, []); return <div><button onClick={() => finish('take')} /><button onClick={() => recordWith('close')} /><button onClick={() => manager.close('later')} /></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        "schema_version = 1\nid = 'direct'\nkind = 'factory_return_invocations'\nscope = 'all_creations'\n[factory]\nproject = 'acceptance'\nmodule = 'src/record.ts'\nexport = 'record'\n[[factory_arguments]]\nindex = 0\nlabel = 'items'\nitems = true\n[capability]\ncall_is_invocation = true\n[[capability.invocation_arguments]]\nindex = 1\npath = ['action']\nlabel = 'action'\n",
+    );
+    let report = fixture.report();
+    let mut applied = report
+        .callsites
+        .iter()
+        .flat_map(applied_items)
+        .collect::<Vec<_>>();
+    applied.sort();
+    assert_eq!(
+        applied,
+        [
+            ("close".to_owned(), vec!["B".to_owned()]),
+            ("later".to_owned(), vec!["C".to_owned()]),
+            ("take".to_owned(), vec!["A".to_owned()]),
+        ]
+    );
+}
+
+#[test]
 fn callsite_walk_follows_function_children_refs_loaders_and_aliases() {
     let fixture = TestProject::new(&[
         HOOK,

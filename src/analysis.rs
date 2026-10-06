@@ -150,6 +150,9 @@ fn enqueue_backward_task(
 
 struct SourceCatalog {
     imports_by_stem: BTreeMap<String, Vec<(PathBuf, String)>>,
+    /// `import()` specifiers that `imports_by_stem` leaves out, for finding the callers of a
+    /// module loaded on demand, as a modal an opener loads.
+    dynamic_imports_by_stem: BTreeMap<String, Vec<(PathBuf, String)>>,
     configured_files: usize,
     candidate_paths: BTreeSet<PathBuf>,
     skipped_candidate_files: usize,
@@ -160,6 +163,7 @@ impl SourceCatalog {
     const fn new() -> Self {
         Self {
             imports_by_stem: BTreeMap::new(),
+            dynamic_imports_by_stem: BTreeMap::new(),
             configured_files: 0,
             candidate_paths: BTreeSet::new(),
             skipped_candidate_files: 0,
@@ -185,15 +189,28 @@ impl SourceCatalog {
             .iter()
             .any(|factory| source.contains(&factory.module) && source.contains(&factory.export));
         let specifiers = module_specifiers(source, may_use_configured_lazy_factory);
-        for specifier in specifiers {
-            if let Some(stem) = Path::new(&specifier)
-                .file_stem()
-                .and_then(|name| name.to_str())
-            {
-                self.imports_by_stem
-                    .entry(stem.to_owned())
-                    .or_default()
-                    .push((path.to_path_buf(), specifier));
+        let dynamic = if may_use_configured_lazy_factory || !source.contains("import(") {
+            Vec::new()
+        } else {
+            module_specifiers(source, true)
+                .into_iter()
+                .filter(|specifier| !specifiers.contains(specifier))
+                .collect()
+        };
+        for (index, specifier) in [
+            (&mut self.imports_by_stem, specifiers),
+            (&mut self.dynamic_imports_by_stem, dynamic),
+        ] {
+            for specifier in specifier {
+                if let Some(stem) = Path::new(&specifier)
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                {
+                    index
+                        .entry(stem.to_owned())
+                        .or_default()
+                        .push((path.to_path_buf(), specifier));
+                }
             }
         }
     }
@@ -316,7 +333,17 @@ impl SourceCatalog {
             .collect::<BTreeSet<_>>();
         let mut result = BTreeSet::new();
         for name in names {
-            for (importer, specifier) in self.imports_by_stem.get(&name).into_iter().flatten() {
+            // The walk also needs the modules that load a target on demand.
+            let dynamic = dotted
+                .then(|| self.dynamic_imports_by_stem.get(&name))
+                .flatten();
+            for (importer, specifier) in self
+                .imports_by_stem
+                .get(&name)
+                .into_iter()
+                .chain(dynamic)
+                .flatten()
+            {
                 if targets.contains(importer) {
                     continue;
                 }
