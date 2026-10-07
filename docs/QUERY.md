@@ -64,7 +64,7 @@ props passed next to a module import. `context`, `via`, `instance`, and `conditi
 the call sits, how the result reached it, the instance whose items it uses, and the conditions on
 its path; `unfollowed` counts the places the callsite's result went that the walk does not
 follow, and `note` explains unknown values and other rows. Other factory arguments are
-`factory.<label>`. Multiple values in a cell are joined with ` | `, values print as
+`factory.<label>`. Multiple values in a cell are joined with ` | `, once each, values print as
 `Enum.Member`, bare strings, or `?reason` for an unknown, and paths are relative to the
 repository that holds them, found by the nearest `.git`. When a callsite has calls, its escapes
 are one row each without an item; when it has none, each item it requests gets the escape rows.
@@ -151,17 +151,19 @@ a missing value, alone or as one alternative; it is a string, integer, or boolea
 exported value, as `{ module = "src/kinds.ts", export = "ActionKind", path = ["UNKNOWN"] }`. A
 module that is not parsed is requested, so the value is known from the next round. On a factory
 argument, `items = true` says the argument names the items calls apply to: a single value counts
-as a list of one, so it fills the `item.<label>` column as an array argument's elements do, and a
-choice of values, as `ready ? Kind.A : Kind.B`, holds each.
+as a list of one, so it fills the `item.<label>` column as an array argument's elements do, even
+in a report with no callsites; a choice of values, as `ready ? Kind.A : Kind.B`, holds each; and
+`null` or `undefined` is no item. A wrapper component that passes its prop as the item takes, for
+each render site, what that site writes, as array arguments do.
 
 For a function that acts when called, such as one that records an action directly, set
 `call_is_invocation = true` under `[capability]` instead of a returned selector. Each call of the
 factory is then itself the invocation: `invocation_arguments` select the call's own arguments,
 nothing is followed after the call, and each callsite reports one call at the callsite. Labelling
 its projections like another query's makes their CSVs share columns, and `follower view a.csv
-b.csv` shows CSVs with the same columns as one table. Written as `label=path`, as `follower view
-web=web.csv ios=ios.csv`, each CSV's rows get its label in a leading `source` column, which the
-page can filter and group by.
+b.csv` shows CSVs with the same columns as one table; a CSV with no rows is left out, whatever its
+columns. Written as `label=path`, as `follower view web=web.csv ios=ios.csv`, each CSV's rows get
+its label in a leading `source` column, which the page can filter and group by.
 
 A factory may invoke its result itself, as a hook that calls the callback it returns when the
 component unmounts. Each `[[capability.implicit_invocations]]` entry reports such an invocation as
@@ -649,7 +651,10 @@ elements' enum, such as `case Kind.A:` or `visible === Kind.A`, narrows them; `g
 sets one compared value must be in, and `guards_not` the members ruled out, as by `if (visible !==
 Kind.A) return`. When the result left the callsite's scope through a caller, such as the element
 that renders a wrapper with a function child, `instance` is that caller site, and the elements start
-from what that instance requests: the contexts explored through it, or a literal it passes.
+from what that instance requests: the contexts explored through it, a literal it passes, or, when
+it passes a property of a value it does not know, as `sheet.id`, each value its file writes under
+that property. A function child that hands the result to a function its component declares, nested
+or as a local arrow, is followed into that function's parameter, read only inside it.
 `elements_complete` is false when those elements are not all known; the conditions still bound them.
 A call whose conditions match no element the callsite requests cannot be reached with this
 callsite's result, as when a shared descriptor carries several hooks' callbacks and a switch picks

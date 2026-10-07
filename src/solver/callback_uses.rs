@@ -2372,6 +2372,37 @@ impl Solver<'_> {
                         let binding = code.params.iter().enumerate().find_map(|(index, param)| {
                             pattern_path(param, &root).map(|inner| (index, inner))
                         });
+                        // A function declared in the scope, as a nested function or a local arrow,
+                        // reads the result through its parameter, only inside itself.
+                        if binding.is_none()
+                            && path.is_empty()
+                            && let Some((params, function)) = self.local_function(&scope, &root)
+                        {
+                            let mut targets = Vec::new();
+                            if let Some(param) = params.get(position) {
+                                bind_targets(param, &steps, &mut targets);
+                            }
+                            let mut next_via = via.clone();
+                            next_via.push(format!("passed to {text}"));
+                            for target in targets {
+                                let target = match target {
+                                    Target::Name(name, steps) => {
+                                        Target::Within(function.start, function.end, name, steps)
+                                    }
+                                    target => target,
+                                };
+                                queue.push_back((
+                                    scope.clone(),
+                                    target,
+                                    next_via.clone(),
+                                    forward.clone(),
+                                    carried.clone(),
+                                    instance.clone(),
+                                    entered.clone(),
+                                ));
+                            }
+                            continue;
+                        }
                         let Some((parameter, inner)) = binding else {
                             walk.escapes.push((
                                 span,
@@ -2519,6 +2550,15 @@ impl Solver<'_> {
     /// The parameters of a function bound to a local name in a scope, such as a handler
     /// declared in a component.
     fn local_function_params(&self, scope: &UseNode, name: &str) -> Option<Vec<FlowPattern>> {
+        self.local_function(scope, name).map(|(params, _)| params)
+    }
+
+    /// The parameters and span of a function bound to a local name in a scope.
+    fn local_function(
+        &self,
+        scope: &UseNode,
+        name: &str,
+    ) -> Option<(Vec<FlowPattern>, SourceSpan)> {
         let code = self.scope_code(scope)?;
         let mut params = None;
         let mut found = |frames: &[Frame<'_>], _guards: &[Guard<'_>]| {
@@ -2538,10 +2578,10 @@ impl Solver<'_> {
                 };
                 if let Some(FlowExpression {
                     kind: FlowExpressionKind::Arrow { params: arrow, .. },
-                    ..
+                    span,
                 }) = function
                 {
-                    params = Some(arrow.clone());
+                    params = Some((arrow.clone(), span.clone()));
                 }
             }
         };
@@ -3151,12 +3191,58 @@ impl Solver<'_> {
         elements.iter().any(value_is_known).then_some(elements)
     }
 
+    /// The elements every place that uses `scope` writes for the factory argument, as for each
+    /// instance's calls; none unless every place's are found.
+    fn instances_written_elements(
+        &mut self,
+        candidate: &FactoryCallCandidate,
+        graph: &HashMap<UseNode, Vec<UseEdge>>,
+        scope: &UseNode,
+        projection: &ArgumentProjection,
+    ) -> Option<Vec<QueryValue>> {
+        let sites = graph
+            .get(scope)?
+            .iter()
+            .map(|edge| edge.site.clone())
+            .collect::<Vec<_>>();
+        if sites.is_empty() {
+            return None;
+        }
+        let mut elements = Vec::new();
+        for site in sites {
+            let written = self
+                .written_instance_elements(
+                    candidate,
+                    graph,
+                    &site,
+                    projection.index,
+                    projection.items,
+                )
+                .or_else(|| {
+                    self.written_source_elements(
+                        candidate,
+                        graph,
+                        &site,
+                        projection.index,
+                        projection.items,
+                    )
+                })?;
+            for element in written {
+                if !elements.contains(&element) {
+                    elements.push(element);
+                }
+            }
+        }
+        Some(elements)
+    }
+
     fn written_instance_elements(
         &mut self,
         candidate: &FactoryCallCandidate,
         graph: &HashMap<UseNode, Vec<UseEdge>>,
         instance: &SourceSpan,
         index: usize,
+        single: bool,
     ) -> Option<Vec<QueryValue>> {
         let scope = self.candidate_scope(candidate)?;
         let FlowExpressionKind::Identifier { name, .. } = &candidate.arguments.get(index)?.kind
@@ -3217,6 +3303,7 @@ impl Solver<'_> {
             return None;
         }
         let value = query_value(&self.eval_with(caller_file, &written, locals));
+        let value = if single { as_items(value) } else { value };
         let mut elements = Vec::new();
         collect_array_elements(&value, &mut elements);
         // An element that may be any of several values is each of them.
@@ -3549,6 +3636,10 @@ impl Solver<'_> {
                 });
             }
             for value in found {
+                // A single value that is null or undefined is no item.
+                if single && matches!(value, QueryValue::Null | QueryValue::Undefined) {
+                    continue;
+                }
                 if !values.contains(&value) {
                     values.push(value);
                 }
@@ -3981,12 +4072,29 @@ impl Solver<'_> {
                 let Some(argument) = candidate.arguments.get(projection.index) else {
                     continue;
                 };
-                if let Some(pushed) =
+                if let Some(mut pushed) =
                     self.pushed_values(&scope, argument, Some(graph), projection.items)
                 {
+                    // An element that reads the scope's parameters may be known at each render
+                    // site, as the calls of each instance are. When every site's is, the unknown
+                    // elements, from those sites, give way to what they write.
+                    let unknown = !pushed.iter().all(value_is_known)
+                        || possible_elements
+                            .get(&projection.label)
+                            .is_some_and(|elements| !elements.iter().all(value_is_known));
+                    let written = if unknown {
+                        self.instances_written_elements(candidate, graph, &scope, projection)
+                    } else {
+                        None
+                    };
                     let elements = possible_elements
                         .entry(projection.label.clone())
                         .or_insert_with(Vec::new);
+                    if let Some(written) = written {
+                        pushed.retain(value_is_known);
+                        elements.retain(value_is_known);
+                        pushed.extend(written);
+                    }
                     for element in pushed {
                         if !elements.contains(&element) {
                             elements.push(element);
@@ -4155,7 +4263,13 @@ impl Solver<'_> {
                 }
                 let projection = &query.factory_arguments[position];
                 let elements = self
-                    .written_instance_elements(candidate, graph, &instance, projection.index)
+                    .written_instance_elements(
+                        candidate,
+                        graph,
+                        &instance,
+                        projection.index,
+                        projection.items,
+                    )
                     .or_else(|| {
                         self.written_source_elements(
                             candidate,

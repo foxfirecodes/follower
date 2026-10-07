@@ -23,21 +23,28 @@ use crate::query::{
 };
 
 /// Builds the table. The item column holds one element per row of the first factory argument
-/// whose values are arrays, so a lookup by item is a filter on one column.
+/// that names items or whose values are arrays, so a lookup by item is a filter on one column.
 #[allow(clippy::too_many_lines)]
 pub fn query_report_csv(report: &QueryReport, query: &QuerySpec) -> String {
     let item_label = query
         .factory_arguments
         .iter()
+        .find(|projection| projection.items)
         .map(|projection| projection.label.clone())
-        .find(|label| {
-            report.callsites.iter().any(|callsite| {
-                callsite.possible_elements.contains_key(label)
-                    || callsite
-                        .factory_arguments
-                        .get(label)
-                        .is_some_and(|values| values.iter().any(holds_arrays))
-            })
+        .or_else(|| {
+            query
+                .factory_arguments
+                .iter()
+                .map(|projection| projection.label.clone())
+                .find(|label| {
+                    report.callsites.iter().any(|callsite| {
+                        callsite.possible_elements.contains_key(label)
+                            || callsite
+                                .factory_arguments
+                                .get(label)
+                                .is_some_and(|values| values.iter().any(holds_arrays))
+                    })
+                })
         });
     let factory_labels = query
         .factory_arguments
@@ -432,11 +439,16 @@ pub fn value_text(value: &QueryValue) -> String {
 }
 
 fn values_text(values: &[QueryValue]) -> String {
-    values
-        .iter()
-        .map(value_text)
-        .collect::<Vec<_>>()
-        .join(" | ")
+    // Values that print alike, as a member and its string value, show once.
+    let mut texts = Vec::new();
+    for text in values.iter().map(value_text) {
+        for part in text.split(" | ") {
+            if !texts.iter().any(|seen| seen == part) {
+                texts.push(part.to_owned());
+            }
+        }
+    }
+    texts.join(" | ")
 }
 
 fn reachability_text(reachability: Reachability) -> &'static str {
@@ -742,7 +754,8 @@ pub fn item_outcomes(csv: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{csv_fields, csv_records, item_outcomes};
+    use super::{csv_fields, csv_records, item_outcomes, values_text};
+    use crate::query::QueryValue;
 
     #[test]
     fn records_keep_line_breaks_inside_quoted_fields() {
@@ -751,6 +764,20 @@ mod tests {
             ["a,b", "1,\"two\nlines\"", "3,4"]
         );
         assert_eq!(csv_fields("a,\"b, \"\"c\"\"\",d"), ["a", "b, \"c\"", "d"]);
+    }
+
+    #[test]
+    fn values_that_print_alike_show_once_in_a_cell() {
+        let text = |value: &str| QueryValue::String {
+            value: value.to_owned(),
+        };
+        let values = [
+            QueryValue::Alternatives {
+                values: vec![text("a"), text("b")],
+            },
+            text("a"),
+        ];
+        assert_eq!(values_text(&values), "a | b");
     }
 
     #[test]

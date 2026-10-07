@@ -161,7 +161,10 @@ fn view_writes_a_private_page_from_the_csv() {
     assert!(page.contains("csv-data"));
     assert!(page.contains("csv-items"));
     assert!(page.contains("done"));
-    let items = run(&["items".as_ref(), csv.as_os_str()]);
+    // A query with no callsites has no rows to combine, whatever its columns.
+    let empty = fixture.root.join("empty.csv");
+    std::fs::write(&empty, "row_kind,callsite_path\r\n").unwrap();
+    let items = run(&["items".as_ref(), csv.as_os_str(), empty.as_os_str()]);
     assert!(
         items.status.success(),
         "{}",

@@ -180,14 +180,24 @@ fn combined_csv(arguments: &[String]) -> Result<(String, Vec<PathBuf>)> {
         }
     };
     let mut text = String::new();
+    let sources = csvs
+        .iter()
+        .map(|(_, csv)| {
+            std::fs::read_to_string(csv)
+                .with_context(|| format!("failed to read {}", csv.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // A query with no callsites has no rows, and may have no item column to match the others.
+    let any_rows = sources.iter().any(|source| csv_records(source).len() > 1);
     let mut header: Option<String> = None;
-    for (label, csv) in &csvs {
-        let source = std::fs::read_to_string(csv)
-            .with_context(|| format!("failed to read {}", csv.display()))?;
-        let records = csv_records(&source);
+    for ((label, csv), source) in csvs.iter().zip(&sources) {
+        let records = csv_records(source);
         let Some((first, rows)) = records.split_first() else {
             bail!("{} is empty", csv.display());
         };
+        if any_rows && rows.is_empty() {
+            continue;
+        }
         match &header {
             None => {
                 if labelled {

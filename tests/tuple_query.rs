@@ -1103,6 +1103,103 @@ fn an_unexplored_instance_requests_the_arrays_its_caller_builds() {
     );
 }
 
+#[test]
+fn a_single_item_wrapper_takes_what_each_render_site_writes() {
+    // The wrapper's hook takes one item. One render site writes a choice between an item and
+    // `null`, which is no item; the other reads `id` of a value it is given, so its calls apply to
+    // each `id` its file writes, and the callsite's items hold no unknown for it.
+    let fixture = TestProject::new(&[
+        HOOK,
+        ("src/kinds.ts", "export enum Kind { A = 1, B = 2, C = 3 }"),
+        (
+            "src/One.tsx",
+            "import { useItemSelection } from './hook'; export default function One({ kind, children }) { const [visible, apply] = useItemSelection(kind); return children({ visible, apply }); }",
+        ),
+        (
+            "src/Sheets.tsx",
+            "import { Kind } from './kinds'; import One from './One'; export const SHEETS = [{ id: Kind.A }, { id: Kind.B }]; export function Sheets({ sheet }) { return <One kind={sheet.id}>{({ apply }) => <button onClick={() => apply('sheet')} />}</One>; }",
+        ),
+        (
+            "src/App.tsx",
+            "import { current } from 'external-sheets'; import { Kind } from './kinds'; import One from './One'; import { Sheets } from './Sheets'; export function App({ on }) { return <div><One kind={on ? Kind.C : null}>{({ apply }) => <button onClick={() => apply('c')} />}</One><Sheets sheet={current} /></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write(
+        "query.toml",
+        &ITEMS_QUERY.replace("label = 'items'\n", "label = 'items'\nitems = true\n"),
+    );
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    assert_eq!(
+        applied_items(callsite),
+        [
+            ("c".to_owned(), vec!["C".to_owned()]),
+            ("sheet".to_owned(), vec!["A".to_owned(), "B".to_owned()]),
+        ]
+    );
+    let names = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(requested_members(&report), (names(&["A", "B", "C"]), false));
+    assert!(
+        !callsite
+            .possible_elements
+            .values()
+            .flatten()
+            .any(|value| matches!(value, QueryValue::Null)),
+        "{:?}",
+        callsite.possible_elements
+    );
+}
+
+#[test]
+fn callbacks_passed_to_local_functions_are_followed_into_them() {
+    // A function child hands the result to a function its component declares, nested or as a
+    // local arrow, after an early return; each call applies to its own render site's items.
+    let fixture = TestProject::new(&[
+        HOOK,
+        ("src/kinds.ts", "export enum Kind { A = 1, B = 2 }"),
+        (
+            "src/Sel.tsx",
+            "import { useItemSelection } from './hook'; export default function Sel({ kinds, children }) { const [visible, apply] = useItemSelection(kinds); return children({ visible, apply }); }",
+        ),
+        (
+            "src/App.tsx",
+            "import { Kind } from './kinds'; import Sel from './Sel'; function First({ hidden }) { if (hidden) { return null; } function Inner(apply) { return <button onClick={() => apply('first')} />; } return <Sel kinds={[Kind.A]}>{({ apply }) => Inner(apply)}</Sel>; } function Second() { const Inner = (apply) => <button onClick={() => apply('second')} />; return <Sel kinds={[Kind.B]}>{({ apply }) => Inner(apply)}</Sel>; } export function App() { return <div><First hidden={false} /><Second /></div>; }",
+        ),
+    ]);
+    fixture.write(
+        "flow.toml",
+        "schema_version = 1\nname = 'acceptance'\nsource_roots = ['src']\n[[entries]]\nmodule = 'src/App.tsx'\nexport = 'App'\n",
+    );
+    fixture.write("query.toml", ITEMS_QUERY);
+    let report = fixture.report();
+    let [callsite] = report.callsites.as_slice() else {
+        panic!("one callsite: {:?}", report.callsites);
+    };
+    assert_eq!(
+        applied_items(callsite),
+        [
+            ("first".to_owned(), vec!["A".to_owned()]),
+            ("second".to_owned(), vec!["B".to_owned()]),
+        ]
+    );
+    assert!(
+        callsite.capability.escapes.is_empty(),
+        "{:?}",
+        callsite.capability.escapes
+    );
+}
+
 /// Each call's action and the enum members its items name, sorted.
 fn applied_items(callsite: &code_flow::query::QueryCallsiteValues) -> Vec<(String, Vec<String>)> {
     let mut applied = callsite
