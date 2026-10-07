@@ -1,6 +1,7 @@
 //! A self-contained page for browsing a query CSV: search, filters, and grouping by item,
-//! callsite, call file, or argument. The page holds only the CSV, so it shows exactly what an
-//! agent reading the CSV sees.
+//! callsite, call file, or argument, and the item outcomes of `follower items`. The page holds
+//! only the CSV and what is derived from it, so it shows exactly what an agent reading the CSV
+//! sees.
 
 use std::{
     fs::OpenOptions,
@@ -35,10 +36,11 @@ fn page(csv: &str, title: &str) -> Result<String> {
         Ok(serde_json::to_string(value)?.replace('<', "\\u003c"))
     };
     Ok(format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>Follower callsite table</title><style>{}</style></head><body><div id=\"app\"></div><script id=\"csv-title\" type=\"application/json\">{}</script><script id=\"csv-data\" type=\"application/json\">{}</script><script>{}</script></body></html>\n",
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>Follower callsite table</title><style>{}</style></head><body><div id=\"app\"></div><script id=\"csv-title\" type=\"application/json\">{}</script><script id=\"csv-data\" type=\"application/json\">{}</script><script id=\"csv-items\" type=\"application/json\">{}</script><script>{}</script></body></html>\n",
         include_str!("viewer.css"),
         embed(title)?,
         embed(csv)?,
+        embed(&crate::csv_report::item_outcomes(csv))?,
         include_str!("viewer.js"),
     ))
 }

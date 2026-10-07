@@ -553,9 +553,196 @@ pub fn csv_records(text: &str) -> Vec<&str> {
     records
 }
 
+/// The fields of one CSV record, unquoted (RFC 4180).
+fn csv_fields(record: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut characters = record.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' if quoted && characters.peek() == Some(&'"') => {
+                field.push('"');
+                characters.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => fields.push(std::mem::take(&mut field)),
+            _ => field.push(character),
+        }
+    }
+    fields.push(field);
+    fields
+}
+
+/// What the callsites of a query CSV say about one item.
+#[derive(Default)]
+struct ItemOutcome {
+    called: std::collections::BTreeSet<String>,
+    unknown: std::collections::BTreeSet<String>,
+    not_called: std::collections::BTreeSet<String>,
+    arguments: Vec<std::collections::BTreeSet<String>>,
+    unresolved: bool,
+}
+
+impl ItemOutcome {
+    fn outcome(&self, unknown_item: bool) -> &'static str {
+        if unknown_item {
+            "unknown"
+        } else if !self.called.is_empty() {
+            if self.unresolved {
+                "called_with_unknown_arguments"
+            } else {
+                "called"
+            }
+        } else if !self.unknown.is_empty() {
+            "unknown"
+        } else {
+            "not_called"
+        }
+    }
+}
+
+/// One row per item of a query CSV, or of several joined by `follower view`, saying whether any
+/// call applies to it across every callsite that requests it: `called`, with the argument values
+/// of those calls, `called_with_unknown_arguments`, `not_called` when every callsite that
+/// requests it is known to make no call for it, or `unknown`. A callsite leaves its uncalled items
+/// unknown when its result escapes or one of its calls applies to items not all known, since that
+/// call could be for any of them. Unknown items (`?reason`) are `unknown`. With a `source` column,
+/// `sources` gives the outcome in each source and places are prefixed by their source.
+#[allow(clippy::too_many_lines)]
+pub fn item_outcomes(csv: &str) -> String {
+    let records = csv_records(csv);
+    let Some((header, records)) = records.split_first() else {
+        return String::new();
+    };
+    let header = csv_fields(header);
+    let column = |name: &str| header.iter().position(|column| column == name);
+    let Some(item) = header.iter().position(|column| column.starts_with("item.")) else {
+        return String::new();
+    };
+    let arguments = header
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.starts_with("arg."))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let (kind, complete, resolved, source) = (
+        column("row_kind"),
+        column("item_complete"),
+        column("arguments_resolved"),
+        column("source"),
+    );
+    let (path, line) = (column("callsite_path"), column("callsite_line"));
+    let rows = records
+        .iter()
+        .map(|record| csv_fields(record))
+        .filter(|row| row.len() > 1)
+        .collect::<Vec<_>>();
+    let get = |row: &[String], index: Option<usize>| -> String {
+        index
+            .and_then(|index| row.get(index))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let place = |row: &[String]| {
+        let place = format!("{}:{}", get(row, path), get(row, line));
+        match source {
+            Some(_) => format!("{} {place}", get(row, source)),
+            None => place,
+        }
+    };
+    let uncertain_row = |row: &[String]| {
+        let kind = get(row, kind);
+        kind == "escape"
+            || (kind == "call" && (row[item].starts_with('?') || get(row, complete) == "false"))
+    };
+    let uncertain = rows
+        .iter()
+        .filter(|row| uncertain_row(row))
+        .map(|row| place(row))
+        .collect::<std::collections::BTreeSet<_>>();
+    // Each item's outcome overall and in each source.
+    let mut items = BTreeMap::<String, (ItemOutcome, BTreeMap<String, ItemOutcome>)>::new();
+    for row in &rows {
+        let value = &row[item];
+        let kind = get(row, kind);
+        if value.is_empty() || kind == "excluded_call" {
+            continue;
+        }
+        let at = place(row);
+        let (entry, sources) = items.entry(value.clone()).or_default();
+        let source_entry = sources.entry(get(row, source)).or_default();
+        for outcome in [source_entry, entry] {
+            if kind == "call" {
+                outcome.called.insert(at.clone());
+                outcome
+                    .arguments
+                    .resize_with(arguments.len(), Default::default);
+                for (values, &index) in outcome.arguments.iter_mut().zip(&arguments) {
+                    values.extend(
+                        row[index]
+                            .split(" | ")
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned),
+                    );
+                }
+                outcome.unresolved |= get(row, resolved) == "false";
+            } else if kind == "escape" || uncertain.contains(&at) {
+                outcome.unknown.insert(at.clone());
+            } else {
+                outcome.not_called.insert(at.clone());
+            }
+        }
+    }
+    let item_column = &header[item];
+    let mut out = String::new();
+    let mut columns = vec![item_column.clone(), "outcome".to_owned()];
+    columns.extend(arguments.iter().map(|&index| header[index].clone()));
+    if source.is_some() {
+        columns.push("sources".to_owned());
+    }
+    columns.extend(["called_at", "unknown_at", "not_called_at"].map(str::to_owned));
+    write_record(&mut out, columns.iter().map(String::as_str));
+    // Known items first, then unknown ones.
+    let mut items = items.into_iter().collect::<Vec<_>>();
+    items.sort_by_key(|(value, _)| value.starts_with('?'));
+    for (value, (outcome, sources)) in &items {
+        let unknown_item = value.starts_with('?');
+        let joined = |places: &std::collections::BTreeSet<String>| {
+            places.iter().cloned().collect::<Vec<_>>().join(" | ")
+        };
+        let mut fields = vec![value.clone(), outcome.outcome(unknown_item).to_owned()];
+        fields.extend(
+            (0..arguments.len())
+                .map(|index| outcome.arguments.get(index).map(joined).unwrap_or_default()),
+        );
+        if source.is_some() {
+            fields.push(
+                sources
+                    .iter()
+                    .map(|(source, outcome)| format!("{source}: {}", outcome.outcome(unknown_item)))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            );
+        }
+        // An unknown item's calls are places it is unknown at.
+        let (called, unknown) = if unknown_item {
+            (
+                String::new(),
+                joined(&outcome.called.union(&outcome.unknown).cloned().collect()),
+            )
+        } else {
+            (joined(&outcome.called), joined(&outcome.unknown))
+        };
+        fields.extend([called, unknown, joined(&outcome.not_called)]);
+        write_record(&mut out, fields.iter().map(String::as_str));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::csv_records;
+    use super::{csv_fields, csv_records, item_outcomes};
 
     #[test]
     fn records_keep_line_breaks_inside_quoted_fields() {
@@ -563,5 +750,66 @@ mod tests {
             csv_records("a,b\n1,\"two\nlines\"\n3,4\n"),
             ["a,b", "1,\"two\nlines\"", "3,4"]
         );
+        assert_eq!(csv_fields("a,\"b, \"\"c\"\"\",d"), ["a", "b, \"c\"", "d"]);
+    }
+
+    #[test]
+    fn items_are_called_not_called_or_unknown_across_every_callsite_and_source() {
+        let csv = "source,row_kind,item.kind,item_complete,callsite_path,callsite_line,status,arg.action,arguments_resolved\n\
+            hook,call,Kind.A,true,src/a.tsx,1,called,close,true\n\
+            hook,no_call,Kind.B,true,src/a.tsx,1,called,,\n\
+            hook,no_call,Kind.C,true,src/b.tsx,2,unused,,\n\
+            hook,call,?computed,false,src/c.tsx,3,called,open,true\n\
+            hook,no_call,Kind.D,false,src/c.tsx,3,called,,\n\
+            hook,escape,Kind.E,true,src/d.tsx,4,escapes,,\n\
+            hook,excluded_call,Kind.C,true,src/b.tsx,2,unused,later,true\n\
+            direct,call,Kind.B,true,src/e.tsx,5,called,?unknown,false\n\
+            direct,call,Kind.A,true,src/e.tsx,6,called,open,true\n";
+        let rows = csv_records(&item_outcomes(csv))
+            .into_iter()
+            .map(csv_fields)
+            .collect::<Vec<_>>();
+        let row = |item: &str| rows.iter().find(|row| row[0] == item).unwrap();
+        assert_eq!(
+            rows[0],
+            [
+                "item.kind",
+                "outcome",
+                "arg.action",
+                "sources",
+                "called_at",
+                "unknown_at",
+                "not_called_at"
+            ]
+        );
+        assert_eq!(
+            row("Kind.A")[1..5],
+            [
+                "called",
+                "close | open",
+                "direct: called | hook: called",
+                "direct src/e.tsx:6 | hook src/a.tsx:1"
+            ]
+        );
+        assert_eq!(
+            row("Kind.B")[1..4],
+            [
+                "called_with_unknown_arguments",
+                "?unknown",
+                "direct: called_with_unknown_arguments | hook: not_called"
+            ]
+        );
+        assert_eq!(row("Kind.B")[6], "hook src/a.tsx:1");
+        // An excluded call is no call.
+        assert_eq!(row("Kind.C")[1], "not_called");
+        // A call whose items are not all known could be for an item its callsite requests.
+        assert_eq!(row("Kind.D")[1], "unknown");
+        assert_eq!(row("Kind.D")[5], "hook src/c.tsx:3");
+        assert_eq!(row("Kind.E")[1], "unknown");
+        assert_eq!(
+            row("?computed")[1..6],
+            ["unknown", "open", "hook: unknown", "", "hook src/c.tsx:3"]
+        );
+        assert_eq!(rows.last().unwrap()[0], "?computed");
     }
 }

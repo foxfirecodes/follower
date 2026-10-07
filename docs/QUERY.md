@@ -72,10 +72,23 @@ are one row each without an item; when it has none, each item it requests gets t
 `follower view report.csv` writes `report.html`, or `--output` elsewhere, as a self-contained,
 owner-readable page built from the CSV alone, so it shows exactly what an agent reading the CSV
 sees. It groups rows by item by default and can group by callsite, call file, argument, status, or
-enclosing function, with search over the shown columns, filters, a needs-review view (rows whose
-answer is not complete: a result not called or escaping, an escape whose calls are missing even at
-a callsite with calls, an unknown argument, or items not all known), and a column picker. A search that narrows to three groups or fewer opens them, and
+enclosing function, with search over the shown columns, filters, a needs-review view, and a
+column picker. Needs review shows rows whose answer is not known: an escape, whose calls are
+missing even at a callsite with calls; an unknown argument or item; a call whose items are not all
+known; or no call for an item at a callsite with one of those, since they could be for it. A
+result never called, or no call for an item at a callsite whose calls are all known, is an answer
+and is not shown. A search that narrows to three groups or fewer opens them, and
 `report.html#q=Kind.A&group=callsite` opens with that search and grouping.
+
+`follower items report.csv`, with the same arguments as `view`, prints one row per item with its
+`outcome` across every callsite that requests it: `called`, `called_with_unknown_arguments`,
+`not_called` when every callsite that requests it makes no call for it, or `unknown` when no call
+was found and a callsite that requests it has one of the gaps above. Each `arg.<label>` holds the
+values of the calls for the item, and `called_at`, `unknown_at`, and `not_called_at` list the
+callsites. With labelled CSVs, `sources` gives the outcome in each and places start with their
+label, so a hook query and a query of direct calls together say whether anything calls an item.
+Unknown items (`?reason`) come last; an item `not_called` may still be called at the callsites
+listed for them. The page's Items view shows this table, and `#view=items` opens it.
 
 Add `--html-report` to write an interactive, self-contained report to a new owner-readable file
 in `/tmp`. The command prints its path to stderr and leaves JSON or text stdout unchanged. Set
@@ -668,6 +681,7 @@ is only `null` or `undefined` is unknown, since such a value often stands for on
 
 The engine follows object and array destructuring, local calls and closures, records, finite computed record
 selection, object literals with computed keys such as `{ [Kind.A]: value }`, `void` expressions,
+`new C(...)` as a call of `C`, so a promise's executor and the calls in it are followed,
 JSX attributes written without a value, which pass `true`, arrays and finite spreads, exact string/boolean/numeric-enum strict-equality branches,
 null comparisons, logical expressions, conditional expressions, finite-array `.map` and `.filter`,
 `Object.values` on known records, local `.push`, object literal spreads, destructuring and

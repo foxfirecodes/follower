@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use code_flow::{
     Analyzer, Project,
-    csv_report::{csv_records, query_report_csv},
+    csv_report::{csv_records, item_outcomes, query_report_csv},
     csv_viewer::write_csv_viewer,
     html_report::write_query_report_html,
     query::{QueryReport, QueryValue, load_query},
@@ -68,6 +68,13 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Print one CSV row per item of query CSVs: whether any call applies to it, with which
+    /// arguments, and where it is called, unknown, or not called.
+    Items {
+        /// The CSVs, as for `view`.
+        #[arg(required = true)]
+        csv: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -124,10 +131,35 @@ fn main() -> Result<()> {
             html_report,
         } => run_query(&project, &query, format, fail_on_unresolved, html_report),
         Command::View { csv, output } => view(&csv, output),
+        Command::Items { csv } => {
+            let (text, _) = combined_csv(&csv)?;
+            print!("{}", item_outcomes(&text));
+            Ok(())
+        }
     }
 }
 
 fn view(arguments: &[String], output: Option<PathBuf>) -> Result<()> {
+    let (text, csvs) = combined_csv(arguments)?;
+    let first = &csvs[0];
+    let output = output.unwrap_or_else(|| first.with_extension("html"));
+    let title = csvs
+        .iter()
+        .map(|csv| {
+            csv.file_name().map_or_else(
+                || csv.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    write_csv_viewer(&text, &title, &output)?;
+    eprintln!("Viewer: {}", output.display());
+    Ok(())
+}
+
+/// The CSVs named by `arguments` as one, with their paths.
+fn combined_csv(arguments: &[String]) -> Result<(String, Vec<PathBuf>)> {
     // Several query CSVs with the same columns show as one table, as a hook query's calls and a
     // query of direct calls that answer the same question. A label says which CSV a row is from.
     let csvs = arguments
@@ -183,22 +215,7 @@ fn view(arguments: &[String], output: Option<PathBuf>) -> Result<()> {
             text.push('\n');
         }
     }
-    let csvs = csvs.into_iter().map(|(_, csv)| csv).collect::<Vec<_>>();
-    let first = &csvs[0];
-    let output = output.unwrap_or_else(|| first.with_extension("html"));
-    let title = csvs
-        .iter()
-        .map(|csv| {
-            csv.file_name().map_or_else(
-                || csv.display().to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" + ");
-    write_csv_viewer(&text, &title, &output)?;
-    eprintln!("Viewer: {}", output.display());
-    Ok(())
+    Ok((text, csvs.into_iter().map(|(_, csv)| csv).collect()))
 }
 
 fn run_query(

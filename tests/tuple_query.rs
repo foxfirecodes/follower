@@ -1212,11 +1212,16 @@ fn implicit_invocations_are_calls_at_each_callsite_that_does_not_opt_out() {
 #[test]
 fn calls_that_are_the_invocation_report_their_own_arguments() {
     // A function that acts when called: each call is the invocation, an options property gives
-    // the action, a missing one takes the default, and a helper's callers say its items.
+    // the action, a missing one takes the default, and a helper's callers say its items. A call
+    // in a callback given to `new` counts too.
     let fixture = TestProject::new(&[
         (
             "src/kinds.ts",
-            "export enum Kind { A = 1, B = 2, C = 3, D = 4 }",
+            "export enum Kind { A = 1, B = 2, C = 3, D = 4, E = 5 }",
+        ),
+        (
+            "src/confirm.ts",
+            "import { Kind } from './kinds'; import { record } from './record'; export function confirm() { return new Promise((resolve) => { function onConfirm() { record(Kind.E, { action: 'confirm' }); resolve(); } onConfirm(); }); }",
         ),
         (
             "src/record.ts",
@@ -1241,7 +1246,7 @@ fn calls_that_are_the_invocation_report_their_own_arguments() {
     );
     let report = fixture.report();
     // The excluded helper's call is not a callsite.
-    assert_eq!(report.callsites.len(), 3, "{:?}", report.callsites);
+    assert_eq!(report.callsites.len(), 4, "{:?}", report.callsites);
     let mut applied = report
         .callsites
         .iter()
@@ -1251,6 +1256,7 @@ fn calls_that_are_the_invocation_report_their_own_arguments() {
     assert_eq!(
         applied,
         [
+            ("confirm".to_owned(), vec!["E".to_owned()]),
             ("take".to_owned(), vec!["B".to_owned()]),
             ("unknown".to_owned(), vec!["A".to_owned()]),
             ("unknown".to_owned(), vec!["C".to_owned()]),

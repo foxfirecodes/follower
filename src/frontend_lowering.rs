@@ -962,6 +962,21 @@ impl Lowerer<'_> {
                     Some(argument) => self.lower_expression(argument.to_expression()),
                 };
             }
+            // Any other `new C(...)` is a call of `C`, so the callbacks it is given, such as a
+            // promise's executor, are in the model with the calls they make.
+            Expression::NewExpression(new) => FlowExpressionKind::Call {
+                callee: Box::new(self.lower_expression(&new.callee)),
+                arguments: new
+                    .arguments
+                    .iter()
+                    .map(|argument| match argument {
+                        Argument::SpreadElement(spread) => {
+                            self.unsupported_expression("spread_call_argument", spread.span)
+                        }
+                        _ => self.lower_expression(argument.to_expression()),
+                    })
+                    .collect(),
+            },
             // `a?.b` and `f?.(x)` read and call like `a.b` and `f(x)`; on a missing value the read
             // or call is unknown, as without the guard.
             Expression::ChainExpression(chain) => {

@@ -159,7 +159,17 @@ fn view_writes_a_private_page_from_the_csv() {
     );
     let page = std::fs::read_to_string(fixture.root.join("report.html")).unwrap();
     assert!(page.contains("csv-data"));
+    assert!(page.contains("csv-items"));
     assert!(page.contains("done"));
+    let items = run(&["items".as_ref(), csv.as_os_str()]);
+    assert!(
+        items.status.success(),
+        "{}",
+        String::from_utf8_lossy(&items.stderr)
+    );
+    let items = String::from_utf8(items.stdout).unwrap();
+    assert!(items.starts_with("item."), "{items}");
+    assert!(items.contains(",called,done,"), "{items}");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

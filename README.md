@@ -31,7 +31,8 @@ Queries can also select tuple return elements with `returned_index`, treat each 
 function that acts when called as the invocation with `call_is_invocation`, report invocations a
 factory makes of its result itself with `implicit_invocations`, read properties of arguments with
 projection paths and defaults, and project numeric enum member names from TS source. `follower
-view` shows several CSVs with the same columns as one table. Project configs accept `[import_aliases]` for paths such as `@sample/*`,
+view` shows several CSVs with the same columns as one table, and `follower items` says for each
+item whether any of their calls applies to it. Project configs accept `[import_aliases]` for paths such as `@sample/*`,
 `platform_extensions` for code split by platform, contracts for libraries the analysis does not
 read (component consumers, wrappers, openers, lazy factories), and `[[render_roots]]` and
 `[[render_calls]]` to declare code rendered where no path from an entry is found; what those reach

@@ -2,6 +2,7 @@
   'use strict';
   const source = JSON.parse(document.getElementById('csv-data').textContent);
   const title = JSON.parse(document.getElementById('csv-title').textContent);
+  const itemSource = JSON.parse(document.getElementById('csv-items').textContent);
 
   // RFC 4180 parsing: quoted fields may hold commas, quotes, and newlines.
   function parse(text) {
@@ -36,9 +37,21 @@
     row.callsite = place(row.callsite_path, row.callsite_line);
     row.call = place(row.call_path, row.call_line);
   });
-  // A row needs review when the answer it gives is not complete. An escape does too, even at a
-  // callsite with calls: the calls it leads to are missing from the list.
-  const review = row => row.status !== 'called' || row.arguments_resolved === 'false' || row.item_complete === 'false' || row.row_kind === 'no_call' || row.row_kind === 'escape';
+  // A row needs review when what it says is not known: an escape, whose calls are missing even at
+  // a callsite with calls; an unknown argument or item; a call whose items are not all known; or
+  // no call for an item at a callsite with either of those, since they could be for it. A result
+  // never called, or no call for an item where every call is known, is an answer.
+  const itemOf = row => (itemColumn && row[itemColumn]) || '';
+  const site = row => `${row.source || ''} ${row.callsite}`;
+  const uncertainRow = row => row.row_kind === 'escape' || (row.row_kind === 'call' && (itemOf(row).startsWith('?') || row.item_complete === 'false'));
+  const uncertain = new Set(rows.filter(uncertainRow).map(site));
+  const review = row => uncertainRow(row) || row.arguments_resolved === 'false' || itemOf(row).startsWith('?')
+    || (row.row_kind === 'no_call' && (uncertain.has(site(row)) || (!itemOf(row) && row.item_complete === 'false')));
+
+  // One row per item from `follower items`: whether any call applies to it across every callsite.
+  const [itemHeader = [], ...itemBody] = parse(itemSource);
+  const items = itemBody.filter(record => record.length > 1).map(record => Object.fromEntries(itemHeader.map((column, index) => [column, record[index] || ''])));
+  const itemReview = item => item.outcome === 'unknown' || item.outcome === 'called_with_unknown_arguments';
 
   const app = document.getElementById('app');
   app.innerHTML = `<main class="shell">
@@ -46,12 +59,14 @@
     <div class="metrics" id="metrics"></div>
     <div class="notice" id="triage"></div>
     <div class="toolbar">
+      <label class="field">Show <select class="filter" id="view" aria-label="Show rows or items"><option value="rows">Rows</option><option value="items">Items</option></select></label>
       <input class="search" id="search" type="search" placeholder="Search shown columns" aria-label="Search rows">
-      <label class="field">Group by <select class="filter" id="group" aria-label="Group rows"></select></label>
-      <span id="filters" class="filters"></span>
+      <label class="field rows-only">Group by <select class="filter" id="group" aria-label="Group rows"></select></label>
+      <span id="filters" class="filters rows-only"></span>
+      <select class="filter items-only" id="outcome" aria-label="Filter outcome"><option value="">outcome: any</option></select>
       <label class="check"><input type="checkbox" id="review"> Needs review</label>
-      <label class="check"><input type="checkbox" id="excluded"> Excluded calls</label>
-      <button class="button" id="columns-toggle" type="button">Columns</button>
+      <label class="check rows-only"><input type="checkbox" id="excluded"> Excluded calls</label>
+      <button class="button rows-only" id="columns-toggle" type="button">Columns</button>
       <span class="count" id="count"></span>
     </div>
     <div class="columns hidden" id="columns"></div>
@@ -75,7 +90,8 @@
     ...(itemColumn ? [['Items', distinct(itemColumn).size]] : []),
     ['Calls', new Set(calls.map(row => row.call)).size],
     ['Unresolved calls', new Set(calls.filter(row => row.arguments_resolved === 'false').map(row => row.call)).size],
-    ['Callsites to review', new Set(rows.filter(review).map(row => row.callsite)).size],
+    ['Callsites to review', new Set(rows.filter(review).map(site)).size],
+    ...(items.length ? [['Items not called', items.filter(item => item.outcome === 'not_called').length], ['Items to review', items.filter(itemReview).length]] : []),
   ];
   metrics.forEach(([label, count]) => {
     const card = node('div', 'metric');
@@ -84,7 +100,7 @@
   });
   const statuses = {};
   new Map(rows.map(row => [row.callsite, row.status])).forEach(status => { statuses[status] = (statuses[status] || 0) + 1; });
-  $('#triage').textContent = `Callsites by result: ${Object.entries(statuses).sort((a, b) => b[1] - a[1]).map(([status, count]) => `${count} ${status.replaceAll('_', ' ')}`).join(', ')}. "Needs review" shows rows whose answer is not complete: a result not called or escaping, an escape whose calls are missing, an unknown argument, or items that are not all known.`;
+  $('#triage').textContent = `Callsites by result: ${Object.entries(statuses).sort((a, b) => b[1] - a[1]).map(([status, count]) => `${count} ${status.replaceAll('_', ' ')}`).join(', ')}. "Needs review" shows rows whose answer is not known: an escape, an unknown argument or item, a call whose items are not all known, or no call for an item at a callsite with one of those. A result never called is an answer, not a gap. Show items for each item's outcome across every callsite: called, not called anywhere, or unknown.`;
 
   // Columns: the callsite and call places stand for their path and line columns.
   const allColumns = ['row_kind', ...(itemColumn ? [itemColumn, 'item_complete'] : []), 'callsite', 'enclosing', 'reachability', 'unreached_reason', 'status', 'call', ...argColumns, 'arguments_resolved', 'found', 'context', 'via', 'instance', 'conditions', 'unfollowed', 'note', ...header.filter(column => column.startsWith('factory.'))].filter(column => has(column) || column === 'callsite' || column === 'call');
@@ -118,7 +134,8 @@
   let sort = { column: '', descending: false };
   let limit = 150;
   const chipClass = value => ({ called: 'exact', explored: 'exact', reachable: 'exact', true: 'exact', source: 'conditional', possible: 'conditional', declared: 'conditional', inferred: 'conditional', escapes: 'unknown', unused: 'muted', not_called: 'muted', called_with_unknown_arguments: 'unknown', false: 'unknown', excluded_call: 'muted', no_call: 'muted', escape: 'unknown', unknown: 'unknown' })[value] || '';
-  const chipColumns = new Set(['row_kind', 'status', 'reachability', 'found', 'item_complete', 'arguments_resolved']);
+  const chipColumns = new Set(['row_kind', 'status', 'reachability', 'found', 'item_complete', 'arguments_resolved', 'outcome']);
+  [...new Set(items.map(item => item.outcome))].sort().forEach(value => { const option = node('option', '', `outcome: ${value}`); option.value = value; $('#outcome').append(option); });
 
   function table(list, hide) {
     const columns = allColumns.filter(column => visible.has(column) && column !== hide);
@@ -152,8 +169,50 @@
     return sort.descending ? -result : result;
   }
 
+  // An item's row links to its rows, grouped by callsite.
+  function itemTable(list) {
+    const element = node('table', 'grid');
+    const head = node('tr');
+    itemHeader.forEach(column => head.append(node('th', '', column)));
+    element.append(head);
+    list.forEach(item => {
+      const tr = node('tr');
+      itemHeader.forEach(column => {
+        const value = item[column] || '';
+        const td = node('td', column.endsWith('_at') ? 'wide' : '');
+        if (column === itemColumn) {
+          const link = node('button', 'button mono', value.startsWith('?') ? `unknown (${value.slice(1).replaceAll('_', ' ')})` : value);
+          link.type = 'button';
+          link.addEventListener('click', () => { $('#view').value = 'rows'; $('#search').value = value; $('#group').value = 'callsite'; limit = 150; render(); });
+          td.append(link);
+        } else if (chipColumns.has(column) && value) td.append(node('span', `chip ${chipClass(value)}`, value.replaceAll('_', ' ')));
+        else td.append(node('span', column.endsWith('_at') ? 'mono' : '', value));
+        tr.append(td);
+      });
+      element.append(tr);
+    });
+    return element;
+  }
+
+  function renderItems(search) {
+    const list = items.filter(item =>
+      (!$('#review').checked || itemReview(item))
+      && (!$('#outcome').value || item.outcome === $('#outcome').value)
+      && (!search || itemHeader.some(column => (item[column] || '').toLowerCase().includes(search))));
+    $('#count').textContent = `${list.length} of ${items.length} items`;
+    const results = $('#results');
+    results.replaceChildren();
+    if (!list.length) { results.append(node('p', 'empty', items.length ? 'No matching items.' : 'This CSV has no item column.')); return; }
+    results.append(itemTable(list.slice(0, limit * 4)));
+    if (list.length > limit * 4) results.append(more(list.length - limit * 4));
+  }
+
   function render() {
     const search = $('#search').value.trim().toLowerCase();
+    const showItems = $('#view').value === 'items';
+    document.querySelectorAll('.rows-only').forEach(element => element.classList.toggle('hidden', showItems));
+    document.querySelectorAll('.items-only').forEach(element => element.classList.toggle('hidden', !showItems));
+    if (showItems) { $('#columns').classList.add('hidden'); renderItems(search); return; }
     const group = $('#group').value;
     const list = rows.filter(row =>
       ($('#excluded').checked || row.row_kind !== 'excluded_call')
@@ -207,10 +266,11 @@
     return button;
   }
 
-  // `#q=text&group=column` sets the search and grouping, so a lookup can be linked.
+  // `#q=text&group=column&view=items` sets the search, grouping, and view, so a lookup can be linked.
   const hash = new URLSearchParams(location.hash.slice(1));
   if (hash.has('q')) $('#search').value = hash.get('q');
   if (hash.has('group') && groupings.some(([value]) => value === hash.get('group'))) $('#group').value = hash.get('group');
-  ['#search', '#group', '#review', '#excluded'].forEach(selector => $(selector).addEventListener(selector === '#search' ? 'input' : 'change', () => { limit = 150; render(); }));
+  if (hash.get('view') === 'items') $('#view').value = 'items';
+  ['#search', '#group', '#review', '#excluded', '#view', '#outcome'].forEach(selector => $(selector).addEventListener(selector === '#search' ? 'input' : 'change', () => { limit = 150; render(); }));
   render();
 })();
