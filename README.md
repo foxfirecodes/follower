@@ -1,73 +1,117 @@
-# Follower prototype
+# Follower
 
-Follower is an executable experiment for a local Rust analyzer that explains callback
-flow through TypeScript/React code. It intentionally implements a narrow semantic fragment first:
-Oxc parsing/binding/CFG extraction, Node/TypeScript import resolution, an owned lowering boundary,
-repository callback-factory models, finite registry choices, React component prop forwarding, and
-intrinsic event registration.
+Follower reads a TypeScript/React codebase and tells you where a callback ends up being called,
+and with what arguments. It works from the source code alone and never runs your app.
 
-The reference experiment is configured in `fixtures/reference/flow.toml`.
+> Follower is an early prototype. It understands a limited set of TypeScript and React patterns,
+> and it reports any code it can't follow instead of guessing.
 
-```sh
-cargo run --bin follower -- index --project fixtures/reference/flow.toml
-cargo run --bin follower -- audit --project fixtures/reference/flow.toml --model notice-dismiss-v1
+## Why
+
+In a React app, a callback can go a long way between where it's made and where it's used. A hook
+creates it, a component passes it down as a prop, another component gives it a new name, and in
+the end a button calls it from `onClick`. Searching for the callback's name misses most of those
+steps.
+
+Follower tracks the callback itself, whatever it's called along the way. You tell it which
+function creates the callback, and it lists every place the callback gets called and the
+arguments it gets. Anywhere it can't follow the callback, it says so, so you know what to check
+by hand.
+
+## Example
+
+```tsx
+export function App() {
+  const { runAction } = useWidgetActions(["banner", "modal"]);
+  return <Card dismiss={runAction} />;
+}
+
+function Card({ dismiss }: { dismiss: (kind: string) => void }) {
+  return <button onClick={() => dismiss("close_button")}>Close</button>;
+}
 ```
 
-The first generic query family finds factory calls, projects selected factory arguments, follows a
-selected property of the returned value, and projects arguments at every invocation. The fixture
-uses an array-valued factory argument and forwards the returned callback through React props:
+Ask Follower about `runAction` from `useWidgetActions`, and it reports that `runAction` was
+created with `["banner", "modal"]` and is called with `"close_button"` from the button in `Card`,
+even though `Card` calls it `dismiss`.
+
+## How to use
+
+You need Rust 1.96 or newer. Install the `follower` command from this folder:
 
 ```sh
-cargo run --bin follower -- query \
-  --project fixtures/factory-query/flow.toml \
-  --query fixtures/factory-query/query.toml
+cargo install --path .
 ```
 
-Use `--format json` for the stable machine-readable report, and `--format csv` for a flat table of
-callsites, calls, and items that `follower view` turns into a browsable page. The query
-declaration and current semantics are documented in [`docs/QUERY.md`](docs/QUERY.md).
+### 1. Describe your project
 
-Queries can also select tuple return elements with `returned_index`, treat each call of a
-function that acts when called as the invocation with `call_is_invocation`, report invocations a
-factory makes of its result itself with `implicit_invocations`, read properties of arguments with
-projection paths and defaults, and project numeric enum member names from TS source. `follower
-view` shows several CSVs with the same columns as one table, and `follower items` says for each
-item whether any of their calls applies to it. Project configs accept `[import_aliases]` for paths such as `@sample/*`,
-`platform_extensions` for code split by platform, contracts for libraries the analysis does not
-read (component consumers, wrappers, openers, lazy factories), and `[[render_roots]]` and
-`[[render_calls]]` to declare code rendered where no path from an entry is found; what those reach
-is labeled `declared`. See [`docs/QUERY.md`](docs/QUERY.md) for synthetic tuple and project
-examples.
+Create a `flow.toml` that says where your source code is and where your app starts:
 
-The control-flow fixture exercises finite strict-equality branches and row-preserving literal-array
-`.map`, canonical ordinary-call linkage, and local callback reassignment:
+```toml
+schema_version = 1
+name = "my-app"
+source_roots = ["src"]
+
+[[entries]]
+module = "src/App.tsx"
+export = "App"
+```
+
+### 2. Write a query
+
+Create a `query.toml` that names the function that creates the callback and the arguments you
+want to see:
+
+```toml
+schema_version = 1
+id = "widget-actions"
+kind = "factory_return_invocations"
+scope = "all_creations"
+
+# The function that creates the callback
+[factory]
+project = "my-app"
+module = "src/widget.ts"
+export = "useWidgetActions"
+
+# Record its first argument
+[[factory_arguments]]
+index = 0
+label = "widget_types"
+
+# Follow the runAction property of what it returns
+[capability]
+returned_property = ["runAction"]
+
+# Record the first argument of every call to it
+[[capability.invocation_arguments]]
+index = 0
+label = "action_kind"
+```
+
+### 3. Run it
 
 ```sh
-cargo run --bin follower -- query \
-  --project fixtures/query-control-flow/flow.toml \
-  --query fixtures/query-control-flow/query.toml
+follower query --project flow.toml --query query.toml
 ```
 
-The mutation fixture demonstrates the current conservative boundary for an aliased record whose
-callback property is overwritten:
+This prints a summary you can read. Other output formats:
+
+- `--format json` gives the full report as JSON.
+- `--format csv` gives one row per call, which works well in a spreadsheet. Run
+  `follower view report.csv` to turn the CSV into a web page you can search and filter.
+
+To try Follower without writing any files, run the example included in this repository:
 
 ```sh
-cargo run --bin follower -- query \
-  --project fixtures/query-mutation/flow.toml \
-  --query fixtures/query-mutation/query.toml
+follower query --project fixtures/factory-query/flow.toml --query fixtures/factory-query/query.toml
 ```
 
-To exercise a callback forwarded through three components with prop renaming and two independent
-creation contexts:
+Run `follower --help` to see the other commands.
 
-```sh
-cargo run --bin follower -- audit --project fixtures/prop-chain/flow.toml \
-  --model prop-chain-callback --scope reachable
-```
+## Learn more
 
-The checked-in fixture distinguishes `() => dismiss()` from `() => dismiss` and is the first
-target for the correlation-aware audit. Unsupported syntax is represented explicitly in the owned
-IR and must become a query-specific coverage gap when it can affect a result.
-
-Current implementation boundaries and experiment results are recorded in
-[`docs/PROTOTYPE_STATUS.md`](docs/PROTOTYPE_STATUS.md).
+- [`docs/QUERY.md`](docs/QUERY.md) lists every project and query option and explains each part
+  of the report.
+- [`docs/PROTOTYPE_STATUS.md`](docs/PROTOTYPE_STATUS.md) lists what Follower supports today and
+  where it stops.
